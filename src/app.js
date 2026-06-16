@@ -21,7 +21,19 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 // Serve locally-stored KYC docs when S3 isn't configured (dev fallback only).
 app.use('/uploads', express.static(path.join(process.cwd(), 'src', 'uploads')));
 
+// API routes
 app.use('/', indexRoutes);
+
+// Serve frontend static files
+const publicPath = path.join(process.cwd(), 'public');
+app.use(express.static(publicPath));
+
+// SPA fallback — serve index.html for any route not matched by API
+app.get('*', (req, res) => {
+  const indexPath = path.join(publicPath, 'index.html');
+  res.sendFile(indexPath);
+});
+
 app.use(errorMiddleware);
 
 export default app;
