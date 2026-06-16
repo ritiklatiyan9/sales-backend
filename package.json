@@ -1,0 +1,33 @@
+{
+  "name": "booking-api",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "description": "Booking & KYC module API — co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "migrate": "node src/migrations/001_booking_core.js",
+    "migrate:kyc-docs": "node src/migrations/002_kyc_doc_types.js",
+    "migrate:project-settings": "node src/migrations/003_project_settings.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.700.0",
+    "@aws-sdk/lib-storage": "3.700.0",
+    "@aws-sdk/s3-request-presigner": "3.700.0",
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^2.1.1",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.11.3",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

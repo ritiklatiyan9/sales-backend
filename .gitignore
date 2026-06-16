@@ -1,0 +1,12 @@
+node_modules/
+.env
+src/uploads/*
+!src/uploads/.gitkeep
+npm-debug.log*
+# local dev/verification artifacts
+server.log
+.token.txt
+.site.txt
+.booking.txt
+.case.txt
+.doc.txt
