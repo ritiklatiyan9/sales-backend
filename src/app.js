@@ -11,9 +11,15 @@ const app = express();
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan('dev'));
 
-// CORS — allow the booking-ui SPA origin(s). `*` for dev.
-const corsOrigin = process.env.CORS_ORIGIN || '*';
-app.use(cors({ origin: corsOrigin === '*' ? '*' : corsOrigin.split(',').map((s) => s.trim()) }));
+// CORS — allow ALL origins. `origin: true` reflects the request's origin (so it
+// also works when requests send credentials/Authorization), and handles preflight.
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors({ origin: true, credentials: true }));
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
