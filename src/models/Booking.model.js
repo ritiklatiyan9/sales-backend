@@ -65,7 +65,7 @@ class BookingModel extends MasterModel {
              m.nominee_name AS client_nominee, m.nominee_relation AS client_nominee_rel,
              m.nominee_phone AS client_nominee_phone,
              p.plot_no, p.block AS plot_block, p.plot_size, p.sale_price AS plot_sale_price,
-             s.name AS site_name
+             s.name AS site_name, s.city AS site_city, s.state AS site_state
       FROM bookings b
       LEFT JOIN members m ON m.id = b.client_member_id
       LEFT JOIN plots   p ON p.id = b.plot_id

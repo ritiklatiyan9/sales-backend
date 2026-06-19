@@ -61,8 +61,8 @@ export const uploadDocument = asyncHandler(async (req, res) => {
   const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
   const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
 
-  // Photos don't need OCR — they're just stored and shown on the client profile.
-  const isPhoto = type === 'PHOTO';
+  // Photos and the final signed booking form don't need OCR — they're archive files.
+  const skipOcr = type === 'PHOTO' || type === 'FINAL_APPROVED_BOOKED_FORM';
 
   const doc = await documentModel.create({
     kyc_case_id: kycCase.id,
@@ -73,31 +73,38 @@ export const uploadDocument = asyncHandler(async (req, res) => {
     file_hash: fileHash,
     mime_type: req.file.mimetype,
     file_size: req.file.size,
-    ocr_status: isPhoto ? 'DONE' : 'PENDING',
-    ocr_engine: isPhoto ? 'none' : null,
-    ocr_completed_at: isPhoto ? new Date() : null,
+    ocr_status: skipOcr ? 'DONE' : 'PENDING',
+    ocr_engine: skipOcr ? 'none' : null,
+    ocr_completed_at: skipOcr ? new Date() : null,
   }, pool);
 
   let jobId = null;
-  if (isPhoto) {
+  if (skipOcr) {
     emitOcrUpdate({ bookingId: kycCase.booking_id, documentId: doc.id, status: 'DONE' });
   } else {
-    // Enqueue OCR; record the job id (null if the broker was unreachable → retry later).
+    // In-process queue returns instantly with a synthetic job id (no broker).
     jobId = await enqueueOcr(doc.id);
-    await pool.query('UPDATE documents SET ocr_job_id = $1 WHERE id = $2', [jobId, doc.id]);
-    // Roll up case + booking to "OCR pending" (unless already verified).
-    await pool.query(`UPDATE kyc_cases SET status = 'OCR_PENDING', updated_at = now() WHERE id = $1 AND status <> 'VERIFIED'`, [kycCase.id]);
-    await pool.query(`UPDATE bookings SET kyc_status = 'OCR_PENDING', updated_at = now() WHERE id = $1 AND kyc_status <> 'VERIFIED'`, [kycCase.booking_id]);
     emitOcrUpdate({ bookingId: kycCase.booking_id, documentId: doc.id, status: 'PENDING' });
   }
 
-  // Mirror the document onto the accounting client record so it shows on /clients/:id.
-  const linked = await linkDocToMember(type, storageKey, kycCase.client_member_id);
+  // Respond the moment the file is stored + row created — the UI no longer waits on
+  // status roll-ups, job-id persistence, or the accounting mirror.
+  res.status(201).json({ documentId: doc.id, jobId, ocr_status: skipOcr ? 'DONE' : 'PENDING', type });
 
-  res.status(201).json({
-    documentId: doc.id, jobId, ocr_status: isPhoto ? 'DONE' : 'PENDING', type,
-    linkedToClient: Boolean(linked), memberColumn: linked?.col || null,
-  });
+  // Fire-and-forget bookkeeping — never blocks the HTTP response.
+  (async () => {
+    try {
+      if (!skipOcr) {
+        await pool.query('UPDATE documents SET ocr_job_id = $1 WHERE id = $2', [jobId, doc.id]);
+        await pool.query(`UPDATE kyc_cases SET status = 'OCR_PENDING', updated_at = now() WHERE id = $1 AND status <> 'VERIFIED'`, [kycCase.id]);
+        await pool.query(`UPDATE bookings SET kyc_status = 'OCR_PENDING', updated_at = now() WHERE id = $1 AND kyc_status <> 'VERIFIED'`, [kycCase.booking_id]);
+      }
+      // Mirror the document onto the accounting client record (shows on /clients/:id).
+      await linkDocToMember(type, storageKey, kycCase.client_member_id);
+    } catch (err) {
+      console.error('[kyc upload] post-processing failed:', err.message);
+    }
+  })();
 });
 
 /** GET /kyc/document/:id — current OCR status + latest extracted fields. */

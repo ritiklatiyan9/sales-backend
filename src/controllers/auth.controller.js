@@ -65,13 +65,15 @@ export const getMe = asyncHandler(async (req, res) => {
   const user = await userModel.findById(req.user.id);
   if (!user) return res.status(404).json({ message: 'User not found' });
 
+  // Include address/city/state so the print forms can source full site details from
+  // context (currentSite) instead of hardcoding a company/site name.
   let sites;
   if (user.role === 'admin' || user.role === 'super_admin') {
-    const { rows } = await pool.query('SELECT id, name FROM sites ORDER BY name');
+    const { rows } = await pool.query('SELECT id, name, code, address, city, state FROM sites ORDER BY name');
     sites = rows;
   } else {
     const { rows } = await pool.query(
-      `SELECT s.id, s.name FROM sites s
+      `SELECT s.id, s.name, s.code, s.address, s.city, s.state FROM sites s
        JOIN user_sites us ON us.site_id = s.id
        WHERE us.user_id = $1 ORDER BY s.name`,
       [user.id]
