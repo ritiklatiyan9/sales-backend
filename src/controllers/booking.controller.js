@@ -42,6 +42,126 @@ export const listBookings = asyncHandler(async (req, res) => {
   res.json(rows);
 });
 
+/**
+ * GET /bookings/dashboard?site_id=&days=
+ * Single aggregated payload for the dashboard — replaces the old pattern of shipping
+ * the full 500-row bookings list (with 3 correlated subqueries per row) to the browser
+ * and aggregating client-side. All aggregates run as set-based SQL, in parallel; the
+ * response is a few KB regardless of booking volume.
+ */
+export const getDashboard = asyncHandler(async (req, res) => {
+  const siteId = Number(req.query.site_id);
+  if (!siteId) return res.status(400).json({ message: 'site_id is required' });
+  const days = Math.min(90, Math.max(7, Number(req.query.days) || 14));
+
+  const recentSelect = `
+    SELECT b.id, b.booking_no, b.status, b.kyc_status, b.booking_date, b.created_at,
+           b.token_amount, b.booked_by, b.buyer_name,
+           m.full_name AS client_name, m.photo AS client_photo,
+           p.plot_no, p.block AS plot_block
+    FROM bookings b
+    LEFT JOIN members m ON m.id = b.client_member_id
+    LEFT JOIN plots   p ON p.id = b.plot_id
+    WHERE b.site_id = $1`;
+
+  const [kpi, docs, dist, trend, recent, queue, topExec, activity] = await Promise.all([
+    pool.query(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE status = 'CANCELLED' OR kyc_status = 'REJECTED')::int AS rejected,
+              count(*) FILTER (WHERE (kyc_status = 'VERIFIED' OR status = 'CONFIRMED')
+                               AND status <> 'CANCELLED' AND kyc_status <> 'REJECTED')::int AS verified,
+              count(*) FILTER (WHERE booking_date >= now()::date)::int AS today,
+              count(*) FILTER (WHERE booking_date >= now()::date - 6)::int AS this_week,
+              count(*) FILTER (WHERE booking_date >= now()::date - 13
+                               AND booking_date <  now()::date - 6)::int AS prev_week,
+              count(*) FILTER (WHERE status NOT IN ('CANCELLED','CONFIRMED')
+                               AND kyc_status NOT IN ('VERIFIED','REJECTED')
+                               AND booking_date < now()::date - 3)::int AS stale,
+              COALESCE(SUM(token_amount), 0)::float AS token_total,
+              COALESCE(SUM(token_amount) FILTER (WHERE booking_date >= date_trunc('month', now())), 0)::float AS token_month,
+              COALESCE(SUM(token_amount) FILTER (WHERE booking_date >= date_trunc('month', now()) - interval '1 month'
+                                                 AND booking_date < date_trunc('month', now())), 0)::float AS token_prev_month
+       FROM bookings WHERE site_id = $1`,
+      [siteId]
+    ),
+    pool.query(
+      `SELECT count(*)::int AS docs,
+              count(*) FILTER (WHERE ocr_status = 'DONE')::int AS ocr_done,
+              count(*) FILTER (WHERE ocr_status IN ('PENDING','PROCESSING'))::int AS ocr_pending,
+              count(*) FILTER (WHERE ocr_status = 'FAILED')::int AS ocr_failed
+       FROM documents WHERE site_id = $1`,
+      [siteId]
+    ),
+    pool.query(
+      `SELECT COALESCE(kyc_status, 'NOT_STARTED') AS key, count(*)::int AS value
+       FROM bookings WHERE site_id = $1 GROUP BY 1`,
+      [siteId]
+    ),
+    pool.query(
+      `SELECT to_char(d, 'YYYY-MM-DD') AS key,
+              count(b.id)::int AS submitted,
+              count(b.id) FILTER (WHERE b.kyc_status = 'VERIFIED' OR b.status = 'CONFIRMED')::int AS verified,
+              COALESCE(SUM(b.token_amount), 0)::float AS token
+       FROM generate_series(now()::date - ($2::int - 1), now()::date, interval '1 day') AS d
+       LEFT JOIN bookings b ON b.site_id = $1 AND b.booking_date::date = d::date
+       GROUP BY d ORDER BY d`,
+      [siteId, days]
+    ),
+    pool.query(`${recentSelect} ORDER BY b.created_at DESC LIMIT 8`, [siteId]),
+    pool.query(
+      `${recentSelect}
+         AND b.status NOT IN ('CANCELLED','CONFIRMED')
+         AND b.kyc_status NOT IN ('VERIFIED','REJECTED')
+       ORDER BY b.booking_date ASC NULLS LAST, b.created_at ASC LIMIT 5`,
+      [siteId]
+    ),
+    pool.query(
+      `SELECT booked_by AS name, count(*)::int AS bookings, COALESCE(SUM(token_amount), 0)::float AS token
+       FROM bookings
+       WHERE site_id = $1 AND booked_by IS NOT NULL AND booking_date >= date_trunc('month', now())
+       GROUP BY booked_by ORDER BY bookings DESC, token DESC LIMIT 1`,
+      [siteId]
+    ),
+    pool.query(
+      `SELECT * FROM (
+         SELECT 'CREATED' AS kind, b.created_at AS at, b.id, b.booking_no,
+                m.full_name AS client_name, NULL AS detail
+         FROM bookings b LEFT JOIN members m ON m.id = b.client_member_id
+         WHERE b.site_id = $1
+         UNION ALL
+         SELECT 'VERIFIED', k.verified_at, b.id, b.booking_no, m.full_name, NULL
+         FROM kyc_cases k
+         JOIN bookings b ON b.id = k.booking_id
+         LEFT JOIN members m ON m.id = b.client_member_id
+         WHERE b.site_id = $1 AND k.verified_at IS NOT NULL
+         UNION ALL
+         SELECT 'OCR_DONE', d.ocr_completed_at, b.id, b.booking_no, m.full_name, d.type
+         FROM documents d
+         JOIN kyc_cases k ON k.id = d.kyc_case_id
+         JOIN bookings b ON b.id = k.booking_id
+         LEFT JOIN members m ON m.id = b.client_member_id
+         WHERE b.site_id = $1 AND d.ocr_status = 'DONE' AND d.ocr_completed_at IS NOT NULL
+       ) ev
+       WHERE ev.at IS NOT NULL
+       ORDER BY ev.at DESC LIMIT 20`,
+      [siteId]
+    ),
+  ]);
+
+  res.json({
+    kpi: kpi.rows[0],
+    docs: docs.rows[0],
+    distribution: dist.rows,
+    trend: trend.rows,
+    recent: recent.rows,
+    queue: queue.rows,
+    top_executive: topExec.rows[0] || null,
+    activity: activity.rows,
+    days,
+    generated_at: new Date().toISOString(),
+  });
+});
+
 /** POST /bookings */
 export const createBooking = asyncHandler(async (req, res) => {
   const {

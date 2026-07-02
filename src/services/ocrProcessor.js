@@ -87,10 +87,38 @@ const rollupCaseAndBooking = async (documentId) => {
 };
 
 /**
- * Process one document end-to-end. Never throws (errors are recorded as FAILED), so it
- * is safe to call fire-and-forget.
+ * Result cache — if the exact same file (by sha-256 hash) was already OCR'd
+ * successfully for the same document type, reuse that result instead of paying
+ * for another vision call. Covers re-uploads and replace-with-same-file.
  */
-export const processDocument = async (documentId) => {
+const findCachedResult = async (doc) => {
+  if (!doc.file_hash) return null;
+  const { rows } = await pool.query(
+    `SELECT r.raw_text, r.extracted_fields, r.confidence_overall, r.confidence_map, r.engine
+       FROM documents d2
+       JOIN ocr_results r ON r.document_id = d2.id
+      WHERE d2.file_hash = $1 AND d2.id <> $2 AND d2.type = $3 AND d2.ocr_status = 'DONE'
+      ORDER BY r.processed_at DESC
+      LIMIT 1`,
+    [doc.file_hash, doc.id, doc.type]
+  );
+  const hit = rows[0];
+  if (!hit) return null;
+  return {
+    text: hit.raw_text?.text || '',
+    fields: hit.extracted_fields || {},
+    confidence: Number(hit.confidence_overall) || 0,
+    confidenceMap: hit.confidence_map || {},
+    engine: `cache:${hit.engine || 'unknown'}`,
+  };
+};
+
+/**
+ * Process one document end-to-end. Never throws (errors are recorded as FAILED), so it
+ * is safe to call fire-and-forget. Emits live pipeline stage events the UI renders as
+ * an animated progress timeline: FETCH → PREPROCESS → OCR → VALIDATE → DONE.
+ */
+export const processDocument = async (documentId, preload) => {
   console.log(`[ocrProcessor] start document_id=${documentId}`);
   const { rows } = await pool.query('SELECT * FROM documents WHERE id = $1', [documentId]);
   const doc = rows[0];
@@ -100,23 +128,38 @@ export const processDocument = async (documentId) => {
   }
 
   const bookingId = await getBookingId(documentId);
+  const stage = (s) => emitOcrUpdate({ bookingId, documentId, status: 'PROCESSING', stage: s });
+
   try {
     await setProcessing(documentId);
-    emitOcrUpdate({ bookingId, documentId, status: 'PROCESSING' });
+    stage('FETCH');
 
-    const fileBytes = await fetchKycDocumentBytes(doc.file_path);
-    const result = await runOcr(fileBytes, doc.mime_type, doc.type);
+    // Cache hit → skip the vision call entirely (same bytes, same doc type).
+    const cached = await findCachedResult(doc);
+    let result;
+    if (cached) {
+      console.log(`[ocrProcessor] cache hit for document_id=${documentId} (hash ${String(doc.file_hash).slice(0, 12)}…)`);
+      stage('VALIDATE');
+      result = cached;
+    } else {
+      // Fast path: use the in-memory bytes handed over by the upload request when
+      // available — skips the storage round-trip so OCR starts instantly.
+      const fileBytes = preload?.buffer?.length
+        ? preload.buffer
+        : await fetchKycDocumentBytes(doc.file_path);
+      result = await runOcr(fileBytes, preload?.mimeType || doc.mime_type, doc.type, stage);
+    }
 
     await saveResult({ documentId, ...result });
     await setDone(documentId, result.engine);
     const bId = await rollupCaseAndBooking(documentId);
-    emitOcrUpdate({ bookingId: bId || bookingId, documentId, status: 'DONE' });
+    emitOcrUpdate({ bookingId: bId || bookingId, documentId, status: 'DONE', stage: 'DONE' });
     console.log(`[ocrProcessor] done document_id=${documentId} fields=${Object.keys(result.fields).join(',')}`);
   } catch (err) {
     console.error(`[ocrProcessor] FAILED document_id=${documentId}:`, err.message);
     await setFailed(documentId, err);
     let bId = bookingId;
     try { bId = await rollupCaseAndBooking(documentId); } catch { /* ignore */ }
-    emitOcrUpdate({ bookingId: bId || bookingId, documentId, status: 'FAILED' });
+    emitOcrUpdate({ bookingId: bId || bookingId, documentId, status: 'FAILED', stage: 'FAILED' });
   }
 };

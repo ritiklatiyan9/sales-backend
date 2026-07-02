@@ -3,6 +3,7 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import upload from '../middlewares/multer.middleware.js';
 import {
   uploadDocument, getDocument, deleteDocument, getCase, retryDocument, extractPreview, verifyCase,
+  updateDocumentFields,
 } from '../controllers/kyc.controller.js';
 
 const router = express.Router();
@@ -12,6 +13,7 @@ router.post('/upload', upload.single('file'), uploadDocument);
 router.get('/document/:id', getDocument);
 router.delete('/document/:id', deleteDocument);
 router.post('/document/:id/retry', retryDocument);
+router.patch('/document/:id/fields', updateDocumentFields);
 router.get('/case/:id', getCase);
 router.post('/case/:id/extract-preview', extractPreview);
 router.post('/case/:id/verify', verifyCase);

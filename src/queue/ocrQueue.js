@@ -16,9 +16,9 @@ const waiting = [];
 
 const pump = () => {
   while (active < MAX_CONCURRENCY && waiting.length) {
-    const { documentId } = waiting.shift();
+    const { documentId, preload } = waiting.shift();
     active += 1;
-    processDocument(documentId)
+    processDocument(documentId, preload)
       .catch((err) => console.error('[ocrQueue] processing error:', err.message))
       .finally(() => { active -= 1; pump(); });
   }
@@ -27,10 +27,14 @@ const pump = () => {
 /**
  * Schedule OCR for a document. Returns a synthetic job id (stored as documents.ocr_job_id)
  * so the existing callers and DB columns are unchanged.
+ *
+ * `preload` (optional) = { buffer, mimeType } — the upload handler already holds the
+ * file bytes in memory, so passing them here lets the processor skip the storage
+ * round-trip entirely and start OCR immediately (retries omit it and fetch normally).
  */
-export const enqueueOcr = async (documentId) => {
+export const enqueueOcr = async (documentId, preload) => {
   const jobId = `inproc:${crypto.randomUUID()}`;
-  waiting.push({ documentId });
+  waiting.push({ documentId, preload });
   // Defer so the HTTP response returns before OCR work starts.
   setImmediate(pump);
   return jobId;

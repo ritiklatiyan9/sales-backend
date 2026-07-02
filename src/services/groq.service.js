@@ -186,12 +186,14 @@ export function normalizeExtracted(extracted, documentType) {
     // Normalize to booking form field names
     const normalized = {
       name: extracted.name || extracted.full_name || '',
+      father_name: extracted.father_name || '',
       dob: formatDob(extracted.dob || extracted.date_of_birth || ''),
       address: extracted.address || '',
       city: extracted.city || extracted.district || '',
       state: extracted.state || '',
       pincode: extracted.pincode || extracted.pin || '',
       gender: extracted.gender || '',
+      mobile: extracted.mobile || extracted.phone || '',
     };
 
     // Document-type-specific fields
@@ -216,11 +218,24 @@ export function normalizeExtracted(extracted, documentType) {
       case 'DOMICILE':
         normalized.domicile_no = extracted.certificate_number || extracted.domicile_no || extracted.certificate_no || extracted.serial_number || '';
         normalized.issue_date = formatDob(extracted.issue_date || '');
+        normalized.village = extracted.village || '';
+        normalized.tehsil = extracted.tehsil || '';
         break;
       case 'INCOME':
         normalized.income_no = extracted.certificate_number || extracted.income_no || extracted.certificate_no || extracted.serial_number || '';
         normalized.annual_income = extracted.annual_income || extracted.income || '';
         normalized.issue_date = formatDob(extracted.issue_date || '');
+        break;
+      case 'OTHER':
+        // Property / legal documents — registry, patta, land records.
+        normalized.plot_number = extracted.plot_number || extracted.plot_no || '';
+        normalized.khasra_number = extracted.khasra_number || extracted.khasra_no || '';
+        normalized.area = extracted.area || '';
+        normalized.registry_number = extracted.registry_number || extracted.registry_no || '';
+        normalized.village = extracted.village || '';
+        normalized.tehsil = extracted.tehsil || '';
+        normalized.date = formatDob(extracted.date || '');
+        normalized.amount = extracted.amount || '';
         break;
     }
 

@@ -82,8 +82,10 @@ export const uploadDocument = asyncHandler(async (req, res) => {
   if (skipOcr) {
     emitOcrUpdate({ bookingId: kycCase.booking_id, documentId: doc.id, status: 'DONE' });
   } else {
-    // In-process queue returns instantly with a synthetic job id (no broker).
-    jobId = await enqueueOcr(doc.id);
+    // In-process queue returns instantly with a synthetic job id (no broker). The raw
+    // bytes are handed straight to the processor so OCR starts without re-downloading
+    // the file from storage.
+    jobId = await enqueueOcr(doc.id, { buffer: req.file.buffer, mimeType: req.file.mimetype });
     emitOcrUpdate({ bookingId: kycCase.booking_id, documentId: doc.id, status: 'PENDING' });
   }
 
@@ -142,6 +144,67 @@ export const deleteDocument = asyncHandler(async (req, res) => {
   res.json({ message: 'Document deleted', documentId: req.params.id });
 });
 
+/**
+ * PATCH /kyc/document/:id/fields — human correction of the AI-extracted fields.
+ * Body: { fields: { key: value, … } } — treated as the authoritative full set for the
+ * document (cleared keys are removed). Edited/added values are marked human-verified
+ * (confidence 1.0); untouched values keep their AI confidence.
+ */
+export const updateDocumentFields = asyncHandler(async (req, res) => {
+  const doc = await documentModel.findById(req.params.id, pool);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+  const input = req.body?.fields;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return res.status(400).json({ message: 'Provide a fields object' });
+  }
+
+  // Sanitise: string keys/values only, drop empties, cap lengths.
+  const fields = {};
+  for (const [k, v] of Object.entries(input)) {
+    const key = String(k).trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 64);
+    const val = v === null || v === undefined ? '' : String(v).trim().slice(0, 500);
+    if (key && val) fields[key] = val;
+  }
+
+  const { rows } = await pool.query(
+    'SELECT * FROM ocr_results WHERE document_id = $1 ORDER BY id DESC LIMIT 1',
+    [doc.id]
+  );
+  const latest = rows[0];
+  const prevFields = latest?.extracted_fields || {};
+  const prevConf = latest?.confidence_map || {};
+
+  // Human-verified values get confidence 1.0; unchanged ones keep their AI score.
+  const confidenceMap = {};
+  for (const k of Object.keys(fields)) {
+    confidenceMap[k] = fields[k] === String(prevFields[k] ?? '') ? (prevConf[k] ?? 1) : 1;
+  }
+  const values = Object.values(confidenceMap);
+  const overall = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+
+  if (latest) {
+    await pool.query(
+      `UPDATE ocr_results SET extracted_fields = $1, confidence_map = $2, confidence_overall = $3 WHERE id = $4`,
+      [JSON.stringify(fields), JSON.stringify(confidenceMap), Math.round(overall * 1000) / 1000, latest.id]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO ocr_results (document_id, raw_text, extracted_fields, confidence_overall, confidence_map, engine, processed_at)
+       VALUES ($1, $2, $3, $4, $5, 'manual', now())`,
+      [doc.id, JSON.stringify({ text: '' }), JSON.stringify(fields), Math.round(overall * 1000) / 1000, JSON.stringify(confidenceMap)]
+    );
+    // A manually-filled document counts as processed.
+    await pool.query(
+      `UPDATE documents SET ocr_status = 'DONE', ocr_engine = COALESCE(ocr_engine, 'manual'), ocr_completed_at = COALESCE(ocr_completed_at, now()), updated_at = now() WHERE id = $1`,
+      [doc.id]
+    );
+  }
+
+  const bookingId = await documentModel.getBookingId(doc.id, pool);
+  if (bookingId) emitOcrUpdate({ bookingId, documentId: doc.id, status: 'DONE', stage: 'DONE' });
+  res.json({ documentId: doc.id, fields, confidence_map: confidenceMap, confidence_overall: overall });
+});
+
 /** GET /kyc/case/:id — case + its documents (each with latest OCR result). */
 export const getCase = asyncHandler(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM kyc_cases WHERE id = $1', [req.params.id]);
@@ -189,16 +252,20 @@ export const extractPreview = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'No completed documents to extract from' });
   }
 
-  const extracted = {};
-  for (const doc of documents) {
-    if (!doc.raw_text?.text) continue;
-    try {
-      const fields = await extractKycFieldsWithAi(doc.raw_text.text, doc.type);
-      Object.assign(extracted, fields);
-    } catch (err) {
-      console.error(`[preview] Groq extraction failed for doc ${doc.id}:`, err.message);
-    }
-  }
+  // Run all per-document extractions in parallel — the response is bounded by the
+  // slowest document instead of the sum of all of them.
+  const results = await Promise.all(
+    documents.map(async (doc) => {
+      if (!doc.raw_text?.text) return {};
+      try {
+        return await extractKycFieldsWithAi(doc.raw_text.text, doc.type);
+      } catch (err) {
+        console.error(`[preview] Groq extraction failed for doc ${doc.id}:`, err.message);
+        return {};
+      }
+    })
+  );
+  const extracted = Object.assign({}, ...results);
 
   res.json({
     caseId: kycCase.id,
