@@ -5,6 +5,9 @@ import lookupRoutes from './lookups.routes.js';
 import kycRoutes from './kyc.routes.js';
 import plotDocumentRoutes from './plotDocument.routes.js';
 import settingsRoutes from './settings.routes.js';
+import agentRoutes from './agent.routes.js';
+import teamRoutes from './team.routes.js';
+import adminRoutes from './admin.routes.js';
 
 const router = express.Router();
 
@@ -16,5 +19,8 @@ router.use('/', lookupRoutes);   // /clients/search, /clients, /clients/:id, /pl
 router.use('/kyc', kycRoutes);
 router.use('/plot-documents', plotDocumentRoutes);   // Plot-centric shared document store
 router.use('/project-settings', settingsRoutes);   // Project Details (company + payments)
+router.use('/agents', agentRoutes);   // Agent network: hierarchy, referrals, ledger
+router.use('/teams', teamRoutes);     // Team management (admin only)
+router.use('/admin', adminRoutes);    // Access control: sites + module permissions
 
 export default router;

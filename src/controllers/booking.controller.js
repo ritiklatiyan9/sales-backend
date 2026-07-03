@@ -6,6 +6,7 @@ import { deleteKycDocument, getKycDocumentUrl, uploadKycDocument, getPublicKycUr
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
+import { isAdminRole, getVisibleUserIds } from '../services/agentNetwork.service.js';
 
 // Token-payment capture fields a booking may set (mirror of the accounting plot-payment
 // taking fields). Stored on the booking and propagated to plot_payments by tokenPaymentSync.
@@ -32,11 +33,14 @@ const CLIENT_FIELDS = [
 // Normalise '' → null so optional date/number-ish columns don't choke on empty strings.
 const clean = (v) => (v === '' ? null : v);
 
-/** GET /bookings?site_id=&status=&kyc_status=&q=&client_member_id= */
+/** GET /bookings?site_id=&status=&kyc_status=&q=&client_member_id=
+ * Visibility is role-scoped server-side: admins see everything; agents/team heads
+ * see only bookings owned by (or created by) users inside their own network. */
 export const listBookings = asyncHandler(async (req, res) => {
-  const { site_id, status, kyc_status, q, client_member_id } = req.query;
+  const { site_id, status, kyc_status, q, client_member_id, agent_user_id } = req.query;
+  const visibleUserIds = await getVisibleUserIds(req.user); // null = unrestricted
   const rows = await bookingModel.list(
-    { siteId: site_id, status, kycStatus: kyc_status, q, clientMemberId: client_member_id },
+    { siteId: site_id, status, kycStatus: kyc_status, q, clientMemberId: client_member_id, agentUserId: agent_user_id, visibleUserIds },
     pool
   );
   res.json(rows);
@@ -179,10 +183,20 @@ export const createBooking = asyncHandler(async (req, res) => {
     if (req.body[f] !== undefined) tokenData[f] = clean(req.body[f]);
   }
 
+  // Agent-network ownership: bookings created by non-admin users are owned by that
+  // agent and stamped with their team, so hierarchy/team scoping & future commission
+  // runs have a reliable source of truth.
+  let ownership = {};
+  if (!isAdminRole(req.user?.role)) {
+    const { rows: creatorRows } = await pool.query('SELECT id, team_id FROM users WHERE id = $1', [req.user.id]);
+    if (creatorRows[0]) ownership = { agent_user_id: creatorRows[0].id, team_id: creatorRows[0].team_id || null };
+  }
+
   const created = await bookingModel.create({
     site_id,
     plot_id: plot_id || null,
     client_member_id,
+    ...ownership,
     sale_price: sale_price || 0,
     token_amount: token_amount || 0,
     payment_plan: payment_plan || 'FULL',
@@ -219,6 +233,12 @@ export const createBooking = asyncHandler(async (req, res) => {
 export const getBooking = asyncHandler(async (req, res) => {
   const booking = await bookingModel.getDetail(req.params.id, pool);
   if (!booking) return res.status(404).json({ message: 'Booking not found' });
+
+  // Network scoping: non-admins may only open bookings inside their own hierarchy.
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  if (visibleUserIds && !visibleUserIds.includes(booking.agent_user_id) && !visibleUserIds.includes(booking.created_by)) {
+    return res.status(403).json({ message: 'You are not authorised to view this booking' });
+  }
 
   const cases = await kycCaseModel.findByBooking(booking.id, pool);
   for (const c of cases) {

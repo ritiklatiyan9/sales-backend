@@ -12,7 +12,8 @@
     "migrate:project-settings": "node src/migrations/003_project_settings.js",
     "migrate:booking-agent": "node src/migrations/004_booking_agent.js",
     "migrate:token-payment": "node src/migrations/006_token_payment_link.js",
-    "backfill:plot-bookings": "node src/scripts/backfill_plot_bookings.js"
+    "backfill:plot-bookings": "node src/scripts/backfill_plot_bookings.js",
+    "migrate:agent-network": "node src/migrations/007_agent_network.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.700.0",

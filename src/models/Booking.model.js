@@ -5,14 +5,21 @@ class BookingModel extends MasterModel {
     super('bookings');
   }
 
-  /** List with joined client/plot labels + KYC/OCR rollup indicators. */
-  async list({ siteId, status, kycStatus, q, clientMemberId }, pool) {
+  /** List with joined client/plot labels + KYC/OCR rollup indicators.
+   * `visibleUserIds` (array | null) scopes rows to an agent's own network —
+   * bookings they own (agent_user_id) or personally created. */
+  async list({ siteId, status, kycStatus, q, clientMemberId, agentUserId, visibleUserIds }, pool) {
     const where = [];
     const params = [];
     if (siteId) { params.push(siteId); where.push(`b.site_id = $${params.length}`); }
     if (status) { params.push(status); where.push(`b.status = $${params.length}`); }
     if (kycStatus) { params.push(kycStatus); where.push(`b.kyc_status = $${params.length}`); }
     if (clientMemberId) { params.push(clientMemberId); where.push(`b.client_member_id = $${params.length}`); }
+    if (agentUserId) { params.push(agentUserId); where.push(`b.agent_user_id = $${params.length}`); }
+    if (Array.isArray(visibleUserIds)) {
+      params.push(visibleUserIds);
+      where.push(`(b.agent_user_id = ANY($${params.length}) OR b.created_by = ANY($${params.length}))`);
+    }
     if (q) {
       params.push(`%${q}%`);
       where.push(`(b.booking_no ILIKE $${params.length} OR b.buyer_name ILIKE $${params.length} OR m.full_name ILIKE $${params.length} OR p.plot_no ILIKE $${params.length})`);
