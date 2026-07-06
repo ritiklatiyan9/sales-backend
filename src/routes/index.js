@@ -8,6 +8,7 @@ import settingsRoutes from './settings.routes.js';
 import agentRoutes from './agent.routes.js';
 import teamRoutes from './team.routes.js';
 import adminRoutes from './admin.routes.js';
+import homeLayoutRoutes from './homeLayout.routes.js';
 
 const router = express.Router();
 
@@ -22,5 +23,6 @@ router.use('/project-settings', settingsRoutes);   // Project Details (company +
 router.use('/agents', agentRoutes);   // Agent network: hierarchy, referrals, ledger
 router.use('/teams', teamRoutes);     // Team management (admin only)
 router.use('/admin', adminRoutes);    // Access control: sites + module permissions
+router.use('/home-layout', homeLayoutRoutes); // Per-user launcher screen layout
 
 export default router;

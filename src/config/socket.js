@@ -24,6 +24,9 @@ export const initSocket = (server) => {
     // Clients join a per-booking room to receive KYC/OCR updates for that booking.
     socket.on('join_booking', (bookingId) => socket.join(`booking_${bookingId}`));
     socket.on('leave_booking', (bookingId) => socket.leave(`booking_${bookingId}`));
+    // Member-first KYC cases have no booking yet — their workspace joins a case room.
+    socket.on('join_kyc_case', (caseId) => socket.join(`kyc_case_${caseId}`));
+    socket.on('leave_kyc_case', (caseId) => socket.leave(`kyc_case_${caseId}`));
   });
 
   return io;
@@ -40,4 +43,5 @@ export const emitOcrUpdate = (evt) => {
   if (!io) return;
   io.emit('ocr_update', evt);
   if (evt.bookingId) io.to(`booking_${evt.bookingId}`).emit('ocr_update', evt);
+  if (evt.caseId) io.to(`kyc_case_${evt.caseId}`).emit('ocr_update', evt);
 };

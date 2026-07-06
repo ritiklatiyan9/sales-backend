@@ -44,7 +44,8 @@ export async function extractKycFieldsWithAi(ocrText, documentType) {
           { role: 'user', content: prompt },
         ],
         temperature: 0.1,
-        max_tokens: 600,
+        // The full KYC form returns ~30 fields — give it headroom.
+        max_tokens: documentType === 'KYC_FORM' ? 1400 : 600,
         response_format: { type: 'json_object' },
       }),
     });
@@ -131,6 +132,21 @@ function buildExtractionPrompt(text, type) {
       'issue_date (DD/MM/YYYY)',
       'district',
       'state',
+    ],
+    // The company's own KYC Application Form (filled by the customer) — every
+    // booking-form field plus the machine block printed top-right.
+    KYC_FORM: [
+      'agent_code (the AGENT CODE printed top-right, format AGT-XXXXX)',
+      'kyc_no (the KYC reference number, digits only)',
+      'name (applicant full name)', 'father_name', 'mother_name', 'spouse_name',
+      'dob (DD/MM/YYYY)', 'gender', 'marital_status', 'religion', 'nationality',
+      'qualification', 'occupation', 'company_name',
+      'mobile (10 digits)', 'alt_phone', 'whatsapp', 'email',
+      'address (correspondence address without city/state/pincode)',
+      'city', 'state', 'pincode (6 digits)',
+      'aadhaar_number (12 digits)', 'pan_number (10 chars)', 'voter_id_number',
+      'nominee_name', 'nominee_relation', 'nominee_phone', 'nominee_dob (DD/MM/YYYY)',
+      'bank_name', 'account_number', 'ifsc_code', 'branch',
     ],
   };
 
@@ -225,6 +241,33 @@ export function normalizeExtracted(extracted, documentType) {
         normalized.income_no = extracted.certificate_number || extracted.income_no || extracted.certificate_no || extracted.serial_number || '';
         normalized.annual_income = extracted.annual_income || extracted.income || '';
         normalized.issue_date = formatDob(extracted.issue_date || '');
+        break;
+      case 'KYC_FORM':
+        // The company's own form — the full booking-form field set.
+        normalized.agent_code = extracted.agent_code || extracted.agentcode || extracted.referral_code || '';
+        normalized.kyc_no = extracted.kyc_no || extracted.kyc_number || '';
+        normalized.aadhaar = extracted.aadhaar_number || extracted.aadhaar || '';
+        normalized.pan = extracted.pan_number || extracted.pan || '';
+        normalized.voter_id = extracted.voter_id_number || extracted.voter_id || '';
+        normalized.mother_name = extracted.mother_name || '';
+        normalized.spouse_name = extracted.spouse_name || '';
+        normalized.marital_status = extracted.marital_status || '';
+        normalized.religion = extracted.religion || '';
+        normalized.nationality = extracted.nationality || '';
+        normalized.qualification = extracted.qualification || '';
+        normalized.occupation = extracted.occupation || '';
+        normalized.company_name = extracted.company_name || extracted.employer || '';
+        normalized.alt_phone = extracted.alt_phone || extracted.alternate_phone || '';
+        normalized.whatsapp = extracted.whatsapp || '';
+        normalized.email = extracted.email || '';
+        normalized.nominee_name = extracted.nominee_name || '';
+        normalized.nominee_relation = extracted.nominee_relation || extracted.nominee_relationship || '';
+        normalized.nominee_phone = extracted.nominee_phone || '';
+        normalized.nominee_dob = formatDob(extracted.nominee_dob || '');
+        normalized.bank_name = extracted.bank_name || '';
+        normalized.account_number = extracted.account_number || extracted.account_no || '';
+        normalized.ifsc = extracted.ifsc_code || extracted.ifsc || '';
+        normalized.branch = extracted.branch || '';
         break;
       case 'OTHER':
         // Property / legal documents — registry, patta, land records.

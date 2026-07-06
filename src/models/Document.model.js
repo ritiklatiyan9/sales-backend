@@ -28,6 +28,16 @@ class DocumentModel extends MasterModel {
     `, [documentId]);
     return rows[0]?.booking_id || null;
   }
+
+  /** Case + booking ids for a document — booking_id is null for member-anchored cases. */
+  async getCaseAndBookingId(documentId, pool) {
+    const { rows } = await pool.query(`
+      SELECT k.id AS case_id, k.booking_id FROM documents d
+      JOIN kyc_cases k ON k.id = d.kyc_case_id
+      WHERE d.id = $1
+    `, [documentId]);
+    return { caseId: rows[0]?.case_id || null, bookingId: rows[0]?.booking_id || null };
+  }
 }
 
 export default new DocumentModel();

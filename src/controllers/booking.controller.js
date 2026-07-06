@@ -52,11 +52,27 @@ export const listBookings = asyncHandler(async (req, res) => {
  * the full 500-row bookings list (with 3 correlated subqueries per row) to the browser
  * and aggregating client-side. All aggregates run as set-based SQL, in parallel; the
  * response is a few KB regardless of booking volume.
+ *
+ * Role-scoped: admins see the whole site; agents/team heads see only bookings (and
+ * KYC cases) owned by or created within their own network — the same visibility rule
+ * listBookings/getBooking already enforce, applied here to every aggregate so an
+ * agent's dashboard reflects their own work instead of the whole site's.
  */
 export const getDashboard = asyncHandler(async (req, res) => {
   const siteId = Number(req.query.site_id);
   if (!siteId) return res.status(400).json({ message: 'site_id is required' });
   const days = Math.min(90, Math.max(7, Number(req.query.days) || 14));
+
+  const visibleUserIds = await getVisibleUserIds(req.user); // null = admin, unrestricted
+  const scoped = Array.isArray(visibleUserIds);
+  // Ownership filter applied to every booking-derived aggregate below. $2 (or $3 where
+  // a query already uses $2 for something else) is always the visibleUserIds array.
+  const bookingScope = (alias, param) => (scoped ? `AND (${alias}.agent_user_id = ANY($${param}) OR ${alias}.created_by = ANY($${param}))` : '');
+  // Mirrors KycCase.model.js list()'s visibility clause: a case is "mine" if I created
+  // it directly, OR I own/created the booking it's since been adopted into.
+  const kycScope = (caseAlias, bookingAlias, param) => (scoped
+    ? `AND (${caseAlias}.created_by = ANY($${param}) OR ${bookingAlias}.agent_user_id = ANY($${param}) OR ${bookingAlias}.created_by = ANY($${param}))`
+    : '');
 
   const recentSelect = `
     SELECT b.id, b.booking_no, b.status, b.kyc_status, b.booking_date, b.created_at,
@@ -66,9 +82,17 @@ export const getDashboard = asyncHandler(async (req, res) => {
     FROM bookings b
     LEFT JOIN members m ON m.id = b.client_member_id
     LEFT JOIN plots   p ON p.id = b.plot_id
-    WHERE b.site_id = $1`;
+    WHERE b.site_id = $1 ${bookingScope('b', 2)}`;
 
-  const [kpi, docs, dist, trend, recent, queue, topExec, activity] = await Promise.all([
+  const kpiParams = scoped ? [siteId, visibleUserIds] : [siteId];
+  const docsParams = scoped ? [siteId, visibleUserIds] : [siteId];
+  const distParams = scoped ? [siteId, visibleUserIds] : [siteId];
+  const trendParams = scoped ? [siteId, days, visibleUserIds] : [siteId, days];
+  const listParams = scoped ? [siteId, visibleUserIds] : [siteId];
+  const activityParams = scoped ? [siteId, visibleUserIds] : [siteId];
+  const myKycParams = scoped ? [siteId, visibleUserIds] : [siteId];
+
+  const [kpi, docs, dist, trend, recent, queue, topExec, activity, myKyc] = await Promise.all([
     pool.query(
       `SELECT count(*)::int AS total,
               count(*) FILTER (WHERE status = 'CANCELLED' OR kyc_status = 'REJECTED')::int AS rejected,
@@ -85,21 +109,24 @@ export const getDashboard = asyncHandler(async (req, res) => {
               COALESCE(SUM(token_amount) FILTER (WHERE booking_date >= date_trunc('month', now())), 0)::float AS token_month,
               COALESCE(SUM(token_amount) FILTER (WHERE booking_date >= date_trunc('month', now()) - interval '1 month'
                                                  AND booking_date < date_trunc('month', now())), 0)::float AS token_prev_month
-       FROM bookings WHERE site_id = $1`,
-      [siteId]
+       FROM bookings b WHERE b.site_id = $1 ${bookingScope('b', 2)}`,
+      kpiParams
     ),
     pool.query(
       `SELECT count(*)::int AS docs,
-              count(*) FILTER (WHERE ocr_status = 'DONE')::int AS ocr_done,
-              count(*) FILTER (WHERE ocr_status IN ('PENDING','PROCESSING'))::int AS ocr_pending,
-              count(*) FILTER (WHERE ocr_status = 'FAILED')::int AS ocr_failed
-       FROM documents WHERE site_id = $1`,
-      [siteId]
+              count(*) FILTER (WHERE d.ocr_status = 'DONE')::int AS ocr_done,
+              count(*) FILTER (WHERE d.ocr_status IN ('PENDING','PROCESSING'))::int AS ocr_pending,
+              count(*) FILTER (WHERE d.ocr_status = 'FAILED')::int AS ocr_failed
+       FROM documents d
+       LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
+       LEFT JOIN bookings  b ON b.id = k.booking_id
+       WHERE d.site_id = $1 ${scoped ? `AND (k.created_by = ANY($2) OR b.agent_user_id = ANY($2) OR b.created_by = ANY($2))` : ''}`,
+      docsParams
     ),
     pool.query(
       `SELECT COALESCE(kyc_status, 'NOT_STARTED') AS key, count(*)::int AS value
-       FROM bookings WHERE site_id = $1 GROUP BY 1`,
-      [siteId]
+       FROM bookings b WHERE b.site_id = $1 ${bookingScope('b', 2)} GROUP BY 1`,
+      distParams
     ),
     pool.query(
       `SELECT to_char(d, 'YYYY-MM-DD') AS key,
@@ -107,19 +134,20 @@ export const getDashboard = asyncHandler(async (req, res) => {
               count(b.id) FILTER (WHERE b.kyc_status = 'VERIFIED' OR b.status = 'CONFIRMED')::int AS verified,
               COALESCE(SUM(b.token_amount), 0)::float AS token
        FROM generate_series(now()::date - ($2::int - 1), now()::date, interval '1 day') AS d
-       LEFT JOIN bookings b ON b.site_id = $1 AND b.booking_date::date = d::date
+       LEFT JOIN bookings b ON b.site_id = $1 AND b.booking_date::date = d::date ${bookingScope('b', 3)}
        GROUP BY d ORDER BY d`,
-      [siteId, days]
+      trendParams
     ),
-    pool.query(`${recentSelect} ORDER BY b.created_at DESC LIMIT 8`, [siteId]),
+    pool.query(`${recentSelect} ORDER BY b.created_at DESC LIMIT 8`, listParams),
     pool.query(
       `${recentSelect}
          AND b.status NOT IN ('CANCELLED','CONFIRMED')
          AND b.kyc_status NOT IN ('VERIFIED','REJECTED')
        ORDER BY b.booking_date ASC NULLS LAST, b.created_at ASC LIMIT 5`,
-      [siteId]
+      listParams
     ),
-    pool.query(
+    // Site-wide leaderboard — admin only; meaningless once scoped to a single agent.
+    scoped ? Promise.resolve({ rows: [] }) : pool.query(
       `SELECT booked_by AS name, count(*)::int AS bookings, COALESCE(SUM(token_amount), 0)::float AS token
        FROM bookings
        WHERE site_id = $1 AND booked_by IS NOT NULL AND booking_date >= date_trunc('month', now())
@@ -131,24 +159,36 @@ export const getDashboard = asyncHandler(async (req, res) => {
          SELECT 'CREATED' AS kind, b.created_at AS at, b.id, b.booking_no,
                 m.full_name AS client_name, NULL AS detail
          FROM bookings b LEFT JOIN members m ON m.id = b.client_member_id
-         WHERE b.site_id = $1
+         WHERE b.site_id = $1 ${bookingScope('b', 2)}
          UNION ALL
          SELECT 'VERIFIED', k.verified_at, b.id, b.booking_no, m.full_name, NULL
          FROM kyc_cases k
          JOIN bookings b ON b.id = k.booking_id
          LEFT JOIN members m ON m.id = b.client_member_id
-         WHERE b.site_id = $1 AND k.verified_at IS NOT NULL
+         WHERE b.site_id = $1 AND k.verified_at IS NOT NULL ${bookingScope('b', 2)}
          UNION ALL
          SELECT 'OCR_DONE', d.ocr_completed_at, b.id, b.booking_no, m.full_name, d.type
          FROM documents d
          JOIN kyc_cases k ON k.id = d.kyc_case_id
          JOIN bookings b ON b.id = k.booking_id
          LEFT JOIN members m ON m.id = b.client_member_id
-         WHERE b.site_id = $1 AND d.ocr_status = 'DONE' AND d.ocr_completed_at IS NOT NULL
+         WHERE b.site_id = $1 AND d.ocr_status = 'DONE' AND d.ocr_completed_at IS NOT NULL ${bookingScope('b', 2)}
        ) ev
        WHERE ev.at IS NOT NULL
        ORDER BY ev.at DESC LIMIT 20`,
-      [siteId]
+      activityParams
+    ),
+    // Member-first KYC pipeline (agent's primary workflow) — covers cases that have no
+    // booking yet, which the booking-derived aggregates above never see.
+    pool.query(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE k.status NOT IN ('VERIFIED','REJECTED'))::int AS pending,
+              count(*) FILTER (WHERE k.status = 'VERIFIED')::int AS verified,
+              count(*) FILTER (WHERE k.booking_id IS NULL)::int AS not_booked
+       FROM kyc_cases k
+       LEFT JOIN bookings b ON b.id = k.booking_id
+       WHERE k.site_id = $1 ${kycScope('k', 'b', 2)}`,
+      myKycParams
     ),
   ]);
 
@@ -161,17 +201,23 @@ export const getDashboard = asyncHandler(async (req, res) => {
     queue: queue.rows,
     top_executive: topExec.rows[0] || null,
     activity: activity.rows,
+    my_kyc: myKyc.rows[0],
+    scoped,
     days,
     generated_at: new Date().toISOString(),
   });
 });
 
-/** POST /bookings */
+/** POST /bookings — admin roles only (agents do KYC; they never create bookings). */
 export const createBooking = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins can create bookings. Agents handle KYC only.' });
+  }
+
   const {
     site_id, plot_id, client_member_id,
     sale_price, token_amount, payment_plan,
-    booking_date, buyer_name, notes, booking_agent_id,
+    booking_date, buyer_name, notes, booking_agent_id, referral_code,
   } = req.body;
 
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
@@ -183,13 +229,44 @@ export const createBooking = asyncHandler(async (req, res) => {
     if (req.body[f] !== undefined) tokenData[f] = clean(req.body[f]);
   }
 
-  // Agent-network ownership: bookings created by non-admin users are owned by that
-  // agent and stamped with their team, so hierarchy/team scoping & future commission
-  // runs have a reliable source of truth.
+  // Referral attribution, strongest signal first:
+  //  1. An explicit referral_code (printed on the customer's KYC form and OCR'd or
+  //     typed at booking time) — PER-BOOKING attribution, so the same customer can be
+  //     brought back by a different agent for their next plot.
+  //  2. members.referred_by_user_id — the agent who first added this customer's number.
+  //  3. members.created_by, when that creator is an agent (legacy rows).
   let ownership = {};
-  if (!isAdminRole(req.user?.role)) {
-    const { rows: creatorRows } = await pool.query('SELECT id, team_id FROM users WHERE id = $1', [req.user.id]);
-    if (creatorRows[0]) ownership = { agent_user_id: creatorRows[0].id, team_id: creatorRows[0].team_id || null };
+  let referral_source = null;
+  if (referral_code) {
+    const code = String(referral_code).trim().toUpperCase();
+    const { rows } = await pool.query(
+      'SELECT id, team_id, name, referral_code FROM users WHERE upper(referral_code) = $1 AND is_active = true',
+      [code]
+    );
+    if (!rows[0]) {
+      return res.status(400).json({ message: `Referral code ${code} does not match any active agent` });
+    }
+    ownership = { agent_user_id: rows[0].id, team_id: rows[0].team_id || null };
+    referral_source = 'form';
+  } else {
+    const { rows: memberRows } = await pool.query(
+      `SELECT m.referred_by_user_id, m.created_by,
+              ru.id AS ref_id, ru.team_id AS ref_team, ru.role AS ref_role,
+              cu.id AS cre_id, cu.team_id AS cre_team, cu.role AS cre_role
+         FROM members m
+         LEFT JOIN users ru ON ru.id = m.referred_by_user_id
+         LEFT JOIN users cu ON cu.id = m.created_by
+        WHERE m.id = $1`,
+      [client_member_id]
+    );
+    const mem = memberRows[0];
+    if (mem?.ref_id) {
+      ownership = { agent_user_id: mem.ref_id, team_id: mem.ref_team || null };
+      referral_source = 'member';
+    } else if (mem?.cre_id && !isAdminRole(mem.cre_role)) {
+      ownership = { agent_user_id: mem.cre_id, team_id: mem.cre_team || null };
+      referral_source = 'member';
+    }
   }
 
   const created = await bookingModel.create({
@@ -212,8 +289,46 @@ export const createBooking = asyncHandler(async (req, res) => {
   }, pool);
 
   const booking_no = await bookingModel.generateBookingNo(created.id, created.booking_date, pool);
-  // Open a KYC case up front so the UI can immediately accept uploads.
-  await kycCaseModel.getOrCreateForBooking(created, pool);
+
+  // Adopt the customer's pre-existing KYC: member-anchored cases (opened by an agent
+  // before this booking existed) AND cases stranded on the member's CANCELLED bookings,
+  // so a re-booking never restarts KYC from zero.
+  const { rows: adopted } = await pool.query(
+    `UPDATE kyc_cases k SET booking_id = $1, updated_at = now()
+      WHERE k.client_member_id = $2
+        AND (k.booking_id IS NULL
+             OR EXISTS (SELECT 1 FROM bookings ob WHERE ob.id = k.booking_id AND ob.status = 'CANCELLED'))
+      RETURNING k.id, k.status`,
+    [created.id, client_member_id]
+  );
+  if (adopted.length) {
+    // Exactly ONE case per booking: the workspace UI, uploads and verify must all agree
+    // on the authoritative case. Keep the strongest (newest on ties), fold the others'
+    // documents into it, and delete the emptied duplicates.
+    const rank = { OPEN: 0, REJECTED: 0, OCR_PENDING: 1, OCR_DONE: 2, VERIFIED: 3 };
+    const sorted = [...adopted].sort((a, b) => (rank[b.status] ?? 0) - (rank[a.status] ?? 0) || b.id - a.id);
+    const best = sorted[0];
+    const losers = sorted.slice(1).map((c) => c.id);
+    if (losers.length) {
+      await pool.query('UPDATE documents SET kyc_case_id = $1, updated_at = now() WHERE kyc_case_id = ANY($2)', [best.id, losers]);
+      await pool.query('DELETE FROM kyc_cases WHERE id = ANY($1)', [losers]);
+    }
+
+    // Roll the booking's KYC status up from the surviving case.
+    const kycStatus = { OCR_PENDING: 'OCR_PENDING', OCR_DONE: 'OCR_DONE', VERIFIED: 'VERIFIED' }[best.status];
+    if (kycStatus) {
+      await pool.query(
+        `UPDATE bookings SET kyc_status = $1::varchar,
+                status = CASE WHEN $1::varchar = 'VERIFIED' AND status = 'KYC_PENDING' THEN 'KYC_DONE' ELSE status END,
+                updated_at = now()
+          WHERE id = $2`,
+        [kycStatus, created.id]
+      );
+    }
+  } else {
+    // No pre-booking KYC — open a fresh case so the UI can immediately accept uploads.
+    await kycCaseModel.getOrCreateForBooking(created, pool);
+  }
 
   // Propagate to the accounting plot ledger (BOOKED + buyer + Booking By + commission).
   // Fire-and-forget semantics: a sync failure must never fail the booking itself.
@@ -226,7 +341,9 @@ export const createBooking = asyncHandler(async (req, res) => {
   // plot sync so plots.booking_by is populated for the payment's "Booked By").
   const token_sync = await syncTokenPayment(created, pool);
 
-  res.status(201).json({ ...created, booking_no, plot_sync, token_sync });
+  // Re-read: the adoption rollup above may have advanced status/kyc_status.
+  const fresh = adopted.length ? await bookingModel.findById(created.id, pool) : created;
+  res.status(201).json({ ...fresh, booking_no, plot_sync, token_sync, referral_source });
 });
 
 /** GET /bookings/:id  → booking + kyc cases + documents (with latest OCR result) */
@@ -269,8 +386,11 @@ export const getBooking = asyncHandler(async (req, res) => {
   res.json({ ...booking, kyc_cases: cases, verifyUrl });
 });
 
-/** PUT /bookings/:id — editable fields only. */
+/** PUT /bookings/:id — editable fields only. Admin roles only. */
 export const updateBooking = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins can edit bookings' });
+  }
   const allowed = ['plot_id', 'sale_price', 'token_amount', 'payment_plan', 'status', 'buyer_name', 'notes', 'booking_date', 'booking_agent_id', ...TOKEN_PAYMENT_FIELDS];
   const data = {};
   for (const k of allowed) if (req.body[k] !== undefined) data[k] = req.body[k];
@@ -297,8 +417,11 @@ export const updateBooking = asyncHandler(async (req, res) => {
   res.json({ ...updated, plot_sync, token_sync });
 });
 
-/** POST /bookings/:id/cancel — status change only (no deletion). */
+/** POST /bookings/:id/cancel — status change only (no deletion). Admin roles only. */
 export const cancelBooking = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins can cancel bookings' });
+  }
   const updated = await bookingModel.update(req.params.id, { status: 'CANCELLED' }, pool);
   if (!updated) return res.status(404).json({ message: 'Booking not found' });
   // Drop the still-pending token payment (CANCELLED ⇒ removal path). Approved rows kept.
@@ -313,10 +436,26 @@ export const cancelBooking = asyncHandler(async (req, res) => {
  * (those FKs are SET NULL/RESTRICT and point outward). Uploaded files are cleaned first.
  */
 export const deleteBooking = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins can delete bookings' });
+  }
   const { id } = req.params;
   const booking = await bookingModel.findById(id, pool);
   if (!booking) return res.status(404).json({ message: 'Booking not found' });
 
+  // KYC belongs to the CUSTOMER, not the booking: detach the booking's cases (with
+  // their documents intact) back to member-anchored cases instead of letting the FK
+  // cascade destroy an agent's verified KYC. A future booking re-adopts them. Empty
+  // OPEN shells (the auto-created case nobody uploaded to) cascade away with the
+  // booking — detaching those would just pile up invisible orphans.
+  const { rows: detached } = await pool.query(
+    `UPDATE kyc_cases k SET booking_id = NULL, updated_at = now()
+      WHERE k.booking_id = $1 AND k.client_member_id IS NOT NULL
+        AND (k.status <> 'OPEN' OR EXISTS (SELECT 1 FROM documents d WHERE d.kyc_case_id = k.id))
+      RETURNING k.id`,
+    [id]
+  );
+  // Cases with no member to anchor on still cascade — clean their files first.
   const { rows: docs } = await pool.query(
     `SELECT d.file_path FROM documents d JOIN kyc_cases k ON k.id = d.kyc_case_id WHERE k.booking_id = $1`,
     [id]
@@ -331,22 +470,45 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   const token_sync = await syncTokenPayment({ ...booking, status: 'CANCELLED' }, pool);
 
   await pool.query('DELETE FROM bookings WHERE id = $1', [id]);
-  res.json({ message: 'Booking deleted', id: Number(id), removedDocuments: docs.length, token_sync });
+  res.json({
+    message: 'Booking deleted', id: Number(id),
+    detachedKycCases: detached.length, removedDocuments: docs.length, token_sync,
+  });
 });
 
-/** GET /clients/search?site_id=&q= — searches existing members (CLIENT). */
+/** GET /clients/search?site_id=&q= — searches existing members (CLIENT).
+ * Includes the referring agent (who added the number) + the latest KYC case status so
+ * the booking form can show "KYC verified · referred by AGT-XXXXX" on selection. */
 export const searchClients = asyncHandler(async (req, res) => {
   const { site_id, q } = req.query;
   const params = [];
-  const where = [`member_type = 'CLIENT'`];
-  if (site_id) { params.push(site_id); where.push(`site_id = $${params.length}`); }
+  const where = [`m.member_type = 'CLIENT'`];
+  if (site_id) { params.push(site_id); where.push(`m.site_id = $${params.length}`); }
   if (q) {
     params.push(`%${q}%`);
-    where.push(`(full_name ILIKE $${params.length} OR phone ILIKE $${params.length} OR aadhar_no ILIKE $${params.length} OR pan_no ILIKE $${params.length})`);
+    where.push(`(m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR m.aadhar_no ILIKE $${params.length} OR m.pan_no ILIKE $${params.length})`);
   }
+  // The LATERAL prefers the case a NEW booking would adopt (booking-less, or stranded
+  // on a CANCELLED booking) so kyc_attachable tells the form whether "documents attach
+  // automatically" is actually true; otherwise it falls back to the member's strongest
+  // case for display.
   const { rows } = await pool.query(
-    `SELECT id, full_name, phone, email, city, aadhar_no, pan_no, photo, occupation, father_name
-     FROM members WHERE ${where.join(' AND ')} ORDER BY full_name ASC LIMIT 50`,
+    `SELECT m.id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no, m.photo, m.occupation, m.father_name,
+            u.name AS referred_by_name, u.referral_code AS referred_by_code,
+            k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
+     FROM members m
+     LEFT JOIN users u ON u.id = m.referred_by_user_id
+     LEFT JOIN LATERAL (
+       SELECT kc.id, kc.status,
+              (kc.booking_id IS NULL OR b.status = 'CANCELLED') AS attachable
+         FROM kyc_cases kc
+         LEFT JOIN bookings b ON b.id = kc.booking_id
+        WHERE kc.client_member_id = m.id
+        ORDER BY (kc.booking_id IS NULL OR b.status = 'CANCELLED') DESC,
+                 (kc.status = 'VERIFIED') DESC, kc.id DESC
+        LIMIT 1
+     ) k ON true
+     WHERE ${where.join(' AND ')} ORDER BY m.full_name ASC LIMIT 50`,
     params
   );
   res.json(rows);
@@ -394,6 +556,12 @@ export const createClient = asyncHandler(async (req, res) => {
 
   const cols = ['site_id', 'member_type', 'status', 'created_by'];
   const vals = [site_id, 'CLIENT', 'ACTIVE', req.user?.id || null];
+  // A customer registered by an agent carries that agent as their referrer — bookings
+  // created later auto-attach the agent from this column.
+  if (!isAdminRole(req.user?.role)) {
+    cols.push('referred_by_user_id');
+    vals.push(req.user?.id || null);
+  }
   for (const f of CLIENT_FIELDS) {
     if (req.body[f] !== undefined) { cols.push(f); vals.push(clean(req.body[f])); }
   }
@@ -407,6 +575,12 @@ export const createClient = asyncHandler(async (req, res) => {
 
 /** PUT /clients/:id — update any of the supported CLIENT member fields. */
 export const updateClient = asyncHandler(async (req, res) => {
+  // members.gender has a DB CHECK (MALE/FEMALE/OTHER) — OCR/typed input arrives as
+  // "Male"; coerce or skip instead of failing the whole update.
+  if (req.body.gender !== undefined && req.body.gender !== '' && req.body.gender !== null) {
+    const g = String(req.body.gender).trim().toUpperCase();
+    if (['MALE', 'FEMALE', 'OTHER'].includes(g)) req.body.gender = g; else delete req.body.gender;
+  }
   const sets = [];
   const vals = [];
   for (const f of CLIENT_FIELDS) {

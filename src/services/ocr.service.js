@@ -16,7 +16,7 @@
  * On failure it throws, letting the processor mark the document FAILED (the UI
  * then offers a Retry, exactly like the old flow).
  */
-import { normalizeExtracted } from './groq.service.js';
+import { normalizeExtracted, extractKycFieldsWithAi } from './groq.service.js';
 
 const fetchFn = globalThis.fetch
   ? globalThis.fetch.bind(globalThis)
@@ -39,13 +39,41 @@ const FIELDS_BY_TYPE = {
   DL: ['name', 'dl_number', 'dob', 'gender', 'address', 'city', 'state', 'pincode'],
   DOMICILE: ['name', 'father_name', 'certificate_number (domicile / serial / registration number on the certificate)', 'issue_date (DD/MM/YYYY)', 'village', 'tehsil', 'district', 'state'],
   INCOME: ['name', 'father_name', 'certificate_number (income certificate / serial number)', 'annual_income (amount in rupees)', 'issue_date (DD/MM/YYYY)', 'district', 'state'],
+  // The company's own printed KYC Application Form, filled by hand and scanned back.
+  // Extracts EVERY booking-form field plus the machine block (agent code / KYC no).
+  KYC_FORM: [
+    'agent_code (the AGENT CODE printed in the box at the TOP-RIGHT of the form — format AGT-XXXXX)',
+    'kyc_no (the KYC reference number printed near the agent code, digits only)',
+    'name (applicant full name)', 'father_name', 'mother_name', 'spouse_name',
+    'dob (DD/MM/YYYY)', 'gender', 'marital_status', 'religion', 'nationality',
+    'qualification', 'occupation', 'company_name (employer / firm name)',
+    'mobile (10 digits)', 'alt_phone (10 digits)', 'whatsapp (10 digits)', 'email',
+    'address (correspondence address, single line, WITHOUT city/state/pincode)',
+    'city', 'state', 'pincode (6 digits)',
+    'aadhaar_number (12 digits)', 'pan_number (10 chars)', 'voter_id_number',
+    'nominee_name', 'nominee_relation', 'nominee_phone (10 digits)', 'nominee_dob (DD/MM/YYYY)',
+    'bank_name', 'account_number', 'ifsc_code (11 chars, e.g. HDFC0001234)', 'branch',
+  ],
   // Property / legal documents (registry, patta, land record …) uploaded as OTHER.
   OTHER: ['name (owner name)', 'father_name', 'plot_number', 'khasra_number', 'area (with unit)', 'registry_number', 'village', 'tehsil', 'district', 'state', 'date (DD/MM/YYYY)', 'amount (in rupees)', 'mobile (10 digits)', 'address'],
 };
 
+// Extra guidance for the company's own form: it is a PRINTED template with
+// HANDWRITTEN entries — very different OCR conditions from an ID card.
+const KYC_FORM_HINTS = `
+This is the company's own PRINTED "KYC Application Form". Some values are pre-printed
+(typed) and some are HANDWRITTEN in pen by the customer on dotted/blank lines.
+- Read handwriting carefully, letter by letter; Indian names and Hindi-influenced
+  spellings are common. If a handwritten value is ambiguous, prefer "" over a guess.
+- The TOP-RIGHT corner has a machine block with "AGENT CODE" (like AGT-7KQ2M) and
+  "KYC No." — transcribe these EXACTLY as printed; they are typed, not handwritten.
+- A field label followed by an empty dotted line means the customer left it blank —
+  return "" for it (do NOT copy the label text as a value).
+- For checkbox rows (e.g. Gender: [ ] Male [x] Female), return the ticked option.`;
+
 const buildPrompt = (docType) => {
   const fields = FIELDS_BY_TYPE[docType] || FIELDS_BY_TYPE.OTHER;
-  return `You are reading an Indian KYC / legal document image (type: ${docType}).
+  return `You are reading an Indian KYC / legal document image (type: ${docType}).${docType === 'KYC_FORM' ? KYC_FORM_HINTS : ''}
 Do three things and return ONE JSON object only:
 1) "raw_text": a faithful plain-text transcription of all legible text in the image.
 2) These snake_case fields: ${fields.join(', ')}.
@@ -74,16 +102,18 @@ async function getSharp() {
 /**
  * Auto-rotate (EXIF), downscale to an OCR-optimal resolution, stretch contrast and
  * recompress. Returns { buffer, mimeType } — the original on any failure.
+ * Full-page forms keep more resolution than ID cards: handwriting on an A4 sheet
+ * turns to mush at card-sized resolutions.
  */
-export async function preprocessImage(fileBuffer, mimeType) {
+export async function preprocessImage(fileBuffer, mimeType, { maxEdge = 1440, quality = 80 } = {}) {
   const sharp = await getSharp();
   if (!sharp) return { buffer: fileBuffer, mimeType };
   try {
     const out = await sharp(fileBuffer, { failOn: 'none' })
       .rotate()                                   // honour EXIF orientation (auto-rotate)
-      .resize({ width: 1440, height: 1440, fit: 'inside', withoutEnlargement: true })
+      .resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
       .normalize()                                // contrast stretch → crisper glyphs
-      .jpeg({ quality: 80, mozjpeg: true })
+      .jpeg({ quality, mozjpeg: true })
       .toBuffer();
     // Only keep the processed version when it actually helps (smaller or same-ish).
     if (out.length && out.length < fileBuffer.length * 1.15) {
@@ -96,6 +126,66 @@ export async function preprocessImage(fileBuffer, mimeType) {
   }
 }
 
+/* ── Stage: PDF → image (scanned forms are often shared as PDFs) ──────────── */
+
+/**
+ * Render a PDF's first pages to one tall PNG. The printable KYC form is a single
+ * page, but phone scanner apps sometimes emit 2 pages — both are stitched vertically
+ * so nothing is silently dropped. Throws a friendly error on failure.
+ */
+export async function pdfToImage(pdfBuffer) {
+  let pdfToPng;
+  try {
+    ({ pdfToPng } = await import('pdf-to-png-converter'));
+  } catch (e) {
+    throw new Error('PDF support unavailable on this server — upload a photo (JPG/PNG) of the form instead');
+  }
+  const pages = await pdfToPng(pdfBuffer, {
+    viewportScale: 2.0,      // ~150dpi at A4 — enough for handwriting
+    pagesToProcess: [1, 2],  // form is 1 page; tolerate a 2-page scan
+    strictPagesToProcess: false,
+    disableFontFace: true,
+  });
+  if (!pages?.length) throw new Error('Could not render the PDF — upload a photo (JPG/PNG) of the form instead');
+  if (pages.length === 1) return pages[0].content;
+
+  // Stitch two pages vertically with sharp (falls back to page 1 alone).
+  const sharp = await getSharp();
+  if (!sharp) return pages[0].content;
+  try {
+    const metas = await Promise.all(pages.map((p) => sharp(p.content).metadata()));
+    const width = Math.max(...metas.map((m) => m.width || 0));
+    const height = metas.reduce((s, m) => s + (m.height || 0), 0);
+    let top = 0;
+    const composite = pages.map((p, i) => {
+      const layer = { input: p.content, left: 0, top };
+      top += metas[i].height || 0;
+      return layer;
+    });
+    return await sharp({ create: { width, height, channels: 3, background: '#ffffff' } })
+      .composite(composite)
+      .png()
+      .toBuffer();
+  } catch {
+    return pages[0].content;
+  }
+}
+
+/* ── Stage: DOCX → text (typed forms sent as Word documents) ─────────────── */
+
+export async function docxToText(docxBuffer) {
+  let mammoth;
+  try {
+    mammoth = (await import('mammoth')).default;
+  } catch {
+    throw new Error('DOCX support unavailable on this server — upload a PDF or photo of the form instead');
+  }
+  const { value } = await mammoth.extractRawText({ buffer: docxBuffer });
+  const text = String(value || '').trim();
+  if (!text) throw new Error('The DOCX file contains no readable text');
+  return text;
+}
+
 /* ── Stage: strict validation of AI output ────────────────────────────────── */
 
 const RX = {
@@ -104,6 +194,9 @@ const RX = {
   pincode: /^\d{6}$/,
   mobile: /^[6-9]\d{9}$/,
   isoDate: /^\d{4}-\d{2}-\d{2}$/,
+  // Referral codes use an ambiguity-free alphabet (no 0/O/1/I) — see agentNetwork.service.
+  agentCode: /^AGT-[A-HJ-NP-Z2-9]{5}$/,
+  ifsc: /^[A-Z]{4}0[A-Z0-9]{6}$/,
 };
 
 const digitsOnly = (v) => String(v).replace(/\D/g, '');
@@ -135,7 +228,35 @@ export function validateFields(fields) {
     if (m.length === 12 && m.startsWith('91')) m = m.slice(2);
     if (RX.mobile.test(m)) out.mobile = m; else drop('mobile');
   }
-  for (const k of ['dob', 'issue_date', 'date']) {
+  // Extra phone-shaped fields from the KYC form get the same normalisation as mobile.
+  for (const k of ['alt_phone', 'whatsapp', 'nominee_phone']) {
+    if (out[k] === undefined) continue;
+    let m = digitsOnly(out[k]);
+    if (m.length === 12 && m.startsWith('91')) m = m.slice(2);
+    if (RX.mobile.test(m)) out[k] = m; else drop(k);
+  }
+  if (out.agent_code !== undefined) {
+    // Typed machine block — uppercase, strip spaces/junk around the dash. Validation
+    // is deliberately STRICT with no character "fixing": a mis-corrected code could
+    // attribute the booking to the wrong agent. An unreadable code is dropped and the
+    // admin types it manually (it's printed right on the form).
+    let code = String(out.agent_code).toUpperCase().replace(/\s+/g, '').replace(/[^A-Z0-9-]/g, '');
+    if (!code.startsWith('AGT-') && code.startsWith('AGT')) code = `AGT-${code.slice(3)}`;
+    if (RX.agentCode.test(code)) out.agent_code = code; else drop('agent_code');
+  }
+  if (out.ifsc !== undefined) {
+    const ifsc = String(out.ifsc).toUpperCase().replace(/\s/g, '');
+    if (RX.ifsc.test(ifsc)) out.ifsc = ifsc; else drop('ifsc');
+  }
+  if (out.kyc_no !== undefined) {
+    const digits = digitsOnly(out.kyc_no);
+    if (digits) out.kyc_no = digits; else drop('kyc_no');
+  }
+  if (out.email !== undefined) {
+    const email = String(out.email).trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) out.email = email; else drop('email');
+  }
+  for (const k of ['dob', 'issue_date', 'date', 'nominee_dob']) {
     if (out[k] === undefined) continue;
     if (!RX.isoDate.test(out[k])) { drop(k); continue; }
     const d = new Date(out[k]);
@@ -163,13 +284,40 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
   if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not set — cannot run OCR');
   if (!fileBuffer?.length) throw new Error('empty file buffer');
 
-  const isPdf = mimeType === 'application/pdf' || fileBuffer.subarray(0, 5).toString('latin1') === '%PDF-';
+  let buffer = fileBuffer;
+  let mime = mimeType;
+
+  // DOCX → text-only path (no image to look at): extract text, then run the same
+  // field extraction via the text model. Detected by mime OR the PK zip signature
+  // with a .docx-style content type absent.
+  const isDocx = mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (isDocx) {
+    onStage?.('PREPROCESS');
+    const text = await docxToText(fileBuffer);
+    onStage?.('OCR');
+    const rawFields = await extractKycFieldsWithAi(text, docType);
+    onStage?.('VALIDATE');
+    const { fields, dropped } = validateFields(rawFields);
+    if (dropped.length) console.warn(`[ocr] validation dropped: ${dropped.join(', ')}`);
+    // Typed documents carry no per-field visual uncertainty — flat medium-high score.
+    const confidenceMap = Object.fromEntries(Object.keys(fields).map((k) => [k, 0.85]));
+    return { text, fields, confidence: Object.keys(fields).length ? 0.85 : 0.3, confidenceMap, engine: `${ENGINE_NAME}-docx` };
+  }
+
+  // PDF → render to an image first, then continue through the vision pipeline.
+  const isPdf = mime === 'application/pdf' || fileBuffer.subarray(0, 5).toString('latin1') === '%PDF-';
   if (isPdf) {
-    throw new Error('PDF not supported by the fast OCR engine — please upload an image (JPG/PNG) of the document');
+    onStage?.('PREPROCESS');
+    buffer = await pdfToImage(fileBuffer);
+    mime = 'image/png';
   }
 
   onStage?.('PREPROCESS');
-  const pre = await preprocessImage(fileBuffer, mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg');
+  // Full-page forms keep more pixels than ID cards — handwriting needs them.
+  const preOpts = docType === 'KYC_FORM' || docType === 'FINAL_APPROVED_BOOKED_FORM'
+    ? { maxEdge: 2000, quality: 85 }
+    : {};
+  const pre = await preprocessImage(buffer, mime && mime.startsWith('image/') ? mime : 'image/jpeg', preOpts);
   const dataUrl = `data:${pre.mimeType};base64,${pre.buffer.toString('base64')}`;
 
   onStage?.('OCR');
@@ -191,7 +339,8 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
           ],
         }],
         temperature: 0.1,
-        max_tokens: 1600,
+        // Full-page forms return a long transcription + ~30 fields — needs headroom.
+        max_tokens: docType === 'KYC_FORM' ? 3200 : 1600,
         response_format: { type: 'json_object' },
       }),
     });

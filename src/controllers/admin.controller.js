@@ -15,6 +15,7 @@ import { isAdminRole, logActivity } from '../services/agentNetwork.service.js';
 // Booking-app sidebar modules — keep keys in sync with booking-ui Layout.jsx.
 export const BOOKING_MODULES = [
   'booking_dashboard', 'booking_bookings', 'booking_new_booking', 'booking_members',
+  'booking_kyc_new', 'booking_kyc_all',
   'booking_plot_documents', 'booking_agreements', 'booking_network', 'booking_teams',
   'booking_company_details', 'booking_payment_details',
 ];

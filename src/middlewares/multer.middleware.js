@@ -6,13 +6,17 @@ import path from 'path';
 const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
-  const allowed = /jpg|jpeg|png|webp|pdf/;
+  // docx accepted for typed/scanned KYC forms (text extracted via mammoth).
+  const allowed = /jpg|jpeg|png|webp|pdf|docx/;
   const okExt = allowed.test(path.extname(file.originalname).toLowerCase());
   // Trust a matching mime, or a generic octet-stream when the extension is valid
-  // (some clients don't set an image/* content-type).
-  const okMime = allowed.test(file.mimetype) || file.mimetype === 'application/octet-stream';
+  // (some clients don't set an image/* content-type). docx's real mime is the long
+  // openxml one, which the regex won't match — the extension check covers it.
+  const okMime = allowed.test(file.mimetype)
+    || file.mimetype === 'application/octet-stream'
+    || file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if (okExt && okMime) return cb(null, true);
-  cb(new Error('Invalid file type (allowed: jpg, jpeg, png, webp, pdf)'));
+  cb(new Error('Invalid file type (allowed: jpg, jpeg, png, webp, pdf, docx)'));
 };
 
 const upload = multer({

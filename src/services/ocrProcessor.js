@@ -14,13 +14,14 @@ import { fetchKycDocumentBytes } from '../utils/s3.js';
 import { emitOcrUpdate } from '../config/socket.js';
 import { runOcr } from './ocr.service.js';
 
-/** booking_id for a document (for socket room targeting). */
-const getBookingId = async (documentId) => {
+/** case_id + booking_id for a document (for socket room targeting). booking_id is
+ * null for member-anchored KYC cases created before any booking exists. */
+const getCaseAndBookingId = async (documentId) => {
   const { rows } = await pool.query(
-    `SELECT k.booking_id FROM documents d JOIN kyc_cases k ON k.id = d.kyc_case_id WHERE d.id = $1`,
+    `SELECT k.id AS case_id, k.booking_id FROM documents d JOIN kyc_cases k ON k.id = d.kyc_case_id WHERE d.id = $1`,
     [documentId]
   );
-  return rows[0]?.booking_id || null;
+  return { caseId: rows[0]?.case_id || null, bookingId: rows[0]?.booking_id || null };
 };
 
 const setProcessing = (documentId) =>
@@ -78,10 +79,12 @@ const rollupCaseAndBooking = async (documentId) => {
 
   if (allDone && row.case_status !== 'VERIFIED') {
     await pool.query(`UPDATE kyc_cases SET status='OCR_DONE', updated_at=now() WHERE id=$1`, [row.case_id]);
-    await pool.query(
-      `UPDATE bookings SET kyc_status='OCR_DONE', updated_at=now() WHERE id=$1 AND kyc_status <> 'VERIFIED'`,
-      [row.booking_id]
-    );
+    if (row.booking_id) {
+      await pool.query(
+        `UPDATE bookings SET kyc_status='OCR_DONE', updated_at=now() WHERE id=$1 AND kyc_status <> 'VERIFIED'`,
+        [row.booking_id]
+      );
+    }
   }
   return row.booking_id;
 };
@@ -127,8 +130,8 @@ export const processDocument = async (documentId, preload) => {
     return;
   }
 
-  const bookingId = await getBookingId(documentId);
-  const stage = (s) => emitOcrUpdate({ bookingId, documentId, status: 'PROCESSING', stage: s });
+  const { caseId, bookingId } = await getCaseAndBookingId(documentId);
+  const stage = (s) => emitOcrUpdate({ bookingId, caseId, documentId, status: 'PROCESSING', stage: s });
 
   try {
     await setProcessing(documentId);
@@ -153,13 +156,13 @@ export const processDocument = async (documentId, preload) => {
     await saveResult({ documentId, ...result });
     await setDone(documentId, result.engine);
     const bId = await rollupCaseAndBooking(documentId);
-    emitOcrUpdate({ bookingId: bId || bookingId, documentId, status: 'DONE', stage: 'DONE' });
+    emitOcrUpdate({ bookingId: bId || bookingId, caseId, documentId, status: 'DONE', stage: 'DONE' });
     console.log(`[ocrProcessor] done document_id=${documentId} fields=${Object.keys(result.fields).join(',')}`);
   } catch (err) {
     console.error(`[ocrProcessor] FAILED document_id=${documentId}:`, err.message);
     await setFailed(documentId, err);
     let bId = bookingId;
     try { bId = await rollupCaseAndBooking(documentId); } catch { /* ignore */ }
-    emitOcrUpdate({ bookingId: bId || bookingId, documentId, status: 'FAILED', stage: 'FAILED' });
+    emitOcrUpdate({ bookingId: bId || bookingId, caseId, documentId, status: 'FAILED', stage: 'FAILED' });
   }
 };
