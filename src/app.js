@@ -11,15 +11,40 @@ const app = express();
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan('dev'));
 
-// CORS — allow ALL origins. `origin: true` reflects the request's origin (so it
-// also works when requests send credentials/Authorization), and handles preflight.
+const corsOriginValue = String(process.env.CORS_ORIGIN || '').trim();
+const configuredCorsOrigins = corsOriginValue && corsOriginValue !== '*'
+  ? corsOriginValue.split(',').map((origin) => origin.trim()).filter(Boolean)
+  : [];
+const allowedCorsOrigins = new Set([
+  ...configuredCorsOrigins,
+  'https://sales-dg-frontend.vercel.app',
+  'https://www.dgbooking.com',
+  'https://dgbooking.com',
+  'http://localhost:5173',
+  'http://localhost:3000',
+]);
+
+const corsOriginHandler = (origin, callback) => {
+  if (!origin) return callback(null, true);
+  if (corsOriginValue === '*' || allowedCorsOrigins.has(origin)) {
+    return callback(null, true);
+  }
+  return callback(null, false);
+};
+
+// CORS — allow the booking frontend origins explicitly and handle preflight.
 app.use(cors({
-  origin: true,
+  origin: corsOriginHandler,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
-app.options('*', cors({ origin: true, credentials: true }));
+app.options('*', cors({
+  origin: corsOriginHandler,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+}));
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
