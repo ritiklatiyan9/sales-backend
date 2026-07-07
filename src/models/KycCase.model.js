@@ -31,6 +31,57 @@ class KycCaseModel extends MasterModel {
   }
 
   /**
+   * Adopt the customer's pre-existing KYC into a freshly-created booking:
+   * member-anchored cases (opened by an agent before this booking existed) AND cases
+   * stranded on the member's CANCELLED bookings, so a re-booking never restarts KYC
+   * from zero. Keeps exactly ONE case per booking (strongest wins, others' documents
+   * fold into it), rolls the booking's kyc_status up from the surviving case, and
+   * opens a fresh case when the member had none. Shared by createBooking and the
+   * draw-allotment flow. Returns the number of adopted cases.
+   */
+  async adoptForBooking(booking, pool) {
+    const { rows: adopted } = await pool.query(
+      `UPDATE kyc_cases k SET booking_id = $1, updated_at = now()
+        WHERE k.client_member_id = $2
+          AND (k.booking_id IS NULL
+               OR EXISTS (SELECT 1 FROM bookings ob WHERE ob.id = k.booking_id AND ob.status = 'CANCELLED'))
+        RETURNING k.id, k.status`,
+      [booking.id, booking.client_member_id]
+    );
+
+    if (!adopted.length) {
+      // No pre-booking KYC — open a fresh case so the UI can immediately accept uploads.
+      await this.getOrCreateForBooking(booking, pool);
+      return 0;
+    }
+
+    // Exactly ONE case per booking: the workspace UI, uploads and verify must all agree
+    // on the authoritative case. Keep the strongest (newest on ties), fold the others'
+    // documents into it, and delete the emptied duplicates.
+    const rank = { OPEN: 0, REJECTED: 0, OCR_PENDING: 1, OCR_DONE: 2, VERIFIED: 3 };
+    const sorted = [...adopted].sort((a, b) => (rank[b.status] ?? 0) - (rank[a.status] ?? 0) || b.id - a.id);
+    const best = sorted[0];
+    const losers = sorted.slice(1).map((c) => c.id);
+    if (losers.length) {
+      await pool.query('UPDATE documents SET kyc_case_id = $1, updated_at = now() WHERE kyc_case_id = ANY($2)', [best.id, losers]);
+      await pool.query('DELETE FROM kyc_cases WHERE id = ANY($1)', [losers]);
+    }
+
+    // Roll the booking's KYC status up from the surviving case.
+    const kycStatus = { OCR_PENDING: 'OCR_PENDING', OCR_DONE: 'OCR_DONE', VERIFIED: 'VERIFIED' }[best.status];
+    if (kycStatus) {
+      await pool.query(
+        `UPDATE bookings SET kyc_status = $1::varchar,
+                status = CASE WHEN $1::varchar = 'VERIFIED' AND status = 'KYC_PENDING' THEN 'KYC_DONE' ELSE status END,
+                updated_at = now()
+          WHERE id = $2`,
+        [kycStatus, booking.id]
+      );
+    }
+    return adopted.length;
+  }
+
+  /**
    * Member-anchored case (no booking yet — the agent "New KYC" flow).
    * Reuses the member's open booking-less case when the requester can see it
    * (visibleUserIds null = admin, unrestricted), else opens one they own.

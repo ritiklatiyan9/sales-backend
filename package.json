@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "src/server.js",
-  "description": "Booking & KYC module API \u2014 co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
+  "description": "Booking & KYC module API — co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
@@ -16,7 +16,9 @@
     "migrate:agent-network": "node src/migrations/007_agent_network.js",
     "migrate:member-kyc": "node src/migrations/008_member_kyc.js",
     "migrate:home-layout": "node src/migrations/009_home_layout.js",
-    "migrate:kyc-form": "node src/migrations/010_kyc_form_doc_type.js"
+    "migrate:kyc-form": "node src/migrations/010_kyc_form_doc_type.js",
+    "migrate:draw": "node src/migrations/011_draw_module.js",
+    "migrate:login-otp": "node src/migrations/012_login_otp.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.700.0",
@@ -26,12 +28,15 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.18.2",
+    "firebase-admin": "^14.1.0",
+    "google-auth-library": "^10.9.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mammoth": "^1.12.0",
     "morgan": "^1.10.0",
     "multer": "^2.1.1",
     "node-fetch": "^3.3.2",
+    "nodemailer": "^9.0.3",
     "pdf-to-png-converter": "^4.1.1",
     "pg": "^8.11.3",
     "sharp": "^0.35.3",

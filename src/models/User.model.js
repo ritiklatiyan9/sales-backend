@@ -7,6 +7,15 @@ class UserModel {
     return rows[0];
   }
 
+  /** Case-insensitive lookup — Google emails arrive normalised, legacy rows may not be. */
+  async findByEmailInsensitive(email) {
+    const { rows } = await pool.query(
+      'SELECT * FROM users WHERE lower(email) = lower($1) LIMIT 1',
+      [email]
+    );
+    return rows[0];
+  }
+
   async findById(id) {
     const { rows } = await pool.query('SELECT * FROM users WHERE id = $1 LIMIT 1', [id]);
     return rows[0];

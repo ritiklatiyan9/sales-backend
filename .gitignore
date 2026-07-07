@@ -10,3 +10,5 @@ server.log
 .booking.txt
 .case.txt
 .doc.txt
+# Firebase Admin SDK service-account key (server secret — never commit)
+secrets/

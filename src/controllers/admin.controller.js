@@ -18,6 +18,7 @@ export const BOOKING_MODULES = [
   'booking_kyc_new', 'booking_kyc_all',
   'booking_plot_documents', 'booking_agreements', 'booking_network', 'booking_teams',
   'booking_company_details', 'booking_payment_details',
+  'booking_new_entry', 'booking_draws',
 ];
 
 const requireAdmin = (req, res) => {

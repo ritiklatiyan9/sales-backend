@@ -10,6 +10,7 @@ import bookingModel from '../models/Booking.model.js';
 import { extractKycFieldsWithAi } from '../services/groq.service.js';
 import { getVisibleUserIds, isAdminRole } from '../services/agentNetwork.service.js';
 import { hasPermission } from '../services/permissions.service.js';
+import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
 
 // Both KYC sidebar modules ('New KYC' / 'All KYCs') manage the same underlying
 // resource — Access Control's Update/Delete toggles on the "All KYCs" row are the
@@ -108,47 +109,15 @@ export const createCase = asyncHandler(async (req, res) => {
       visibleUserIds,
     }, pool);
   } else {
-    const cleanPhone = String(phone || '').replace(/\D/g, '');
-    if (cleanPhone.length < 6 || cleanPhone.length > 15) {
-      return res.status(400).json({ message: 'Enter a valid mobile number' });
-    }
-
-    // Find-or-create must be atomic: an advisory lock keyed on the number serialises
-    // double-taps and two agents racing on the same lead (members has no unique
-    // phone constraint). Matching on the trailing 10 digits absorbs +91/0 prefixes.
+    // Find-or-create by phone is shared with the Draw Registration flow — atomicity
+    // (advisory xact lock) and the referral-claim rule live in the helper.
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',
-        [`kyc_quick_add:${site_id}:${cleanPhone.slice(-10)}`]);
-
-      const { rows: existing } = await client.query(
-        `SELECT * FROM members
-          WHERE member_type = 'CLIENT' AND site_id = $1
-            AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') <> ''
-            AND RIGHT(regexp_replace(COALESCE(phone, ''), '\\D', '', 'g'), 10) = RIGHT($2, 10)
-          ORDER BY id DESC LIMIT 1`,
-        [site_id, cleanPhone]
+      member = await findOrCreateClientByPhone(
+        { siteId: site_id, phone, fullName: full_name, user: req.user },
+        client
       );
-      member = existing[0];
-
-      if (!member) {
-        const name = String(full_name || '').trim() || `Customer ${cleanPhone}`;
-        const referredBy = isAdmin ? null : req.user?.id || null;
-        const { rows: created } = await client.query(
-          `INSERT INTO members (site_id, member_type, status, full_name, phone, created_by, referred_by_user_id)
-           VALUES ($1, 'CLIENT', 'ACTIVE', $2, $3, $4, $5) RETURNING *`,
-          [site_id, name, cleanPhone, req.user?.id || null, referredBy]
-        );
-        member = created[0];
-      } else if (!member.referred_by_user_id && !isAdmin) {
-        // Existing customer without a referrer — the agent adding them now claims it.
-        await client.query(
-          `UPDATE members SET referred_by_user_id = $1, updated_at = now()
-            WHERE id = $2 AND referred_by_user_id IS NULL`,
-          [req.user.id, member.id]
-        );
-      }
 
       kycCase = await kycCaseModel.getOrCreateForMember({
         memberId: member.id,

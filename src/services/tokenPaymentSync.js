@@ -22,12 +22,13 @@ import pool from '../config/db.js';
 
 // FROM modes that count as a BANK payment type — copied from the accounting frontend
 // (Frontend/src/pages/PlotPayments.jsx) so the derivation matches 1:1.
+// Exported: plotPayments.controller.js writes to the same shared ledger.
 const BANK_TYPE_FROMS = ['BANK', 'TRANSFER', 'CHEQUE', 'UPI', 'NEFT', 'RTGS', 'IMPS'];
-const derivePaymentType = (from) =>
+export const derivePaymentType = (from) =>
   from === 'CHEQUE' ? 'CHEQUE' : BANK_TYPE_FROMS.includes(from) ? 'BANK' : 'CASH';
 
 // Normalise a text field the way the accounting createPayment does: trim + UPPER, '' → null.
-const up = (v) => {
+export const up = (v) => {
   if (v === null || v === undefined) return null;
   const t = String(v).trim();
   return t ? t.toUpperCase() : null;

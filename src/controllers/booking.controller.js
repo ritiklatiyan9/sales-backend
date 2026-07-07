@@ -33,6 +33,36 @@ const CLIENT_FIELDS = [
 // Normalise '' → null so optional date/number-ish columns don't choke on empty strings.
 const clean = (v) => (v === '' ? null : v);
 
+/**
+ * A draw-allotted booking that gets cancelled/deleted must release its allotment:
+ * the draw registration returns to WINNER (still a winner, shop freed) so the unit
+ * can be re-allotted — otherwise ALLOTTED is a dead-end pointing at a dead booking.
+ * Best-effort: tolerates deploys where migration 011 hasn't run (42P01).
+ */
+const revertDrawAllotment = async (bookingId, actorId) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE draw_registrations
+          SET status = 'WINNER', allotted_plot_id = NULL, allotted_at = NULL,
+              allotted_by = NULL, booking_id = NULL, updated_at = now()
+        WHERE booking_id = $1 AND status = 'ALLOTTED'
+        RETURNING id`,
+      [bookingId]
+    );
+    for (const r of rows) {
+      await pool.query(
+        `INSERT INTO draw_events (draw_registration_id, event_type, detail, actor_user_id)
+         VALUES ($1, 'ALLOTMENT_REVERTED', $2, $3)`,
+        [r.id, JSON.stringify({ booking_id: Number(bookingId) }), actorId || null]
+      ).catch(() => { /* audit is best-effort here */ });
+    }
+    return rows.length;
+  } catch (err) {
+    if (err?.code !== '42P01') console.error('[booking] draw-allotment revert failed:', err.message);
+    return 0;
+  }
+};
+
 /** GET /bookings?site_id=&status=&kyc_status=&q=&client_member_id=
  * Visibility is role-scoped server-side: admins see everything; agents/team heads
  * see only bookings owned by (or created by) users inside their own network. */
@@ -290,45 +320,9 @@ export const createBooking = asyncHandler(async (req, res) => {
 
   const booking_no = await bookingModel.generateBookingNo(created.id, created.booking_date, pool);
 
-  // Adopt the customer's pre-existing KYC: member-anchored cases (opened by an agent
-  // before this booking existed) AND cases stranded on the member's CANCELLED bookings,
-  // so a re-booking never restarts KYC from zero.
-  const { rows: adopted } = await pool.query(
-    `UPDATE kyc_cases k SET booking_id = $1, updated_at = now()
-      WHERE k.client_member_id = $2
-        AND (k.booking_id IS NULL
-             OR EXISTS (SELECT 1 FROM bookings ob WHERE ob.id = k.booking_id AND ob.status = 'CANCELLED'))
-      RETURNING k.id, k.status`,
-    [created.id, client_member_id]
-  );
-  if (adopted.length) {
-    // Exactly ONE case per booking: the workspace UI, uploads and verify must all agree
-    // on the authoritative case. Keep the strongest (newest on ties), fold the others'
-    // documents into it, and delete the emptied duplicates.
-    const rank = { OPEN: 0, REJECTED: 0, OCR_PENDING: 1, OCR_DONE: 2, VERIFIED: 3 };
-    const sorted = [...adopted].sort((a, b) => (rank[b.status] ?? 0) - (rank[a.status] ?? 0) || b.id - a.id);
-    const best = sorted[0];
-    const losers = sorted.slice(1).map((c) => c.id);
-    if (losers.length) {
-      await pool.query('UPDATE documents SET kyc_case_id = $1, updated_at = now() WHERE kyc_case_id = ANY($2)', [best.id, losers]);
-      await pool.query('DELETE FROM kyc_cases WHERE id = ANY($1)', [losers]);
-    }
-
-    // Roll the booking's KYC status up from the surviving case.
-    const kycStatus = { OCR_PENDING: 'OCR_PENDING', OCR_DONE: 'OCR_DONE', VERIFIED: 'VERIFIED' }[best.status];
-    if (kycStatus) {
-      await pool.query(
-        `UPDATE bookings SET kyc_status = $1::varchar,
-                status = CASE WHEN $1::varchar = 'VERIFIED' AND status = 'KYC_PENDING' THEN 'KYC_DONE' ELSE status END,
-                updated_at = now()
-          WHERE id = $2`,
-        [kycStatus, created.id]
-      );
-    }
-  } else {
-    // No pre-booking KYC — open a fresh case so the UI can immediately accept uploads.
-    await kycCaseModel.getOrCreateForBooking(created, pool);
-  }
+  // Adopt the customer's pre-existing KYC (member-anchored or stranded on CANCELLED
+  // bookings) so a re-booking never restarts KYC from zero; opens a fresh case if none.
+  const adoptedCount = await kycCaseModel.adoptForBooking(created, pool);
 
   // Propagate to the accounting plot ledger (BOOKED + buyer + Booking By + commission).
   // Fire-and-forget semantics: a sync failure must never fail the booking itself.
@@ -342,7 +336,7 @@ export const createBooking = asyncHandler(async (req, res) => {
   const token_sync = await syncTokenPayment(created, pool);
 
   // Re-read: the adoption rollup above may have advanced status/kyc_status.
-  const fresh = adopted.length ? await bookingModel.findById(created.id, pool) : created;
+  const fresh = adoptedCount ? await bookingModel.findById(created.id, pool) : created;
   res.status(201).json({ ...fresh, booking_no, plot_sync, token_sync, referral_source });
 });
 
@@ -426,7 +420,9 @@ export const cancelBooking = asyncHandler(async (req, res) => {
   if (!updated) return res.status(404).json({ message: 'Booking not found' });
   // Drop the still-pending token payment (CANCELLED ⇒ removal path). Approved rows kept.
   const token_sync = await syncTokenPayment(updated, pool);
-  res.json({ ...updated, token_sync });
+  // If this booking came from a draw allotment, free the allotment (draw → WINNER).
+  const draw_reverted = await revertDrawAllotment(updated.id, req.user?.id);
+  res.json({ ...updated, token_sync, draw_reverted });
 });
 
 /**
@@ -468,6 +464,10 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   // Forcing the removal path keeps the chosen lifecycle: a deleted booking takes its
   // pending ledger entry with it, but never touches money Accounting already approved.
   const token_sync = await syncTokenPayment({ ...booking, status: 'CANCELLED' }, pool);
+
+  // Free a draw allotment BEFORE the delete — the FK would only null booking_id,
+  // stranding the registration in ALLOTTED with no booking behind it.
+  await revertDrawAllotment(booking.id, req.user?.id);
 
   await pool.query('DELETE FROM bookings WHERE id = $1', [id]);
   res.json({
