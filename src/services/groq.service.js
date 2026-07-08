@@ -145,7 +145,8 @@ function buildExtractionPrompt(text, type) {
       'address (correspondence address without city/state/pincode)',
       'city', 'state', 'pincode (6 digits)',
       'aadhaar_number (12 digits)', 'pan_number (10 chars)', 'voter_id_number',
-      'nominee_name', 'nominee_relation', 'nominee_phone', 'nominee_dob (DD/MM/YYYY)',
+      'nominee_name', 'nominee_relation', 'nominee_phone',
+      'nominee_id (the nominee\'s Aadhaar / ID number)', 'nominee_dob (DD/MM/YYYY)',
       'bank_name', 'account_number', 'ifsc_code', 'branch',
     ],
   };
@@ -263,6 +264,7 @@ export function normalizeExtracted(extracted, documentType) {
         normalized.nominee_name = extracted.nominee_name || '';
         normalized.nominee_relation = extracted.nominee_relation || extracted.nominee_relationship || '';
         normalized.nominee_phone = extracted.nominee_phone || '';
+        normalized.nominee_id = extracted.nominee_id || extracted.nominee_aadhaar || '';
         normalized.nominee_dob = formatDob(extracted.nominee_dob || '');
         normalized.bank_name = extracted.bank_name || '';
         normalized.account_number = extracted.account_number || extracted.account_no || '';

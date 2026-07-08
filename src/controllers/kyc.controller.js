@@ -56,6 +56,21 @@ const canAccessCase = async (user, kycCase) => {
     const b = rows[0];
     if (b && (visible.includes(b.agent_user_id) || visible.includes(b.created_by))) return true;
   }
+  // Draw flow: registration auto-opens the customer's case (sometimes by the office),
+  // but running the KYC is the AGENT's job — a draw in the agent's network on this
+  // case (or this member) grants access. Tolerates the draw tables not being migrated.
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM draw_registrations r
+        WHERE (r.kyc_case_id = $1 OR r.client_member_id = $2)
+          AND (r.agent_user_id = ANY($3) OR r.created_by = ANY($3))
+        LIMIT 1`,
+      [kycCase.id, kycCase.client_member_id, visible]
+    );
+    if (rows[0]) return true;
+  } catch (err) {
+    if (err.code !== '42P01' && err.code !== '42703') throw err; // missing table/column
+  }
   return false;
 };
 
@@ -189,8 +204,9 @@ export const uploadDocument = asyncHandler(async (req, res) => {
   const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
   const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
 
-  // Photos and the final signed booking form don't need OCR — they're archive files.
-  const skipOcr = type === 'PHOTO' || type === 'FINAL_APPROVED_BOOKED_FORM';
+  // Photos and the final booking/KYC-form documents don't need OCR — they're archive files.
+  const skipOcr = type === 'PHOTO' || type === 'FINAL_APPROVED_BOOKED_FORM'
+    || type === 'FINAL_BOOKING_FORM' || type === 'CO_APPLICANT_PHOTO';
 
   const doc = await documentModel.create({
     kyc_case_id: kycCase.id,
@@ -341,6 +357,26 @@ export const updateDocumentFields = asyncHandler(async (req, res) => {
   res.json({ documentId: doc.id, fields, confidence_map: confidenceMap, confidence_overall: overall });
 });
 
+// The printed KYC form's QR encodes this public URL; the page resolves the token
+// against the LIVE row (status changes over time — same pattern as draw QRs).
+const kycVerifyUrl = (qrToken) => {
+  const base = process.env.KYC_PUBLIC_VERIFY_URL || 'http://localhost:5174/verify/kyc';
+  return `${base}?token=${qrToken}`;
+};
+
+/** Cases created before migration 014 get their token minted on first read. */
+const ensureQrToken = async (kycCase) => {
+  if (kycCase.qr_token) return kycCase.qr_token;
+  const token = crypto.randomBytes(16).toString('hex');
+  const { rows } = await pool.query(
+    'UPDATE kyc_cases SET qr_token = $1, updated_at = now() WHERE id = $2 AND qr_token IS NULL RETURNING qr_token',
+    [token, kycCase.id]
+  );
+  if (rows[0]) return rows[0].qr_token;
+  const { rows: existing } = await pool.query('SELECT qr_token FROM kyc_cases WHERE id = $1', [kycCase.id]);
+  return existing[0]?.qr_token || null;
+};
+
 /** GET /kyc/case/:id — case + member/booking labels + documents (with latest OCR result). */
 export const getCase = asyncHandler(async (req, res) => {
   const kycCase = await kycCaseModel.getDetail(req.params.id, pool);
@@ -348,9 +384,62 @@ export const getCase = asyncHandler(async (req, res) => {
   if (!(await canAccessCase(req.user, kycCase))) {
     return res.status(403).json({ message: 'You are not authorised to view this KYC case' });
   }
+  const qrToken = await ensureQrToken(kycCase);
   const documents = await kycCaseModel.getDocumentsWithResults(kycCase.id, pool);
   for (const d of documents) d.file_url = await getKycDocumentUrl(d.file_path);
-  res.json({ ...kycCase, documents });
+  res.json({ ...kycCase, qr_token: qrToken, documents, verifyUrl: qrToken ? kycVerifyUrl(qrToken) : null });
+});
+
+/**
+ * GET /public/kyc/verify?token= — UNAUTHENTICATED verification page data.
+ * Resolved against the live row (the token is an unguessable 128-bit capability).
+ * Exposes only what the printed form already shows, with identifiers masked, plus
+ * the live status and a document checklist — never the files themselves.
+ */
+export const publicVerifyKyc = asyncHandler(async (req, res) => {
+  const token = String(req.query.token || '').trim();
+  if (!token) return res.status(400).json({ valid: false, reason: 'Missing token' });
+
+  const { rows } = await pool.query(
+    `SELECT k.id, k.status, k.created_at, k.verified_at,
+            m.full_name, m.phone, m.photo, m.aadhar_no, m.pan_no,
+            s.name AS site_name,
+            u.name AS agent_name, u.referral_code AS agent_code
+       FROM kyc_cases k
+       LEFT JOIN members m ON m.id = k.client_member_id
+       LEFT JOIN sites   s ON s.id = k.site_id
+       LEFT JOIN users   u ON u.id = k.created_by
+      WHERE k.qr_token = $1
+      LIMIT 1`,
+    [token]
+  );
+  const k = rows[0];
+  if (!k) return res.json({ valid: false, reason: 'Invalid or tampered KYC code' });
+
+  const { rows: docs } = await pool.query(
+    'SELECT type, ocr_status, created_at FROM documents WHERE kyc_case_id = $1 ORDER BY id',
+    [k.id]
+  );
+  // Keep only the last 4 characters visible on public identifiers.
+  const mask = (v) => (v ? String(v).replace(/[A-Za-z0-9](?=.{4})/g, 'X') : null);
+
+  res.json({
+    valid: true,
+    kyc_no: `KYC-${String(k.id).padStart(5, '0')}`,
+    status: k.status,
+    is_verified: k.status === 'VERIFIED',
+    customer_name: k.full_name,
+    customer_photo: k.photo,
+    phone_masked: mask(k.phone),
+    aadhaar_masked: mask(k.aadhar_no),
+    pan_masked: mask(k.pan_no),
+    site_name: k.site_name,
+    agent_code: k.agent_code,
+    agent_name: k.agent_name,
+    started_at: k.created_at,
+    verified_at: k.verified_at,
+    documents: docs.map((d) => ({ type: d.type, status: d.ocr_status, uploaded_at: d.created_at })),
+  });
 });
 
 /**

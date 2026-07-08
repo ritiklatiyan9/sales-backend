@@ -5,8 +5,10 @@ import drawModel from '../models/Draw.model.js';
 import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
+import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
 import { isAdminRole, getVisibleUserIds } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
+import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.model.js';
 
 /**
  * Draw-based shop allotment module.
@@ -16,10 +18,15 @@ import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js
  * → WINNER (marked after the lottery) → ALLOTTED (QR scanned at the office; a real
  * booking is created and the accounting plot flips to BOOKED via plotBookingSync).
  *
- * Dealers (role 'agent') can register customers and record payments for their own
- * entries — visibility is network-scoped exactly like bookings. Winner marking,
- * allotment, cancellation and ledger corrections are admin-only.
+ * Who does what (mirrors the KYC flow): dealers (role 'agent') ONLY register
+ * customers and run their KYC — visibility is network-scoped exactly like bookings.
+ * Money flow (ledger payments, slip issue, corrections, cancellation) is managed by
+ * super_admin/admin/sub_admin. Deciding the draw money (required_amount), marking
+ * winners and allotting shops is reserved for super_admin/admin.
  */
+
+// Deciders: the subset of admins who set the draw money and award winners/shops.
+const isDeciderRole = (role) => ['admin', 'super_admin'].includes(String(role || '').toLowerCase());
 
 // Ledger capture fields shared by "create with first payment" and "add payment".
 // Mirrors the booking token-payment capture fields so the UI vocabulary matches.
@@ -48,24 +55,16 @@ const extractToken = (raw) => {
   return s;
 };
 
-/** Network scoping: non-admins may only touch registrations inside their own hierarchy. */
-const assertVisible = async (req, res, registration) => {
-  const visibleUserIds = await getVisibleUserIds(req.user);
-  if (visibleUserIds
-      && !visibleUserIds.includes(registration.agent_user_id)
-      && !visibleUserIds.includes(registration.created_by)) {
-    res.status(403).json({ message: 'You are not authorised to view this draw registration' });
-    return false;
-  }
-  return true;
-};
-
-/** Shared response shape: registration detail + ledger + events + computed rollups. */
+/** Shared response shape: registration detail + ledger + events + computed rollups.
+ * The three reads are independent — run them in PARALLEL: the DB is remote (Neon),
+ * so sequential awaits pay the network latency three times over. */
 const buildDetail = async (id, db = pool) => {
-  const registration = await drawModel.getDetail(id, db);
+  const [registration, payments, events] = await Promise.all([
+    drawModel.getDetail(id, db),
+    drawModel.getPayments(id, db),
+    drawModel.getEvents(id, db),
+  ]);
   if (!registration) return null;
-  const payments = await drawModel.getPayments(id, db);
-  const events = await drawModel.getEvents(id, db);
   const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
   const required = Number(registration.required_amount || 0);
   return {
@@ -103,14 +102,61 @@ const reconcileEligibility = async (registration, actorId, db) => {
 };
 
 /**
+ * GET /draws/settings?site_id= — the per-site draw money (readable by every authed
+ * user: the registration wizard shows it). Set only by Admin/Super Admin below.
+ */
+export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
+  const siteId = parseInt(req.query.site_id, 10);
+  if (!siteId || siteId <= 0) return res.status(400).json({ message: 'A valid site_id is required' });
+  const row = await getDrawSettings(siteId);
+  const amount = Number(row?.draw_required_amount || 0);
+  res.json({
+    site_id: Number(siteId),
+    required_amount: amount > 0 ? amount : null,
+    scheme_name: row?.draw_scheme_name || null,
+    configured: amount > 0,
+  });
+});
+
+/**
+ * PUT /draws/settings — Admin/Super Admin decide the draw money for a site. Every new
+ * registration on the site snapshots this amount.
+ */
+export const setDrawSettings = asyncHandler(async (req, res) => {
+  if (!isDeciderRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only Admin / Super Admin decide the draw amount' });
+  }
+  const { required_amount, scheme_name } = req.body;
+  const siteId = parseInt(req.body.site_id, 10);
+  if (!siteId || siteId <= 0) return res.status(400).json({ message: 'A valid site_id is required' });
+  const amount = Number(required_amount);
+  // Upper bound keeps the value inside NUMERIC(15,2) instead of a raw pg overflow error.
+  if (!amount || amount <= 0 || amount > 9_999_999_999_999) {
+    return res.status(400).json({ message: 'required_amount (draw registration amount) must be greater than zero' });
+  }
+  const { rows: siteRows } = await pool.query('SELECT id FROM sites WHERE id = $1', [siteId]);
+  if (!siteRows[0]) return res.status(404).json({ message: 'Site not found' });
+  const row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name) });
+  res.json({
+    site_id: Number(row.site_id),
+    required_amount: Number(row.draw_required_amount),
+    scheme_name: row.draw_scheme_name,
+    configured: true,
+  });
+});
+
+/**
  * POST /draws — Draw Registration Form submission. Open to dealers (agents) and admins.
  * Customer: { client_member_id } or { phone, full_name } — the phone path is the same
  * quick-add flow as POST /kyc/cases (find-or-create by number, referral claim).
- * Optionally records the first ledger payment in the same request.
+ * The draw money is NEVER taken from the request: it snapshots the per-site amount
+ * that Admin/Super Admin set in Draw Settings (PUT /draws/settings). Admins may still
+ * adjust a single registration later via PATCH /draws/:id.
+ * Optionally records the first ledger payment in the same request (admins only).
  */
 export const createDraw = asyncHandler(async (req, res) => {
   const {
-    site_id, client_member_id, phone, full_name, scheme_name, required_amount, notes,
+    site_id, client_member_id, phone, full_name, scheme_name, notes,
     referral_code, amount,
   } = req.body;
 
@@ -118,9 +164,23 @@ export const createDraw = asyncHandler(async (req, res) => {
   if (!client_member_id && !phone) {
     return res.status(400).json({ message: 'client_member_id or phone is required' });
   }
-  const required = Number(required_amount);
+
+  // Validate the optional first payment BEFORE anything else, so a bad request can
+  // never leave an orphan registration behind. Money is admin-only — an agent
+  // registration simply never carries a payment.
+  const hasFirstPayment = amount !== undefined && amount !== null && amount !== '';
+  if (hasFirstPayment && !isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins record draw payments — register the customer and an admin will manage the ledger' });
+  }
+  const firstAmount = hasFirstPayment ? Number(amount) : 0;
+  if (hasFirstPayment && (!firstAmount || firstAmount <= 0)) {
+    return res.status(400).json({ message: 'Initial payment amount must be greater than zero' });
+  }
+
+  const setting = await getDrawSettings(site_id);
+  const required = Number(setting?.draw_required_amount || 0);
   if (!required || required <= 0) {
-    return res.status(400).json({ message: 'required_amount (draw registration amount) must be greater than zero' });
+    return res.status(400).json({ message: 'The draw amount for this site has not been set — an Admin must configure it in Draw Settings first' });
   }
 
   // An explicit referral code wins the ownership attribution — resolved up front so
@@ -136,14 +196,6 @@ export const createDraw = asyncHandler(async (req, res) => {
       return res.status(400).json({ message: `Referral code ${code} does not match any active agent` });
     }
     ownership = { agent_user_id: rows[0].id };
-  }
-
-  // Validate the optional first payment BEFORE creating anything, so a bad request
-  // can never leave an orphan registration behind.
-  const hasFirstPayment = amount !== undefined && amount !== null && amount !== '';
-  const firstAmount = hasFirstPayment ? Number(amount) : 0;
-  if (hasFirstPayment && (!firstAmount || firstAmount <= 0)) {
-    return res.status(400).json({ message: 'Initial payment amount must be greater than zero' });
   }
 
   // Customer resolution + registration + first payment + events are one atomic unit.
@@ -180,14 +232,24 @@ export const createDraw = asyncHandler(async (req, res) => {
       else if (!isAdminRole(req.user?.role)) ownership = { agent_user_id: req.user.id };
     }
 
+    // Register → KYC: the registration opens (or reuses) the customer's KYC case in
+    // the same transaction, exactly like the agent "New KYC" quick-add. The wizard
+    // then walks straight into document upload.
+    const visibleUserIds = await getVisibleUserIds(req.user);
+    const kycCase = await kycCaseModel.getOrCreateForMember(
+      { memberId, siteId: site_id, createdBy: req.user?.id, visibleUserIds },
+      client
+    );
+
     const created = await drawModel.create({
       site_id,
       client_member_id: memberId,
       ...ownership,
-      scheme_name: clean(scheme_name) || null,
+      scheme_name: clean(scheme_name) || setting?.draw_scheme_name || null,
       required_amount: required,
       status: 'REGISTERED',
       qr_token: crypto.randomBytes(16).toString('hex'),
+      kyc_case_id: kycCase.id,
       notes: clean(notes) || null,
       created_by: req.user?.id || null,
     }, client);
@@ -195,6 +257,7 @@ export const createDraw = asyncHandler(async (req, res) => {
 
     const registration_no = await drawModel.generateRegistrationNo(created.id, created.created_at, client);
     await drawModel.logEvent(created.id, 'REGISTERED', { registration_no, required_amount: required }, req.user?.id, client);
+    await drawModel.logEvent(created.id, 'KYC_OPENED', { kyc_case_id: kycCase.id, kyc_status: kycCase.status }, req.user?.id, client);
 
     if (hasFirstPayment) {
       const data = { draw_registration_id: created.id, amount: firstAmount, created_by: req.user?.id || null };
@@ -239,18 +302,29 @@ export const listDraws = asyncHandler(async (req, res) => {
 
 /** GET /draws/:id — registration + Draw Payment Ledger + audit events + rollups. */
 export const getDraw = asyncHandler(async (req, res) => {
-  const detail = await buildDetail(req.params.id, pool);
+  const [detail, visibleUserIds] = await Promise.all([
+    buildDetail(req.params.id, pool),
+    getVisibleUserIds(req.user),
+  ]);
   if (!detail) return res.status(404).json({ message: 'Draw registration not found' });
-  if (!(await assertVisible(req, res, detail))) return;
+  if (visibleUserIds
+      && !visibleUserIds.includes(detail.agent_user_id)
+      && !visibleUserIds.includes(detail.created_by)) {
+    return res.status(403).json({ message: 'You are not authorised to view this draw registration' });
+  }
   res.json(detail);
 });
 
 /**
  * POST /draws/:id/payments — record a payment in the customer's Draw Payment Ledger.
- * Runs in a transaction with the row locked so concurrent payments can't both skip
- * the ELIGIBLE flip. Eligibility is recomputed automatically after every entry.
+ * ADMIN ONLY (money flow belongs to super_admin/admin/sub_admin — agents register
+ * and run KYC). Runs in a transaction with the row locked so concurrent payments
+ * can't both skip the ELIGIBLE flip. Eligibility is recomputed after every entry.
  */
 export const addDrawPayment = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins record draw payments — agents register customers and complete their KYC' });
+  }
   const paymentAmount = Number(req.body.amount);
   if (!paymentAmount || paymentAmount <= 0) {
     return res.status(400).json({ message: 'amount must be greater than zero' });
@@ -267,13 +341,6 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
     if (!registration) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
-    }
-    const visibleUserIds = await getVisibleUserIds(req.user);
-    if (visibleUserIds
-        && !visibleUserIds.includes(registration.agent_user_id)
-        && !visibleUserIds.includes(registration.created_by)) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ message: 'You are not authorised to record payments for this registration' });
     }
     if (registration.status === 'CANCELLED') {
       await client.query('ROLLBACK');
@@ -367,10 +434,14 @@ export const deleteDrawPayment = asyncHandler(async (req, res) => {
 
 /**
  * POST /draws/:id/issue-slip — generate the Official Draw Entry Slip (lottery coupon).
- * Allowed once the ledger covers required_amount; the eligibility is re-verified from
- * the ledger inside the lock, never trusted from the client.
+ * ADMIN ONLY: the slip certifies the money side (ledger covers required_amount) and
+ * the KYC side (customer VERIFIED) — both re-verified inside the lock, never trusted
+ * from the client. Flow: Register → KYC → payments → slip.
  */
 export const issueSlip = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins issue draw slips — agents register customers and complete their KYC' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -383,13 +454,6 @@ export const issueSlip = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
-    const visibleUserIds = await getVisibleUserIds(req.user);
-    if (visibleUserIds
-        && !visibleUserIds.includes(registration.agent_user_id)
-        && !visibleUserIds.includes(registration.created_by)) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ message: 'You are not authorised to issue a slip for this registration' });
-    }
     if (registration.slip_no) {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: `Draw slip ${registration.slip_no} was already issued` });
@@ -397,6 +461,22 @@ export const issueSlip = asyncHandler(async (req, res) => {
     if (!['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: `Cannot issue a slip while status is ${registration.status}` });
+    }
+
+    // Flow gate: no official slip without the customer's KYC verified. Resolved the
+    // same way the model does — the linked case, falling back to the member's newest.
+    const { rows: kycRows } = await client.query(
+      `SELECT kc.status FROM kyc_cases kc
+        WHERE kc.id = $1::int OR kc.client_member_id = $2
+        ORDER BY (kc.id = $1::int) DESC NULLS LAST, kc.id DESC
+        LIMIT 1`,
+      [registration.kyc_case_id, registration.client_member_id]
+    );
+    if (kycRows[0]?.status !== 'VERIFIED') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        message: `Customer KYC is ${kycRows[0]?.status ? `still ${kycRows[0].status}` : 'not started'} — the draw slip can only be issued after KYC is verified`,
+      });
     }
 
     // Re-verify eligibility from the ledger — the single source of truth.
@@ -430,10 +510,10 @@ export const issueSlip = asyncHandler(async (req, res) => {
   res.json(detail);
 });
 
-/** POST /draws/:id/winner — body { winner: boolean }. Admin only, after the lottery. */
+/** POST /draws/:id/winner — body { winner: boolean }. Admin/super_admin only, after the lottery. */
 export const markWinner = asyncHandler(async (req, res) => {
-  if (!isAdminRole(req.user?.role)) {
-    return res.status(403).json({ message: 'Only admins can mark draw winners' });
+  if (!isDeciderRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only Admin / Super Admin can mark draw winners' });
   }
   const winner = req.body.winner !== false;
   const registration = await drawModel.findById(req.params.id, pool);
@@ -484,36 +564,38 @@ export const scanDraw = asyncHandler(async (req, res) => {
   const token = extractToken(req.body.token);
   if (!token) return res.status(400).json({ message: 'Scan token is required' });
 
-  // qr_token match first (the QR path), then registration/slip number (typed path).
-  let hit = await drawModel.findByQrToken(token, pool);
-  if (!hit) {
-    const { rows } = await pool.query(
-      'SELECT id FROM draw_registrations WHERE registration_no = $1 OR slip_no = $1 LIMIT 1',
-      [token.toUpperCase()]
-    );
-    hit = rows[0];
-  }
+  // ONE indexed lookup covers all three shapes (qr_token / registration_no / slip_no)
+  // — the scan desk is latency-sensitive and the DB is remote.
+  const { rows } = await pool.query(
+    'SELECT id FROM draw_registrations WHERE qr_token = $1 OR registration_no = $2 OR slip_no = $2 LIMIT 1',
+    [token, token.toUpperCase()]
+  );
+  const hit = rows[0];
   if (!hit) {
     return res.status(404).json({ valid: false, message: 'No draw registration matches this code — the slip is not genuine or was revoked' });
   }
 
-  const detail = await buildDetail(hit.id, pool);
+  // Detail + network scoping are independent — fetch in parallel.
+  const [detail, visibleUserIds] = await Promise.all([
+    buildDetail(hit.id, pool),
+    getVisibleUserIds(req.user),
+  ]);
 
   // Same network scoping as GET /draws/:id — registration/slip numbers are
   // sequential and guessable, so without this check any agent could enumerate
   // every customer's ledger, Aadhaar/PAN and live qr_token through this endpoint.
-  const visibleUserIds = await getVisibleUserIds(req.user);
   if (visibleUserIds
       && !visibleUserIds.includes(detail.agent_user_id)
       && !visibleUserIds.includes(detail.created_by)) {
     return res.status(403).json({ valid: false, message: 'This slip belongs to another network — ask an admin to verify it' });
   }
 
-  await drawModel.logEvent(hit.id, 'SCANNED', { by_role: req.user.role }, req.user.id, pool).catch(() => {});
+  // Best-effort audit — never holds the response back.
+  drawModel.logEvent(hit.id, 'SCANNED', { by_role: req.user.role }, req.user.id, pool).catch(() => {});
 
   res.json({
     valid: true,
-    can_allot: detail.status === 'WINNER' && isAdminRole(req.user.role),
+    can_allot: detail.status === 'WINNER' && isDeciderRole(req.user.role),
     verdict:
       detail.status === 'ALLOTTED' ? 'Shop already allotted against this slip'
         : detail.status === 'WINNER' ? 'Verified winner — ready for shop allotment'
@@ -531,8 +613,8 @@ export const scanDraw = asyncHandler(async (req, res) => {
  * the existing plotBookingSync. Draw ledger stays the payment record for the draw.
  */
 export const allotShop = asyncHandler(async (req, res) => {
-  if (!isAdminRole(req.user?.role)) {
-    return res.status(403).json({ message: 'Only admins can allot shops' });
+  if (!isDeciderRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only Admin / Super Admin can allot shops' });
   }
   const plotId = parseInt(req.body.plot_id);
   if (!plotId) return res.status(400).json({ message: 'plot_id is required' });
@@ -654,9 +736,79 @@ export const allotShop = asyncHandler(async (req, res) => {
   // Propagate to the accounting plots ledger (BOOKED + buyer + commission) after
   // commit — fire-and-forget, a sync failure never voids the allotment itself.
   const plot_sync = await syncPlotBookingToAccounting(bookingForSync, pool);
+  // Mirror every Draw Payment Ledger receipt into the shared plot_payments so the
+  // booking's payments page shows the money received (pending, Accounting approves).
+  const ledger_sync = await syncDrawLedgerToPlot(req.params.id, pool);
 
   const detail = await buildDetail(req.params.id, pool);
-  res.json({ ...detail, plot_sync });
+  res.json({ ...detail, plot_sync, ledger_sync });
+});
+
+/**
+ * PATCH /draws/:id — Admin/super_admin decide the draw money (required_amount) and
+ * may correct scheme_name/notes. The amount is locked once the slip exists: the
+ * printed coupon certifies a specific figure, and later stages never regress.
+ */
+export const updateDraw = asyncHandler(async (req, res) => {
+  if (!isDeciderRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only Admin / Super Admin decide the draw amount' });
+  }
+  const { required_amount, scheme_name, notes } = req.body;
+  const hasAmount = required_amount !== undefined && required_amount !== null && required_amount !== '';
+  const amount = hasAmount ? Number(required_amount) : null;
+  if (hasAmount && (!amount || amount <= 0)) {
+    return res.status(400).json({ message: 'required_amount (draw registration amount) must be greater than zero' });
+  }
+  if (!hasAmount && scheme_name === undefined && notes === undefined) {
+    return res.status(400).json({ message: 'Nothing to update' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: regRows } = await client.query(
+      'SELECT * FROM draw_registrations WHERE id = $1 FOR UPDATE',
+      [req.params.id]
+    );
+    const registration = regRows[0];
+    if (!registration) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Draw registration not found' });
+    }
+    if (hasAmount && !['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: `The draw amount is locked once the slip is issued (current status: ${registration.status})` });
+    }
+
+    const sets = [];
+    const params = [];
+    if (hasAmount) { params.push(amount); sets.push(`required_amount = $${params.length}`); }
+    if (scheme_name !== undefined) { params.push(clean(scheme_name)); sets.push(`scheme_name = $${params.length}`); }
+    if (notes !== undefined) { params.push(clean(notes)); sets.push(`notes = $${params.length}`); }
+    params.push(registration.id);
+    await client.query(
+      `UPDATE draw_registrations SET ${sets.join(', ')}, updated_at = now() WHERE id = $${params.length}`,
+      params
+    );
+    if (hasAmount && amount !== Number(registration.required_amount)) {
+      await drawModel.logEvent(
+        registration.id, 'AMOUNT_SET',
+        { from: Number(registration.required_amount), to: amount },
+        req.user?.id, client
+      );
+      // The new amount may flip eligibility either way — recompute from the ledger.
+      await reconcileEligibility({ ...registration, required_amount: amount }, req.user?.id, client);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const detail = await buildDetail(req.params.id, pool);
+  res.json(detail);
 });
 
 /** POST /draws/:id/cancel — admin only; a cancelled entry leaves the lottery pool. */

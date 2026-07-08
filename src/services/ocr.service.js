@@ -51,7 +51,9 @@ const FIELDS_BY_TYPE = {
     'address (correspondence address, single line, WITHOUT city/state/pincode)',
     'city', 'state', 'pincode (6 digits)',
     'aadhaar_number (12 digits)', 'pan_number (10 chars)', 'voter_id_number',
-    'nominee_name', 'nominee_relation', 'nominee_phone (10 digits)', 'nominee_dob (DD/MM/YYYY)',
+    'nominee_name', 'nominee_relation', 'nominee_phone (10 digits)',
+    'nominee_id (the nominee\'s Aadhaar / ID number from the "NOMINEE ID" line)',
+    'nominee_dob (DD/MM/YYYY)',
     'bank_name', 'account_number', 'ifsc_code (11 chars, e.g. HDFC0001234)', 'branch',
   ],
   // Property / legal documents (registry, patta, land record …) uploaded as OTHER.
@@ -64,7 +66,10 @@ const KYC_FORM_HINTS = `
 This is the company's own PRINTED "KYC Application Form". Some values are pre-printed
 (typed) and some are HANDWRITTEN in pen by the customer on dotted/blank lines.
 - Read handwriting carefully, letter by letter; Indian names and Hindi-influenced
-  spellings are common. If a handwritten value is ambiguous, prefer "" over a guess.
+  spellings are common. If a handwritten value is PARTIALLY legible (e.g. an IFSC or
+  account number where you can read most characters), transcribe EXACTLY the characters
+  you can see and give that field a LOW field_confidence (under 0.5) — do NOT invent
+  missing characters, and return "" only when nothing at all is legible.
 - The TOP-RIGHT corner has a machine block with "AGENT CODE" (like AGT-7KQ2M) and
   "KYC No." — transcribe these EXACTLY as printed; they are typed, not handwritten.
 - A field label followed by an empty dotted line means the customer left it blank —
@@ -202,14 +207,24 @@ const RX = {
 const digitsOnly = (v) => String(v).replace(/\D/g, '');
 
 /**
- * Validate/normalise extracted fields. Malformed values are DROPPED (never shown as
- * truth) and the per-field confidence for coerced values is capped.
- * Returns { fields, dropped } — dropped lists keys removed by validation.
+ * Validate/normalise extracted fields.
+ *
+ * Two tiers — the human reviewer is part of this pipeline:
+ *   - HARD fields (aadhaar / pan / agent_code): malformed values are DROPPED. A wrong
+ *     identity number or agent attribution presented as truth is worse than a blank.
+ *   - SOFT fields (ifsc, pincode, phones, email, kyc_no, amounts): an imperfect read
+ *     is KEPT (cleaned) and flagged in `suspect` — the UI shows it with a red
+ *     low-confidence meter so the reviewer corrects it against the paper instead of
+ *     wondering why the field vanished (e.g. a handwritten IFSC misread as "PUBK 1206").
+ *
+ * Returns { fields, dropped, suspect }.
  */
 export function validateFields(fields) {
   const out = { ...fields };
   const dropped = [];
+  const suspect = [];
   const drop = (k) => { dropped.push(k); delete out[k]; };
+  const keepSuspect = (k, cleaned) => { suspect.push(k); out[k] = cleaned; };
 
   if (out.aadhaar !== undefined) {
     const digits = digitsOnly(out.aadhaar);
@@ -221,19 +236,16 @@ export function validateFields(fields) {
   }
   if (out.pincode !== undefined) {
     const pin = digitsOnly(out.pincode);
-    if (RX.pincode.test(pin)) out.pincode = pin; else drop('pincode');
+    if (RX.pincode.test(pin)) out.pincode = pin;
+    else if (pin) keepSuspect('pincode', pin); else drop('pincode');
   }
-  if (out.mobile !== undefined) {
-    let m = digitsOnly(out.mobile);
-    if (m.length === 12 && m.startsWith('91')) m = m.slice(2);
-    if (RX.mobile.test(m)) out.mobile = m; else drop('mobile');
-  }
-  // Extra phone-shaped fields from the KYC form get the same normalisation as mobile.
-  for (const k of ['alt_phone', 'whatsapp', 'nominee_phone']) {
+  // Phone-shaped fields: valid → normalised; partial digits → kept as suspect.
+  for (const k of ['mobile', 'alt_phone', 'whatsapp', 'nominee_phone']) {
     if (out[k] === undefined) continue;
     let m = digitsOnly(out[k]);
     if (m.length === 12 && m.startsWith('91')) m = m.slice(2);
-    if (RX.mobile.test(m)) out[k] = m; else drop(k);
+    if (RX.mobile.test(m)) out[k] = m;
+    else if (m.length >= 6) keepSuspect(k, m); else drop(k);
   }
   if (out.agent_code !== undefined) {
     // Typed machine block — uppercase, strip spaces/junk around the dash. Validation
@@ -245,8 +257,9 @@ export function validateFields(fields) {
     if (RX.agentCode.test(code)) out.agent_code = code; else drop('agent_code');
   }
   if (out.ifsc !== undefined) {
-    const ifsc = String(out.ifsc).toUpperCase().replace(/\s/g, '');
-    if (RX.ifsc.test(ifsc)) out.ifsc = ifsc; else drop('ifsc');
+    const ifsc = String(out.ifsc).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (RX.ifsc.test(ifsc)) out.ifsc = ifsc;
+    else if (ifsc.length >= 4) keepSuspect('ifsc', ifsc); else drop('ifsc');
   }
   if (out.kyc_no !== undefined) {
     const digits = digitsOnly(out.kyc_no);
@@ -254,7 +267,8 @@ export function validateFields(fields) {
   }
   if (out.email !== undefined) {
     const email = String(out.email).trim().toLowerCase();
-    if (/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) out.email = email; else drop('email');
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) out.email = email;
+    else if (email.length >= 4) keepSuspect('email', email); else drop('email');
   }
   for (const k of ['dob', 'issue_date', 'date', 'nominee_dob']) {
     if (out[k] === undefined) continue;
@@ -270,7 +284,7 @@ export function validateFields(fields) {
       if (Number.isFinite(n) && n > 0) out[k] = String(n); else drop(k);
     }
   }
-  return { fields: out, dropped };
+  return { fields: out, dropped, suspect };
 }
 
 /* ── Stage: Groq vision call ──────────────────────────────────────────────── */
@@ -297,11 +311,15 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
     onStage?.('OCR');
     const rawFields = await extractKycFieldsWithAi(text, docType);
     onStage?.('VALIDATE');
-    const { fields, dropped } = validateFields(rawFields);
+    const { fields, dropped, suspect } = validateFields(rawFields);
     if (dropped.length) console.warn(`[ocr] validation dropped: ${dropped.join(', ')}`);
-    // Typed documents carry no per-field visual uncertainty — flat medium-high score.
-    const confidenceMap = Object.fromEntries(Object.keys(fields).map((k) => [k, 0.85]));
-    return { text, fields, confidence: Object.keys(fields).length ? 0.85 : 0.3, confidenceMap, engine: `${ENGINE_NAME}-docx` };
+    // Typed documents carry no per-field visual uncertainty — flat medium-high score;
+    // format-suspect values surface red so the reviewer corrects them. The document
+    // score is the MEAN of the per-field map so an all-suspect doc reads low too.
+    const confidenceMap = Object.fromEntries(Object.keys(fields).map((k) => [k, suspect.includes(k) ? 0.35 : 0.85]));
+    const confVals = Object.values(confidenceMap);
+    const overall = confVals.length ? confVals.reduce((a, b) => a + b, 0) / confVals.length : 0.3;
+    return { text, fields, confidence: overall, confidenceMap, engine: `${ENGINE_NAME}-docx` };
   }
 
   // PDF → render to an image first, then continue through the vision pipeline.
@@ -361,8 +379,9 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
   onStage?.('VALIDATE');
   const text = String(raw.raw_text || raw.text || '').trim();
   const normalized = normalizeExtracted(raw, docType);
-  const { fields, dropped } = validateFields(normalized);
+  const { fields, dropped, suspect } = validateFields(normalized);
   if (dropped.length) console.warn(`[ocr] validation dropped: ${dropped.join(', ')}`);
+  if (suspect.length) console.warn(`[ocr] format-suspect (kept, low confidence): ${suspect.join(', ')}`);
 
   // Per-field confidence: prefer the model's own scores (mapped through the same key
   // normalisation), fall back to a heuristic. Overall = mean of per-field scores.
@@ -373,8 +392,15 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
     dl: ['dl', 'dl_number'], dob: ['dob', 'date_of_birth'],
     domicile_no: ['certificate_number', 'domicile_no'], income_no: ['certificate_number', 'income_no'],
     annual_income: ['annual_income', 'income'], city: ['city', 'district'],
+    // normalizeExtracted renames these — without the alias the model's own low
+    // confidence for e.g. a shaky handwritten IFSC would be lost (defaulting to 0.9).
+    ifsc: ['ifsc', 'ifsc_code'], account_number: ['account_number', 'account_no'],
+    nominee_id: ['nominee_id', 'nominee_aadhaar'],
   };
   const confFor = (key) => {
+    // Format-suspect values are capped low regardless of what the model claimed —
+    // the red meter is the reviewer's cue to check the paper.
+    if (suspect.includes(key)) return 0.35;
     const candidates = KEY_ALIASES[key] || [key];
     for (const c of candidates) {
       const v = Number(modelConf[c]);

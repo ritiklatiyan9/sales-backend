@@ -1,6 +1,13 @@
 import 'dotenv/config';
 import pkg from 'pg';
-const { Pool } = pkg;
+const { Pool, types } = pkg;
+
+// DATE columns (OID 1082, e.g. date_of_birth, co_applicant_dob, issue_date) default to
+// a JS Date parsed at LOCAL midnight; serializing that via res.json() converts to UTC,
+// which rolls the date back a day whenever the server runs ahead of UTC (IST, UTC+5:30
+// — this app's timezone). Keep the raw 'YYYY-MM-DD' string instead: every consumer
+// already expects that shape (e.g. `String(value).slice(0, 10)` on the frontend).
+types.setTypeParser(1082, (v) => v);
 
 // Mirrors the accounting backend's db config so booking-api binds to the SAME database.
 const sslOption = process.env.DB_SSL === 'true' || (process.env.DB_HOST && process.env.DB_HOST.includes('neon'))

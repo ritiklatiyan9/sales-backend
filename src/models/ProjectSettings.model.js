@@ -27,6 +27,8 @@ const ENSURE_SQL = `
     bank_branch         VARCHAR(160),
     payment_terms       TEXT,
     milestones          JSONB DEFAULT '[]'::jsonb,
+    draw_required_amount NUMERIC(15,2),
+    draw_scheme_name    VARCHAR(150),
     created_at          TIMESTAMP WITH TIME ZONE DEFAULT now(),
     updated_at          TIMESTAMP WITH TIME ZONE DEFAULT now()
   )
@@ -54,6 +56,48 @@ export async function getBySite(siteId) {
   await ensure();
   const { rows } = await pool.query('SELECT * FROM project_settings WHERE site_id = $1', [siteId]);
   return rows[0] || null;
+}
+
+/**
+ * Draw Settings — the per-site draw money DECIDED BY Admin/Super Admin. Deliberately
+ * NOT in FIELDS: the general PUT /project-settings endpoint is not role-gated, so the
+ * draw amount is only writable through the decider-gated PUT /draws/settings.
+ * Lazy ALTER keeps the same works-before-migration behaviour as the table itself.
+ */
+let drawEnsured = false;
+async function ensureDraw() {
+  if (drawEnsured) return;
+  await ensure();
+  await pool.query(`
+    ALTER TABLE project_settings
+      ADD COLUMN IF NOT EXISTS draw_required_amount NUMERIC(15,2),
+      ADD COLUMN IF NOT EXISTS draw_scheme_name VARCHAR(150)
+  `);
+  drawEnsured = true;
+}
+
+export async function getDrawSettings(siteId) {
+  await ensureDraw();
+  const { rows } = await pool.query(
+    'SELECT site_id, draw_required_amount, draw_scheme_name, updated_at FROM project_settings WHERE site_id = $1',
+    [siteId]
+  );
+  return rows[0] || null;
+}
+
+export async function upsertDrawSettings(siteId, { required_amount, scheme_name }) {
+  await ensureDraw();
+  const { rows } = await pool.query(
+    `INSERT INTO project_settings (site_id, draw_required_amount, draw_scheme_name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (site_id) DO UPDATE
+       SET draw_required_amount = EXCLUDED.draw_required_amount,
+           draw_scheme_name = EXCLUDED.draw_scheme_name,
+           updated_at = now()
+     RETURNING site_id, draw_required_amount, draw_scheme_name, updated_at`,
+    [siteId, required_amount, scheme_name ?? null]
+  );
+  return rows[0];
 }
 
 export async function upsertBySite(siteId, data) {

@@ -12,14 +12,16 @@ import homeLayoutRoutes from './homeLayout.routes.js';
 import drawRoutes from './draw.routes.js';
 import plotPaymentRoutes from './plotPayments.routes.js';
 import { publicVerifyDraw } from '../controllers/draw.controller.js';
+import { publicVerifyKyc } from '../controllers/kyc.controller.js';
 
 const router = express.Router();
 
 router.get('/health', (req, res) => res.json({ status: 'ok', service: 'booking-api' }));
 
-// PUBLIC (no auth) — resolves a printed draw QR against the live registration so
-// anyone scanning the form/slip can confirm it is genuine on the website.
+// PUBLIC (no auth) — resolves a printed QR against the live row so anyone scanning
+// the form/slip can confirm it is genuine on the website.
 router.get('/public/draws/verify', publicVerifyDraw);
+router.get('/public/kyc/verify', publicVerifyKyc);
 
 router.use('/auth', authRoutes);
 router.use('/bookings', bookingRoutes);

@@ -254,7 +254,17 @@ export const googleLogin = asyncHandler(async (req, res) => {
   res.json({ user: userModel.sanitize(user), ...tokens, via: 'google' });
 });
 
-/** POST /auth/refresh */
+/**
+ * POST /auth/refresh — MULTI-SESSION SAFE.
+ *
+ * Any validly-signed, unexpired refresh token with the current token_version works.
+ * Deliberately NO single-slot hash comparison and NO rotation: the old scheme stored
+ * ONE refresh hash per user, so being logged into the booking AND accounting apps
+ * (or two devices) made the second session's refresh look like token theft — the
+ * handler then bumped token_version and logged the user out of EVERYTHING mid-click.
+ * Revocation still works: bumping users.token_version kills all sessions at once,
+ * and tokens self-expire in 24h (config/jwt.js).
+ */
 export const refresh = asyncHandler(async (req, res) => {
   const { refreshToken } = req.body;
   if (!refreshToken || typeof refreshToken !== 'string') {
@@ -269,19 +279,13 @@ export const refresh = asyncHandler(async (req, res) => {
   }
 
   const user = await userModel.findById(decoded.id);
-  if (!user || user.token_version !== decoded.version) {
-    if (user) await userModel.bumpTokenVersion(user.id, user.token_version);
-    return res.status(401).json({ message: 'Invalid refresh token' });
-  }
-  if (!user.refresh_token || !(await comparePassword(refreshToken, user.refresh_token))) {
-    await userModel.bumpTokenVersion(user.id, user.token_version);
+  if (!user || user.is_active === false || user.token_version !== decoded.version) {
     return res.status(401).json({ message: 'Invalid refresh token' });
   }
 
   const version = user.token_version;
   const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version });
   const newRefreshToken = signRefreshToken({ id: user.id, version });
-  await userModel.setRefreshToken(user.id, await hashRefreshToken(newRefreshToken));
 
   res.json({ accessToken, refreshToken: newRefreshToken });
 });

@@ -73,14 +73,25 @@ class BookingModel extends MasterModel {
              m.ifsc_code AS client_ifsc, m.branch AS client_branch,
              m.nominee_name AS client_nominee, m.nominee_relation AS client_nominee_rel,
              m.nominee_phone AS client_nominee_phone,
+             m.co_applicant_name AS client_co_applicant_name,
+             m.co_applicant_relation AS client_co_applicant_relation,
+             m.co_applicant_dob AS client_co_applicant_dob,
+             m.co_applicant_gender AS client_co_applicant_gender,
+             m.co_applicant_phone AS client_co_applicant_phone,
+             m.co_applicant_email AS client_co_applicant_email,
+             m.co_applicant_aadhar AS client_co_applicant_aadhar,
+             m.co_applicant_pan AS client_co_applicant_pan,
+             m.co_applicant_address AS client_co_applicant_address,
              p.plot_no, p.block AS plot_block, p.plot_size, p.sale_price AS plot_sale_price,
              s.name AS site_name, s.city AS site_city, s.state AS site_state,
-             au.name AS agent_name, au.referral_code AS agent_referral_code
+             au.name AS agent_name, au.referral_code AS agent_referral_code,
+             cu.name AS sales_exec_name, cu.email AS sales_exec_email, cu.phone AS sales_exec_phone
       FROM bookings b
       LEFT JOIN members m ON m.id = b.client_member_id
       LEFT JOIN plots   p ON p.id = b.plot_id
       LEFT JOIN sites   s ON s.id = b.site_id
       LEFT JOIN users  au ON au.id = b.agent_user_id
+      LEFT JOIN users  cu ON cu.id = b.created_by
       WHERE b.id = $1
     `, [id]);
     return rows[0];

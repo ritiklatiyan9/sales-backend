@@ -19,14 +19,21 @@ const TOKEN_PAYMENT_FIELDS = [
  * Member columns a CLIENT record may set from the booking module. These all already
  * exist on the shared accounting `members` table — we only ever write the subset a
  * user supplies, and never touch member_type/site beyond create. Keeps every field
- * that the printable booking form renders editable from the Members screen.
+ * that the printable booking form / AddClient.jsx renders editable from the Members
+ * screen — a field missing here silently never persists no matter what the UI shows.
  */
 const CLIENT_FIELDS = [
   'full_name', 'father_name', 'mother_name', 'spouse_name', 'gender', 'date_of_birth',
   'nationality', 'religion', 'marital_status', 'qualification', 'occupation', 'company_name',
-  'phone', 'alt_phone', 'whatsapp', 'email', 'address', 'city', 'state', 'pincode',
-  'aadhar_no', 'pan_no', 'voter_id', 'passport_no', 'driving_license_no', 'gst_no',
+  'blood_group', 'caste', 'anniversary_date',
+  'phone', 'alt_phone', 'whatsapp', 'email',
+  'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+  'address', 'permanent_address', 'city', 'state', 'pincode',
+  'aadhar_no', 'pan_no', 'voter_id', 'passport_no', 'driving_license_no', 'gst_no', 'tin_no',
   'bank_name', 'account_no', 'ifsc_code', 'branch',
+  'co_applicant_name', 'co_applicant_relation', 'co_applicant_dob', 'co_applicant_gender',
+  'co_applicant_phone', 'co_applicant_email', 'co_applicant_aadhar', 'co_applicant_pan',
+  'co_applicant_address',
   'nominee_name', 'nominee_relation', 'nominee_phone', 'reference', 'notes', 'photo',
 ];
 

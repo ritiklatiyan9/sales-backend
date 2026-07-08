@@ -34,7 +34,7 @@ const plotVerifyUrl = (pay, plot) => buildVerifyUrl({
   ss: plot.site_state || null,
 });
 
-/** GET /plot-payments?plot_id= — plot + rollups + non-cash ledger. Admin roles only. */
+/** GET /plot-payments?plot_id= — plot + rollups + full ledger (cash included). Admin roles only. */
 export const listPlotPayments = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
     return res.status(403).json({ message: 'Only admins can view the plot payment ledger' });
@@ -67,12 +67,15 @@ export const listPlotPayments = asyncHandler(async (req, res) => {
   const plot = plotRows[0];
   if (!plot) return res.status(404).json({ message: 'Plot not found' });
 
+  // ALL payment types listed — cash rows included (e.g. draw registration amounts paid
+  // in cash) so the booking page shows every rupee received; the accounting cash
+  // ledger remains the approval/receipt authority for CASH exactly as before.
   const { rows: payments } = await pool.query(
     `SELECT id, plot_id, site_id, date, amount, payment_from, payment_type,
             bank_name, branch, bank_details, cheque_no, cheque_status,
             narration, received_by, buyer_name, booked_by, status, created_at
        FROM plot_payments
-      WHERE plot_id = $1 AND payment_type IN ('BANK', 'CHEQUE')
+      WHERE plot_id = $1
       ORDER BY date ASC, created_at ASC, id ASC`,
     [plotId]
   );

@@ -5,6 +5,22 @@ class DrawModel extends MasterModel {
     super('draw_registrations');
   }
 
+  /**
+   * The customer's KYC case for a registration: the linked r.kyc_case_id when it
+   * still exists, else the member's newest case. The fallback matters because
+   * adoptForBooking deletes duplicate cases (FK sets our link NULL) and because
+   * registrations created before migration 013 never had a link.
+   * NB: kyc.id/kyc.status are selected AFTER r.* so the resolved values win.
+   */
+  get kycCaseLateral() {
+    return `
+      SELECT kc.id, kc.status FROM kyc_cases kc
+      WHERE kc.id = r.kyc_case_id OR kc.client_member_id = r.client_member_id
+      ORDER BY (kc.id = r.kyc_case_id) DESC NULLS LAST, kc.id DESC
+      LIMIT 1
+    `;
+  }
+
   /** List with joined client/site/agent labels + paid rollup.
    * `visibleUserIds` (array | null) scopes rows to an agent's own network —
    * registrations they own (agent_user_id) or personally created (same rule as bookings). */
@@ -30,6 +46,7 @@ class DrawModel extends MasterModel {
              s.name AS site_name,
              au.name AS agent_name, au.referral_code AS agent_referral_code,
              p.plot_no AS allotted_plot_no, p.block AS allotted_plot_block,
+             kyc.id AS kyc_case_id, kyc.status AS kyc_status,
              COALESCE((SELECT SUM(dp.amount) FROM draw_payments dp
                         WHERE dp.draw_registration_id = r.id), 0)::float AS total_paid,
              (SELECT count(*)::int FROM draw_payments dp
@@ -39,6 +56,7 @@ class DrawModel extends MasterModel {
       LEFT JOIN sites   s ON s.id = r.site_id
       LEFT JOIN users  au ON au.id = r.agent_user_id
       LEFT JOIN plots   p ON p.id = r.allotted_plot_id
+      LEFT JOIN LATERAL (${this.kycCaseLateral}) kyc ON true
       ${whereSql}
       ORDER BY r.created_at DESC
       LIMIT 500
@@ -60,7 +78,8 @@ class DrawModel extends MasterModel {
              b.booking_no, b.status AS booking_status, b.kyc_status AS booking_kyc_status,
              wu.name AS winner_marked_by_name,
              lu.name AS allotted_by_name,
-             cu.name AS created_by_name
+             cu.name AS created_by_name, cu.role AS created_by_role, cu.referral_code AS created_by_code,
+             kyc.id AS kyc_case_id, kyc.status AS kyc_status
       FROM draw_registrations r
       LEFT JOIN members m ON m.id = r.client_member_id
       LEFT JOIN sites   s ON s.id = r.site_id
@@ -70,6 +89,7 @@ class DrawModel extends MasterModel {
       LEFT JOIN users  wu ON wu.id = r.winner_marked_by
       LEFT JOIN users  lu ON lu.id = r.allotted_by
       LEFT JOIN users  cu ON cu.id = r.created_by
+      LEFT JOIN LATERAL (${this.kycCaseLateral}) kyc ON true
       WHERE r.id = $1
     `, [id]);
     return rows[0];
