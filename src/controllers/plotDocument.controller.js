@@ -21,18 +21,29 @@ export const listPlotsWithDocs = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
+  // A plot that's been resold gets a new `plots` row per sale cycle (new buyer,
+  // its own payment trail) — same plot_no repeats. DISTINCT ON collapses each
+  // physical plot down to its latest cycle (most recent created_at) so the
+  // Documents view shows one card per plot instead of one per sale.
   const { rows } = await pool.query(
-    `SELECT p.id, p.plot_no, p.block, p.status, p.buyer_name, p.plot_size,
-            p.booking_by, p.booking_date, p.team, p.plot_tag, p.sale_price,
-            (
-              SELECT COUNT(*) FROM documents d
-                LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
-                LEFT JOIN bookings b ON b.id = k.booking_id
-              WHERE d.plot_id = p.id OR b.plot_id = p.id
-            )::int AS doc_count
-       FROM plots p
-      WHERE p.site_id = $1
-      ORDER BY p.block ASC NULLS LAST, p.plot_no ASC`,
+    `SELECT * FROM (
+       SELECT DISTINCT ON (p.site_id, p.plot_no, p.block)
+              p.id, p.plot_no, p.block, p.status, p.buyer_name, p.plot_size,
+              p.booking_by, p.booking_date, p.team, p.plot_tag, p.sale_price,
+              (
+                SELECT COUNT(*) FROM documents d
+                  LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
+                  LEFT JOIN bookings b ON b.id = k.booking_id
+                WHERE d.plot_id = p.id OR b.plot_id = p.id
+              )::int AS doc_count
+         FROM plots p
+        WHERE p.site_id = $1
+        ORDER BY p.site_id, p.plot_no, p.block, p.created_at DESC NULLS LAST, p.id DESC
+     ) latest
+     ORDER BY block ASC NULLS LAST,
+              substring(plot_no from '^[^0-9]*') ASC,
+              COALESCE(NULLIF(substring(plot_no from '[0-9]+'), '')::bigint, 0) ASC,
+              plot_no ASC`,
     [site_id]
   );
   res.json({ plots: rows });
