@@ -2,7 +2,7 @@ import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
   createDraw, listDraws, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
-  issueSlip, markWinner, scanDraw, allotShop, cancelDraw,
+  issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
   getDrawSettingsHandler, setDrawSettings,
 } from '../controllers/draw.controller.js';
 
@@ -17,6 +17,7 @@ router.get('/settings', getDrawSettingsHandler);
 router.put('/settings', setDrawSettings);
 router.get('/:id', getDraw);
 router.patch('/:id', updateDraw);
+router.delete('/:id', deleteDraw);
 router.post('/:id/payments', addDrawPayment);
 router.delete('/:id/payments/:paymentId', deleteDrawPayment);
 router.post('/:id/issue-slip', issueSlip);

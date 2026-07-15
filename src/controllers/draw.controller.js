@@ -833,6 +833,46 @@ export const cancelDraw = asyncHandler(async (req, res) => {
 });
 
 /**
+ * DELETE /draws/:id — hard-delete a registration (admin only).
+ * Allowed only before the entry reaches the lottery pool (slip issued or later
+ * must use cancel instead — deleting them would corrupt the draw history).
+ */
+export const deleteDraw = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) {
+    return res.status(403).json({ message: 'Only admins can delete draw registrations' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: regRows } = await client.query(
+      'SELECT id, status FROM draw_registrations WHERE id = $1 FOR UPDATE',
+      [req.params.id]
+    );
+    const registration = regRows[0];
+    if (!registration) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Draw registration not found' });
+    }
+    if (!['REGISTERED', 'ELIGIBLE', 'CANCELLED'].includes(registration.status)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        message: `Cannot delete a registration with status ${registration.status} — it is already in the lottery. Cancel it instead.`,
+      });
+    }
+    await client.query('DELETE FROM draw_payments WHERE draw_registration_id = $1', [registration.id]);
+    await client.query('DELETE FROM draw_events WHERE draw_registration_id = $1', [registration.id]);
+    await client.query('DELETE FROM draw_registrations WHERE id = $1', [registration.id]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  res.json({ ok: true, id: Number(req.params.id) });
+});
+
+/**
  * GET /public/draws/verify?token= — UNAUTHENTICATED verification page data.
  * Resolved against the live row (the QR token is an unguessable 128-bit value).
  * Exposes only what the printed form/slip already shows, plus live status — including
