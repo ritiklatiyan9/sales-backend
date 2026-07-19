@@ -1,6 +1,6 @@
 /**
  * Groq AI service for intelligent OCR data extraction.
- * Uses Groq's free mixtral model to parse OCR text and extract relevant KYC fields.
+ * Uses Groq to parse OCR text and extract relevant KYC fields.
  * This keeps only required data and intelligently fills form fields.
  */
 // Node 18+ has a global fetch; fall back to node-fetch only if it's missing.
@@ -9,8 +9,8 @@ const fetchFn = globalThis.fetch
   : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// llama-3.3-70b-versatile is Groq's current free, high-quality model. Override via env.
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+// Qwen 3.6 is Groq's current multimodal replacement for the retired Llama 4 Scout.
+const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.6-27b';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 /**

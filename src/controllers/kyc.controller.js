@@ -8,6 +8,7 @@ import documentModel from '../models/Document.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import bookingModel from '../models/Booking.model.js';
 import { extractKycFieldsWithAi } from '../services/groq.service.js';
+import { runOcr } from '../services/ocr.service.js';
 import { getVisibleUserIds, isAdminRole } from '../services/agentNetwork.service.js';
 import { hasPermission } from '../services/permissions.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
@@ -16,6 +17,24 @@ import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js
 // resource — Access Control's Update/Delete toggles on the "All KYCs" row are the
 // single source of truth agents' edit/delete buttons respect.
 const KYC_MODULE = 'booking_kyc_all';
+const FRESH_FORM_MEMBER_FIELDS = [
+  'full_name', 'father_name', 'mother_name', 'spouse_name', 'gender', 'date_of_birth',
+  'marital_status', 'religion', 'nationality', 'qualification', 'occupation', 'company_name',
+  'phone', 'alt_phone', 'whatsapp', 'email', 'address', 'city', 'state', 'pincode',
+  'aadhar_no', 'pan_no', 'voter_id', 'passport_no', 'driving_license_no',
+  'bank_name', 'account_no', 'ifsc_code', 'branch',
+  'nominee_name', 'nominee_relation', 'nominee_phone',
+];
+
+const parseObjectField = (value, fallback = {}) => {
+  if (!value) return fallback;
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+};
 
 // Maps a booking document type → the accounting `members` document column, so an
 // uploaded doc shows up on the accounting client page (/clients/:id).
@@ -28,14 +47,27 @@ const TYPE_TO_MEMBER_COL = {
   DL: 'driving_license_url',
   CHEQUE: 'cheque_url',
   OTHER: 'other_kyc_url',
+  KYC_FORM: 'other_kyc_url',
+};
+const TYPE_TO_MEMBER_COLS = {
+  ...Object.fromEntries(Object.entries(TYPE_TO_MEMBER_COL).map(([type, column]) => [type, [column]])),
+  AADHAAR: ['aadhar_front_url', 'aadhar_back_url'],
 };
 
 /** Write the uploaded doc's public URL onto the linked client member's KYC column. */
-const linkDocToMember = async (type, storageKey, memberId) => {
-  const col = TYPE_TO_MEMBER_COL[type];
-  if (!col || !memberId) return null;
+const linkDocToMember = async (type, storageKey, memberId, requestedColumn = null) => {
+  const allowedColumns = TYPE_TO_MEMBER_COLS[type] || [];
+  if (!allowedColumns.length || !memberId) return null;
   const url = getPublicKycUrl(storageKey);
   if (!url) return null;
+  let col = allowedColumns.includes(requestedColumn) ? requestedColumn : allowedColumns[0];
+  if (type === 'AADHAAR' && !requestedColumn) {
+    const { rows } = await pool.query(
+      'SELECT aadhar_front_url, aadhar_back_url FROM members WHERE id = $1',
+      [memberId]
+    );
+    if (rows[0]?.aadhar_front_url && !rows[0]?.aadhar_back_url) col = 'aadhar_back_url';
+  }
   await pool.query(`UPDATE members SET ${col} = $1, updated_at = now() WHERE id = $2`, [url, memberId]);
   return { col, url };
 };
@@ -172,6 +204,163 @@ export const listCases = asyncHandler(async (req, res) => {
   res.json(rows);
 });
 
+/**
+ * POST /kyc/fresh-form/preview (multipart)
+ * Read a filled paper KYC form before a customer/case exists. Nothing is persisted at
+ * this stage: the UI lets staff correct uncertain handwriting before committing it.
+ */
+export const previewFreshForm = asyncHandler(async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'Upload the filled KYC form first' });
+  if (!req.body?.site_id) return res.status(400).json({ message: 'Select a site first' });
+
+  const result = await runOcr(req.file.buffer, req.file.mimetype, 'KYC_FORM');
+  res.json({
+    raw_text: result.text,
+    extracted_fields: result.fields,
+    confidence: result.confidence,
+    confidence_map: result.confidenceMap,
+    engine: result.engine,
+  });
+});
+
+/**
+ * POST /kyc/fresh-form/commit (multipart)
+ * Persist the reviewed first-form result atomically: find/create the customer, hydrate
+ * their profile, open the normal KYC case, archive the filled form as an already-read
+ * KYC_FORM document, then return the case so the UI can continue with Aadhaar/PAN/etc.
+ */
+export const commitFreshForm = asyncHandler(async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'The filled KYC form file is required' });
+  const siteId = Number(req.body?.site_id);
+  if (!siteId) return res.status(400).json({ message: 'Select a site first' });
+
+  const memberFields = parseObjectField(req.body.member_fields);
+  const extractedFields = parseObjectField(req.body.extracted_fields);
+  const confidenceMap = parseObjectField(req.body.confidence_map);
+  const rawText = String(req.body.raw_text || '').slice(0, 100000);
+  const confidence = Math.min(1, Math.max(0, Number(req.body.confidence) || 0));
+  const phone = String(memberFields.phone || '').replace(/\D/g, '');
+  const fullName = String(memberFields.full_name || '').trim();
+  if (phone.length < 6 || phone.length > 15) {
+    return res.status(400).json({ message: 'Review and enter a valid mobile number before continuing' });
+  }
+  if (!fullName) return res.status(400).json({ message: 'Review and enter the customer name before continuing' });
+
+  const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+  const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  const client = await pool.connect();
+  let member;
+  let kycCase;
+  let doc;
+
+  try {
+    await client.query('BEGIN');
+    member = await findOrCreateClientByPhone(
+      { siteId, phone, fullName, user: req.user },
+      client
+    );
+
+    const cleanMember = {};
+    for (const key of FRESH_FORM_MEMBER_FIELDS) {
+      const value = memberFields[key];
+      if (value !== undefined && value !== null && String(value).trim()) cleanMember[key] = String(value).trim();
+    }
+    cleanMember.full_name = fullName;
+    cleanMember.phone = phone;
+    if (cleanMember.gender) {
+      const gender = cleanMember.gender.toUpperCase();
+      if (['MALE', 'FEMALE', 'OTHER'].includes(gender)) cleanMember.gender = gender;
+      else delete cleanMember.gender;
+    }
+
+    const updateKeys = Object.keys(cleanMember);
+    if (updateKeys.length) {
+      const setClause = updateKeys.map((key, index) => `${key} = $${index + 1}`).join(', ');
+      const { rows } = await client.query(
+        `UPDATE members SET ${setClause}, updated_at = now() WHERE id = $${updateKeys.length + 1} RETURNING *`,
+        [...updateKeys.map((key) => cleanMember[key]), member.id]
+      );
+      member = rows[0];
+    }
+
+    // A printed agent code can attribute an admin-run paper intake to the correct
+    // referrer. Existing member attribution is never overwritten.
+    const agentCode = String(extractedFields.agent_code || req.body.agent_code || '').trim().toUpperCase();
+    if (agentCode && !member.referred_by_user_id) {
+      const { rows: agents } = await client.query(
+        'SELECT id FROM users WHERE upper(referral_code) = $1 AND is_active = true LIMIT 1',
+        [agentCode]
+      );
+      if (agents[0]) {
+        await client.query(
+          'UPDATE members SET referred_by_user_id = $1, updated_at = now() WHERE id = $2 AND referred_by_user_id IS NULL',
+          [agents[0].id, member.id]
+        );
+      }
+    }
+
+    kycCase = await kycCaseModel.getOrCreateForMember({
+      memberId: member.id,
+      siteId,
+      createdBy: req.user?.id || null,
+      visibleUserIds,
+    }, client);
+
+    doc = await documentModel.create({
+      kyc_case_id: kycCase.id,
+      client_member_id: member.id,
+      site_id: siteId,
+      type: 'KYC_FORM',
+      file_path: storageKey,
+      file_hash: fileHash,
+      mime_type: req.file.mimetype,
+      file_size: req.file.size,
+      ocr_status: 'DONE',
+      ocr_engine: String(req.body.engine || 'groq-vision').slice(0, 40),
+      ocr_completed_at: new Date(),
+    }, client);
+
+    await client.query(
+      `INSERT INTO ocr_results
+         (document_id, raw_text, extracted_fields, confidence_overall, confidence_map, engine, processed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())`,
+      [
+        doc.id,
+        JSON.stringify({ text: rawText }),
+        JSON.stringify(extractedFields),
+        Math.round(confidence * 1000) / 1000,
+        JSON.stringify(confidenceMap),
+        String(req.body.engine || 'groq-vision').slice(0, 40),
+      ]
+    );
+    await client.query(
+      `UPDATE kyc_cases SET status = 'OCR_DONE', updated_at = now() WHERE id = $1 AND status <> 'VERIFIED'`,
+      [kycCase.id]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    await deleteKycDocument(storageKey).catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  await linkDocToMember('KYC_FORM', storageKey, member.id).catch((error) => {
+    console.error('[fresh KYC] member document link failed:', error.message);
+  });
+  emitOcrUpdate({ caseId: kycCase.id, documentId: doc.id, status: 'DONE', stage: 'DONE' });
+  res.status(201).json({
+    ...kycCase,
+    status: 'OCR_DONE',
+    client_member_id: member.id,
+    client_name: member.full_name,
+    client_phone: member.phone,
+    documentId: doc.id,
+  });
+});
+
 /** Resolve a kyc_case from either kyc_case_id or booking_id (creating one if needed). */
 const resolveCase = async (body) => {
   if (body.kyc_case_id) {
@@ -248,7 +437,7 @@ export const uploadDocument = asyncHandler(async (req, res) => {
         }
       }
       // Mirror the document onto the accounting client record (shows on /clients/:id).
-      await linkDocToMember(type, storageKey, kycCase.client_member_id);
+      await linkDocToMember(type, storageKey, kycCase.client_member_id, req.body.member_document_field);
     } catch (err) {
       console.error('[kyc upload] post-processing failed:', err.message);
     }
@@ -279,9 +468,14 @@ export const deleteDocument = asyncHandler(async (req, res) => {
   }
 
   // Clear the linked member column if this document was linked.
-  const col = TYPE_TO_MEMBER_COL[doc.type];
-  if (col && doc.client_member_id) {
-    await pool.query(`UPDATE members SET ${col} = NULL, updated_at = now() WHERE id = $1`, [doc.client_member_id]);
+  const linkedColumns = TYPE_TO_MEMBER_COLS[doc.type] || [];
+  if (linkedColumns.length && doc.client_member_id) {
+    const publicUrl = getPublicKycUrl(doc.file_path);
+    const assignments = linkedColumns.map((column) => `${column} = CASE WHEN ${column} = $2 THEN NULL ELSE ${column} END`);
+    await pool.query(
+      `UPDATE members SET ${assignments.join(', ')}, updated_at = now() WHERE id = $1`,
+      [doc.client_member_id, publicUrl]
+    );
   }
 
   // Capture room targets BEFORE the row (and its case linkage) is deleted.
@@ -576,6 +770,31 @@ export const verifyCase = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You are not authorised to verify this KYC case' });
   }
 
+  // Aadhaar is a single two-sided KYC step. Enforce the same rule at the shared
+  // API boundary so Accounts, Booking and direct requests cannot verify a case
+  // with only one side. Existing verified cases and stored files are untouched.
+  const { rows: aadhaarRows } = await pool.query(
+    `SELECT count(*)::int AS ready_count
+       FROM (
+         SELECT ocr_status
+           FROM documents
+          WHERE kyc_case_id = $1 AND type = 'AADHAAR'
+          ORDER BY id ASC
+          LIMIT 2
+       ) aadhaar_sides
+      WHERE ocr_status = 'DONE'`,
+    [kycCase.id]
+  );
+  const aadhaarReadyCount = aadhaarRows[0]?.ready_count || 0;
+  if (aadhaarReadyCount < 2) {
+    return res.status(400).json({
+      message: `Aadhaar front and back are compulsory (${aadhaarReadyCount}/2 ready)`,
+      code: 'AADHAAR_BOTH_SIDES_REQUIRED',
+      ready_count: aadhaarReadyCount,
+      required_count: 2,
+    });
+  }
+
   const { member_update } = req.body || {};
   if (member_update && kycCase.client_member_id) {
     // Everything the printable KYC form can capture (all exist on the shared members
@@ -585,7 +804,7 @@ export const verifyCase = asyncHandler(async (req, res) => {
       'marital_status', 'religion', 'nationality', 'qualification', 'occupation', 'company_name',
       'phone', 'alt_phone', 'whatsapp', 'email',
       'address', 'city', 'state', 'pincode',
-      'aadhar_no', 'pan_no', 'voter_id',
+      'aadhar_no', 'pan_no', 'voter_id', 'passport_no', 'driving_license_no',
       'bank_name', 'account_no', 'ifsc_code', 'branch',
       'nominee_name', 'nominee_relation', 'nominee_phone',
     ];

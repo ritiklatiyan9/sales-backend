@@ -4,6 +4,7 @@ import upload from '../middlewares/multer.middleware.js';
 import {
   uploadDocument, getDocument, deleteDocument, getCase, retryDocument, extractPreview, verifyCase,
   updateDocumentFields, createCase, listCases, updateCaseCustomer, deleteCase,
+  previewFreshForm, commitFreshForm,
 } from '../controllers/kyc.controller.js';
 
 const router = express.Router();
@@ -14,6 +15,8 @@ router.get('/document/:id', getDocument);
 router.delete('/document/:id', deleteDocument);
 router.post('/document/:id/retry', retryDocument);
 router.patch('/document/:id/fields', updateDocumentFields);
+router.post('/fresh-form/preview', upload.single('file'), previewFreshForm);
+router.post('/fresh-form/commit', upload.single('file'), commitFreshForm);
 // NB: '/cases' before '/case/:id' — member-first KYC list + quick-add (agent flow).
 router.get('/cases', listCases);
 router.post('/cases', createCase);

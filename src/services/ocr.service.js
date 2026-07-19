@@ -23,8 +23,11 @@ const fetchFn = globalThis.fetch
   : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// A Groq multimodal (vision) model. Llama-4 Scout is fast + accurate for ID OCR.
-const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+// Keep the vision model explicit because Groq retires model IDs independently.
+// groq.service.js uses GROQ_MODEL for text-only extraction; this service requires
+// a model that accepts image_url input.
+const CURRENT_GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || CURRENT_GROQ_VISION_MODEL;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS || 45000);
 
@@ -134,9 +137,9 @@ export async function preprocessImage(fileBuffer, mimeType, { maxEdge = 1440, qu
 /* ── Stage: PDF → image (scanned forms are often shared as PDFs) ──────────── */
 
 /**
- * Render a PDF's first pages to one tall PNG. The printable KYC form is a single
- * page, but phone scanner apps sometimes emit 2 pages — both are stitched vertically
- * so nothing is silently dropped. Throws a friendly error on failure.
+ * Render the printable KYC form's two pages to one tall PNG. One-page legacy forms
+ * remain supported; both pages of the current template are stitched vertically so
+ * nothing is silently dropped. Throws a friendly error on failure.
  */
 export async function pdfToImage(pdfBuffer) {
   let pdfToPng;
@@ -147,7 +150,7 @@ export async function pdfToImage(pdfBuffer) {
   }
   const pages = await pdfToPng(pdfBuffer, {
     viewportScale: 2.0,      // ~150dpi at A4 — enough for handwriting
-    pagesToProcess: [1, 2],  // form is 1 page; tolerate a 2-page scan
+    pagesToProcess: [1, 2],  // current boxed form is exactly two pages
     strictPagesToProcess: false,
     disableFontFace: true,
   });
@@ -333,7 +336,7 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
   onStage?.('PREPROCESS');
   // Full-page forms keep more pixels than ID cards — handwriting needs them.
   const preOpts = docType === 'KYC_FORM' || docType === 'FINAL_APPROVED_BOOKED_FORM'
-    ? { maxEdge: 2000, quality: 85 }
+    ? { maxEdge: 3600, quality: 88 }
     : {};
   const pre = await preprocessImage(buffer, mime && mime.startsWith('image/') ? mime : 'image/jpeg', preOpts);
   const dataUrl = `data:${pre.mimeType};base64,${pre.buffer.toString('base64')}`;
@@ -341,34 +344,47 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
   onStage?.('OCR');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+  const requestVision = (model) => fetchFn(GROQ_URL, {
+    method: 'POST',
+    signal: controller.signal,
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: buildPrompt(docType) },
+          { type: 'image_url', image_url: { url: dataUrl } },
+        ],
+      }],
+      temperature: 0.1,
+      // Full-page forms return a long transcription + ~30 fields — needs headroom.
+      max_tokens: docType === 'KYC_FORM' ? 3200 : 1600,
+      response_format: { type: 'json_object' },
+    }),
+  });
+
   let response;
+  let responseBody = '';
+  let modelUsed = GROQ_VISION_MODEL;
   try {
-    response = await fetchFn(GROQ_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: GROQ_VISION_MODEL,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: buildPrompt(docType) },
-            { type: 'image_url', image_url: { url: dataUrl } },
-          ],
-        }],
-        temperature: 0.1,
-        // Full-page forms return a long transcription + ~30 fields — needs headroom.
-        max_tokens: docType === 'KYC_FORM' ? 3200 : 1600,
-        response_format: { type: 'json_object' },
-      }),
-    });
+    response = await requestVision(modelUsed);
+    if (!response.ok) {
+      responseBody = await response.text();
+      const missingModel = response.status === 404 || /model_not_found|does not exist|do not have access/i.test(responseBody);
+      if (missingModel && modelUsed !== CURRENT_GROQ_VISION_MODEL) {
+        console.warn(`[ocr] Groq model ${modelUsed} unavailable; retrying with ${CURRENT_GROQ_VISION_MODEL}`);
+        modelUsed = CURRENT_GROQ_VISION_MODEL;
+        response = await requestVision(modelUsed);
+        responseBody = response.ok ? '' : await response.text();
+      }
+    }
   } finally {
     clearTimeout(timer);
   }
 
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Groq vision API error ${response.status}: ${body.slice(0, 300)}`);
+    throw new Error(`Groq vision API error ${response.status}: ${responseBody.slice(0, 300)}`);
   }
 
   const data = await response.json();
@@ -415,5 +431,5 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
     : (text ? 0.5 : 0.0);
 
   console.log(`[ocr] ${ENGINE_NAME} extracted ${Object.keys(fields).join(', ') || '(none)'} for ${docType} (conf ${confidence.toFixed(2)})`);
-  return { text, fields, confidence, confidenceMap, engine: ENGINE_NAME };
+  return { text, fields, confidence, confidenceMap, engine: `${ENGINE_NAME}:${modelUsed}`.slice(0, 40) };
 }
