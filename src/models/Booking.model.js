@@ -8,7 +8,7 @@ class BookingModel extends MasterModel {
   /** List with joined client/plot labels + KYC/OCR rollup indicators.
    * `visibleUserIds` (array | null) scopes rows to an agent's own network —
    * bookings they own (agent_user_id) or personally created. */
-  async list({ siteId, status, kycStatus, q, clientMemberId, agentUserId, visibleUserIds }, pool) {
+  async list({ siteId, status, kycStatus, q, clientMemberId, agentUserId, memberType, visibleUserIds }, pool) {
     const where = [];
     const params = [];
     if (siteId) { params.push(siteId); where.push(`b.site_id = $${params.length}`); }
@@ -16,19 +16,28 @@ class BookingModel extends MasterModel {
     if (kycStatus) { params.push(kycStatus); where.push(`b.kyc_status = $${params.length}`); }
     if (clientMemberId) { params.push(clientMemberId); where.push(`b.client_member_id = $${params.length}`); }
     if (agentUserId) { params.push(agentUserId); where.push(`b.agent_user_id = $${params.length}`); }
+    if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
     if (Array.isArray(visibleUserIds)) {
       params.push(visibleUserIds);
       where.push(`(b.agent_user_id = ANY($${params.length}) OR b.created_by = ANY($${params.length}))`);
     }
     if (q) {
       params.push(`%${q}%`);
-      where.push(`(b.booking_no ILIKE $${params.length} OR b.buyer_name ILIKE $${params.length} OR m.full_name ILIKE $${params.length} OR p.plot_no ILIKE $${params.length})`);
+      where.push(`(b.booking_no ILIKE $${params.length}
+                   OR b.buyer_name ILIKE $${params.length}
+                   OR m.full_name ILIKE $${params.length}
+                   OR m.member_type ILIKE $${params.length}
+                   OR p.plot_no ILIKE $${params.length})`);
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
     const sql = `
       SELECT b.*,
+             m.id AS account_member_id,
              m.full_name AS client_name, m.phone AS client_phone, m.photo AS client_photo,
+             m.member_type,
+             m.member_type AS registration_role,
+             m.member_type AS role,
              p.plot_no, p.block AS plot_block,
              s.name AS site_name,
              au.name AS agent_name, au.referral_code AS agent_referral_code,
@@ -58,6 +67,7 @@ class BookingModel extends MasterModel {
   async getDetail(id, pool) {
     const { rows } = await pool.query(`
       SELECT b.*,
+             m.id AS account_member_id,
              m.full_name AS client_name, m.phone AS client_phone, m.email AS client_email,
              m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
              m.father_name AS client_father, m.mother_name AS client_mother, m.spouse_name AS client_spouse,
@@ -82,6 +92,9 @@ class BookingModel extends MasterModel {
              m.co_applicant_aadhar AS client_co_applicant_aadhar,
              m.co_applicant_pan AS client_co_applicant_pan,
              m.co_applicant_address AS client_co_applicant_address,
+             m.member_type,
+             m.member_type AS registration_role,
+             m.member_type AS role,
              p.plot_no, p.block AS plot_block, p.plot_size, p.sale_price AS plot_sale_price,
              s.name AS site_name, s.city AS site_city, s.state AS site_state,
              au.name AS agent_name, au.referral_code AS agent_referral_code,

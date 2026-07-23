@@ -24,7 +24,12 @@
     "migrate:draw-payment-link": "node src/migrations/015_draw_payment_link.js",
     "backfill:draw-plot-payments": "node src/scripts/backfill_draw_plot_payments.js",
     "migrate:final-booking-form": "node src/migrations/016_final_booking_form_doc_type.js",
-    "migrate:co-applicant-photo": "node src/migrations/017_co_applicant_photo_doc_type.js"
+    "migrate:co-applicant-photo": "node src/migrations/017_co_applicant_photo_doc_type.js",
+    "migrate:member-roles": "node src/migrations/018_member_roles.js",
+    "migrate:document-member-field": "node src/migrations/019_document_member_field.js",
+    "migrate:ocr-optimization": "node src/migrations/020_ocr_optimization.js",
+    "test:member-roles": "node --test src/services/memberRoles.service.test.mjs",
+    "test:mistral-ocr": "node --test src/services/mistralOcr.service.test.mjs src/services/ocrFallback.service.test.mjs src/services/ocrSingleFlight.service.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.700.0",

@@ -46,7 +46,6 @@ export async function extractKycFieldsWithAi(ocrText, documentType) {
         temperature: 0.1,
         // The full KYC form returns ~30 fields — give it headroom.
         max_tokens: documentType === 'KYC_FORM' ? 1400 : 600,
-        response_format: { type: 'json_object' },
       }),
     });
 
@@ -138,6 +137,7 @@ function buildExtractionPrompt(text, type) {
     KYC_FORM: [
       'agent_code (the AGENT CODE printed top-right, format AGT-XXXXX)',
       'kyc_no (the KYC reference number, digits only)',
+      'member_type (the PERSON ROLE printed/stamped on this role-specific form: CLIENT, MEMBER, VENDOR, SUPERVISOR, FARMER, EMPLOYEE, BROKER, PARTNER or OTHER)',
       'name (applicant full name)', 'father_name', 'mother_name', 'spouse_name',
       'dob (DD/MM/YYYY)', 'gender', 'marital_status', 'religion', 'nationality',
       'qualification', 'occupation', 'company_name',
@@ -247,6 +247,7 @@ export function normalizeExtracted(extracted, documentType) {
         // The company's own form — the full booking-form field set.
         normalized.agent_code = extracted.agent_code || extracted.agentcode || extracted.referral_code || '';
         normalized.kyc_no = extracted.kyc_no || extracted.kyc_number || '';
+        normalized.member_type = extracted.member_type || extracted.registration_role || extracted.applicant_role || extracted.role || '';
         normalized.aadhaar = extracted.aadhaar_number || extracted.aadhaar || '';
         normalized.pan = extracted.pan_number || extracted.pan || '';
         normalized.voter_id = extracted.voter_id_number || extracted.voter_id || '';

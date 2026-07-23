@@ -1,5 +1,6 @@
 /**
- * In-process OCR engine — Groq vision (multimodal LLM) with a multi-stage pipeline:
+ * In-process OCR engine — Mistral Document OCR for full KYC forms and Groq vision
+ * for legacy identity-document flows:
  *
  *   image → preprocess (sharp: auto-rotate, resize, normalize, recompress)
  *         → Groq vision OCR + field extraction (with per-field confidence)
@@ -17,6 +18,8 @@
  * then offers a Retry, exactly like the old flow).
  */
 import { normalizeExtracted, extractKycFieldsWithAi } from './groq.service.js';
+import { MEMBER_TYPES } from './memberRoles.service.js';
+import { runMistralDocumentOcr } from './mistralOcr.service.js';
 
 const fetchFn = globalThis.fetch
   ? globalThis.fetch.bind(globalThis)
@@ -32,6 +35,7 @@ const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS || 45000);
 
 export const ENGINE_NAME = 'groq-vision';
+export const KYC_FORM_ENGINE_NAME = 'mistral-ocr';
 
 // Field lists per document type — mirrors the text extractor so output shape is identical.
 const FIELDS_BY_TYPE = {
@@ -47,6 +51,7 @@ const FIELDS_BY_TYPE = {
   KYC_FORM: [
     'agent_code (the AGENT CODE printed in the box at the TOP-RIGHT of the form — format AGT-XXXXX)',
     'kyc_no (the KYC reference number printed near the agent code, digits only)',
+    'member_type (the PERSON ROLE printed/stamped on this role-specific form: CLIENT, MEMBER, VENDOR, SUPERVISOR, FARMER, EMPLOYEE, BROKER, PARTNER or OTHER)',
     'name (applicant full name)', 'father_name', 'mother_name', 'spouse_name',
     'dob (DD/MM/YYYY)', 'gender', 'marital_status', 'religion', 'nationality',
     'qualification', 'occupation', 'company_name (employer / firm name)',
@@ -75,6 +80,9 @@ This is the company's own PRINTED "KYC Application Form". Some values are pre-pr
   missing characters, and return "" only when nothing at all is legible.
 - The TOP-RIGHT corner has a machine block with "AGENT CODE" (like AGT-7KQ2M) and
   "KYC No." — transcribe these EXACTLY as printed; they are typed, not handwritten.
+- The form is generated for one person role. Read the prominent printed/stamped
+  "PERSON ROLE" / "REGISTRATION ROLE" value and return it as member_type. Do not infer
+  a role from occupation or other handwriting; return "" when the stamp is not legible.
 - A field label followed by an empty dotted line means the customer left it blank —
   return "" for it (do NOT copy the label text as a value).
 - For checkbox rows (e.g. Gender: [ ] Male [x] Female), return the ticked option.`;
@@ -95,6 +103,34 @@ STRICT RULES — never violate:
 - If overall legibility is poor, still transcribe what you can into "raw_text" and leave uncertain fields empty.
 Return only the JSON object.`;
 };
+
+// Mistral OCR already returns the complete document transcription in pages[].markdown.
+// Asking Document Annotation to repeat it as raw_text wastes output tokens, so this
+// prompt requests only the structured form fields and confidence map.
+const buildMistralAnnotationPrompt = (docType) => {
+  const fields = FIELDS_BY_TYPE[docType] || FIELDS_BY_TYPE.OTHER;
+  return `Read the complete Indian KYC form across every page.${docType === 'KYC_FORM' ? KYC_FORM_HINTS : ''}
+Return ONE JSON object with these snake_case fields at the top level: ${fields.join(', ')}.
+Also return "field_confidence", an object mapping every non-empty field to a number from 0 to 1.
+
+Rules:
+- Return valid JSON only. Do not nest the extracted values under "fields".
+- Never guess. Use "" when a value is missing or illegible and omit its confidence.
+- Keep address as one line without city, state, or pincode; return those separately.
+- Use DD/MM/YYYY for dates, exactly 6 digits for pincode, 10 digits for phones,
+  12 digits for Aadhaar, and the printed value for PAN/IFSC/agent code.
+- Preserve handwritten spelling exactly.`;
+};
+
+const mistralFieldDefinitions = (docType) => (
+  (FIELDS_BY_TYPE[docType] || FIELDS_BY_TYPE.OTHER).map((definition) => {
+    const match = String(definition).match(/^([a-z0-9_]+)(?:\s*\((.*)\))?$/i);
+    return {
+      name: match?.[1] || String(definition).trim(),
+      description: match?.[2] || `Exact ${match?.[1] || definition} value from the form`,
+    };
+  })
+);
 
 /* ── Stage: preprocessing (sharp) ─────────────────────────────────────────── */
 
@@ -137,8 +173,8 @@ export async function preprocessImage(fileBuffer, mimeType, { maxEdge = 1440, qu
 /* ── Stage: PDF → image (scanned forms are often shared as PDFs) ──────────── */
 
 /**
- * Render the printable KYC form's two pages to one tall PNG. One-page legacy forms
- * remain supported; both pages of the current template are stitched vertically so
+ * Render the printable KYC form's pages to one tall PNG. One-page legacy forms
+ * remain supported; all three pages of the current template are stitched vertically so
  * nothing is silently dropped. Throws a friendly error on failure.
  */
 export async function pdfToImage(pdfBuffer) {
@@ -150,7 +186,7 @@ export async function pdfToImage(pdfBuffer) {
   }
   const pages = await pdfToPng(pdfBuffer, {
     viewportScale: 2.0,      // ~150dpi at A4 — enough for handwriting
-    pagesToProcess: [1, 2],  // current boxed form is exactly two pages
+    pagesToProcess: [1, 2, 3], // current large-box form is three pages
     strictPagesToProcess: false,
     disableFontFace: true,
   });
@@ -268,6 +304,11 @@ export function validateFields(fields) {
     const digits = digitsOnly(out.kyc_no);
     if (digits) out.kyc_no = digits; else drop('kyc_no');
   }
+  if (out.member_type !== undefined) {
+    const memberType = String(out.member_type).trim().toUpperCase().replace(/[\s-]+/g, '_');
+    if (MEMBER_TYPES.includes(memberType)) out.member_type = memberType;
+    else drop('member_type');
+  }
   if (out.email !== undefined) {
     const email = String(out.email).trim().toLowerCase();
     if (/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) out.email = email;
@@ -297,9 +338,105 @@ export function validateFields(fields) {
  * `onStage(stage)` (optional) is called at 'PREPROCESS' | 'OCR' | 'VALIDATE'.
  * Returns { text, fields, confidence (0-1), confidenceMap, engine }.
  */
-export async function runOcr(fileBuffer, mimeType, docType, onStage) {
-  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not set — cannot run OCR');
+function extractJsonObject(content) {
+  if (!content) return {};
+  const trimmed = String(content).trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const candidate = fenced ? fenced[1] : trimmed;
+  const firstBrace = candidate.indexOf('{');
+  const lastBrace = candidate.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try { return JSON.parse(candidate.slice(firstBrace, lastBrace + 1)); }
+    catch {}
+  }
+  try { return JSON.parse(candidate); }
+  catch { return {}; }
+}
+
+function finalizeOcrResult(raw, fallbackText, docType, engine, providerConfidence) {
+  const text = String(raw.raw_text || raw.text || fallbackText || '').trim();
+  const normalized = normalizeExtracted(raw, docType);
+  const { fields, dropped, suspect } = validateFields(normalized);
+  if (dropped.length) console.warn(`[ocr] validation dropped: ${dropped.join(', ')}`);
+  if (suspect.length) console.warn(`[ocr] format-suspect (kept, low confidence): ${suspect.join(', ')}`);
+
+  const modelConf = (raw.field_confidence && typeof raw.field_confidence === 'object') ? raw.field_confidence : {};
+  const KEY_ALIASES = {
+    aadhaar: ['aadhaar', 'aadhaar_number'], pan: ['pan', 'pan_number'],
+    voter_id: ['voter_id', 'voter_id_number'], passport: ['passport', 'passport_number'],
+    dl: ['dl', 'dl_number'], dob: ['dob', 'date_of_birth'],
+    domicile_no: ['certificate_number', 'domicile_no'], income_no: ['certificate_number', 'income_no'],
+    annual_income: ['annual_income', 'income'], city: ['city', 'district'],
+    ifsc: ['ifsc', 'ifsc_code'], account_number: ['account_number', 'account_no'],
+    nominee_id: ['nominee_id', 'nominee_aadhaar'],
+  };
+  const safeProviderConfidence = Number.isFinite(Number(providerConfidence))
+    ? Math.min(1, Math.max(0, Number(providerConfidence)))
+    : 0.9;
+  const confFor = (key) => {
+    if (suspect.includes(key)) return 0.35;
+    const candidates = KEY_ALIASES[key] || [key];
+    for (const candidate of candidates) {
+      const value = Number(modelConf[candidate]);
+      if (Number.isFinite(value) && value >= 0 && value <= 1) return value;
+    }
+    return safeProviderConfidence;
+  };
+  const confidenceMap = Object.fromEntries(
+    Object.keys(fields).map((key) => [key, Math.round(confFor(key) * 1000) / 1000])
+  );
+  const values = Object.values(confidenceMap);
+  const confidence = values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : (text ? (Number.isFinite(Number(providerConfidence)) ? Number(providerConfidence) : 0.5) : 0);
+
+  console.log(`[ocr] ${engine} extracted ${Object.keys(fields).join(', ') || '(none)'} for ${docType} (conf ${confidence.toFixed(2)})`);
+  return { text, fields, confidence, confidenceMap, engine: String(engine).slice(0, 64) };
+}
+
+async function runOcrPipeline(fileBuffer, mimeType, docType, onStage) {
   if (!fileBuffer?.length) throw new Error('empty file buffer');
+
+  let mistralResult = null;
+  let mistralError = null;
+
+  // Prefer Mistral because it reads the original multi-page PDF. If it errors or
+  // extracts fewer than three meaningful applicant fields, continue through the
+  // Groq vision pipeline below. A sparse Mistral result is retained so it can still
+  // be returned if the fallback provider is unavailable/rate-limited.
+  if (docType === 'KYC_FORM') {
+    onStage?.('PREPROCESS');
+    onStage?.('OCR');
+    try {
+      const result = await runMistralDocumentOcr(
+        fileBuffer,
+        mimeType,
+        buildMistralAnnotationPrompt(docType),
+        mistralFieldDefinitions(docType)
+      );
+      onStage?.('VALIDATE');
+      mistralResult = finalizeOcrResult(
+        result.raw,
+        result.text,
+        docType,
+        `${KYC_FORM_ENGINE_NAME}:${result.model}`,
+        result.confidence
+      );
+      const machineOnly = new Set(['agent_code', 'kyc_no', 'member_type']);
+      const meaningfulFields = Object.keys(mistralResult.fields).filter((key) => !machineOnly.has(key));
+      if (meaningfulFields.length >= 3) return mistralResult;
+      console.warn(`[ocr] Mistral result too sparse (${meaningfulFields.length} applicant fields); falling back to Groq`);
+    } catch (error) {
+      mistralError = error;
+      console.warn(`[ocr] Mistral failed (${error.code || error.message}); falling back to Groq`);
+    }
+  }
+
+  if (!GROQ_API_KEY) {
+    if (mistralResult) return mistralResult;
+    if (mistralError) throw mistralError;
+    throw new Error('GROQ_API_KEY not set — cannot run OCR');
+  }
 
   let buffer = fileBuffer;
   let mime = mimeType;
@@ -336,7 +473,7 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
   onStage?.('PREPROCESS');
   // Full-page forms keep more pixels than ID cards — handwriting needs them.
   const preOpts = docType === 'KYC_FORM' || docType === 'FINAL_APPROVED_BOOKED_FORM'
-    ? { maxEdge: 3600, quality: 88 }
+    ? { maxEdge: docType === 'KYC_FORM' ? 4200 : 3600, quality: 88 }
     : {};
   const pre = await preprocessImage(buffer, mime && mime.startsWith('image/') ? mime : 'image/jpeg', preOpts);
   const dataUrl = `data:${pre.mimeType};base64,${pre.buffer.toString('base64')}`;
@@ -344,92 +481,120 @@ export async function runOcr(fileBuffer, mimeType, docType, onStage) {
   onStage?.('OCR');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
-  const requestVision = (model) => fetchFn(GROQ_URL, {
-    method: 'POST',
-    signal: controller.signal,
-    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const requestVision = (model) => {
+    // Ask Groq only for concise structured fields to reduce completion tokens/TPM.
+    const prompt = docType === 'KYC_FORM'
+      ? buildMistralAnnotationPrompt(docType)
+      : buildPrompt(docType);
+    const payload = {
       model,
       messages: [{
         role: 'user',
         content: [
-          { type: 'text', text: buildPrompt(docType) },
+          { type: 'text', text: prompt },
           { type: 'image_url', image_url: { url: dataUrl } },
         ],
       }],
       temperature: 0.1,
-      // Full-page forms return a long transcription + ~30 fields — needs headroom.
-      max_tokens: docType === 'KYC_FORM' ? 3200 : 1600,
-      response_format: { type: 'json_object' },
-    }),
-  });
+      max_tokens: docType === 'KYC_FORM' ? 1800 : 1600,
+    };
+    return fetchFn(GROQ_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  };
 
   let response;
   let responseBody = '';
-  let modelUsed = GROQ_VISION_MODEL;
+  const modelUsed = GROQ_VISION_MODEL;
   try {
+    // Exactly one Groq request per document. The prompt mandates JSON and the parser
+    // tolerates fenced/plain output, avoiding response_format rejection + retry loops.
     response = await requestVision(modelUsed);
     if (!response.ok) {
       responseBody = await response.text();
-      const missingModel = response.status === 404 || /model_not_found|does not exist|do not have access/i.test(responseBody);
-      if (missingModel && modelUsed !== CURRENT_GROQ_VISION_MODEL) {
-        console.warn(`[ocr] Groq model ${modelUsed} unavailable; retrying with ${CURRENT_GROQ_VISION_MODEL}`);
-        modelUsed = CURRENT_GROQ_VISION_MODEL;
-        response = await requestVision(modelUsed);
-        responseBody = response.ok ? '' : await response.text();
-      }
     }
+  } catch (error) {
+    if (mistralResult) {
+      console.warn(`[ocr] Groq fallback connection failed; using sparse Mistral result: ${error.message}`);
+      return mistralResult;
+    }
+    const combinedError = new Error('Both Mistral and Groq OCR providers failed', { cause: error });
+    combinedError.status = 502;
+    combinedError.code = 'OCR_PROVIDERS_UNAVAILABLE';
+    combinedError.publicMessage = 'Both OCR providers are temporarily unavailable. Please retry shortly.';
+    throw combinedError;
   } finally {
     clearTimeout(timer);
   }
 
   if (!response.ok) {
-    throw new Error(`Groq vision API error ${response.status}: ${responseBody.slice(0, 300)}`);
+    if (mistralResult) {
+      console.warn(`[ocr] Groq fallback failed (${response.status}); using sparse Mistral result`);
+      return mistralResult;
+    }
+    const error = new Error(`Groq fallback could not read the form (HTTP ${response.status})`);
+    error.status = response.status === 429 ? 429 : 502;
+    error.code = response.status === 429
+      ? (docType === 'KYC_FORM' ? 'OCR_PROVIDERS_RATE_LIMITED' : 'GROQ_RATE_LIMITED')
+      : 'GROQ_OCR_FAILED';
+    error.publicMessage = response.status === 429
+      ? (docType === 'KYC_FORM'
+          ? 'Both OCR providers are temporarily rate-limited. Please retry shortly.'
+          : 'OCR is temporarily rate-limited. Please retry this document shortly.')
+      : 'Mistral and Groq could not read this form. Try a clearer scan.';
+    if (response.status === 429) {
+      const retryHeader = Number(response.headers?.get?.('retry-after'));
+      const retryBody = Number(responseBody.match(/try again in\s+([\d.]+)s/i)?.[1]);
+      const retrySeconds = Number.isFinite(retryHeader) && retryHeader > 0
+        ? retryHeader
+        : (Number.isFinite(retryBody) && retryBody > 0 ? retryBody : 30);
+      error.retryAfterMs = Math.min(60_000, Math.max(5_000, Math.ceil(retrySeconds * 1000)));
+    }
+    throw error;
   }
 
   const data = await response.json();
   const content = data.choices?.[0]?.message?.content || '';
-  const jsonMatch = content.match(/\{[\s\S]*\}/);
-  const raw = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+  const raw = extractJsonObject(content);
 
   onStage?.('VALIDATE');
-  const text = String(raw.raw_text || raw.text || '').trim();
-  const normalized = normalizeExtracted(raw, docType);
-  const { fields, dropped, suspect } = validateFields(normalized);
-  if (dropped.length) console.warn(`[ocr] validation dropped: ${dropped.join(', ')}`);
-  if (suspect.length) console.warn(`[ocr] format-suspect (kept, low confidence): ${suspect.join(', ')}`);
+  const groqResult = finalizeOcrResult(raw, '', docType, `${ENGINE_NAME}:${modelUsed}`);
+  if (mistralResult && Object.keys(mistralResult.fields).length > Object.keys(groqResult.fields).length) {
+    console.warn('[ocr] Groq fallback was sparser than Mistral; keeping the better Mistral extraction');
+    return mistralResult;
+  }
+  return groqResult;
+}
 
-  // Per-field confidence: prefer the model's own scores (mapped through the same key
-  // normalisation), fall back to a heuristic. Overall = mean of per-field scores.
-  const modelConf = (raw.field_confidence && typeof raw.field_confidence === 'object') ? raw.field_confidence : {};
-  const KEY_ALIASES = {
-    aadhaar: ['aadhaar', 'aadhaar_number'], pan: ['pan', 'pan_number'],
-    voter_id: ['voter_id', 'voter_id_number'], passport: ['passport', 'passport_number'],
-    dl: ['dl', 'dl_number'], dob: ['dob', 'date_of_birth'],
-    domicile_no: ['certificate_number', 'domicile_no'], income_no: ['certificate_number', 'income_no'],
-    annual_income: ['annual_income', 'income'], city: ['city', 'district'],
-    // normalizeExtracted renames these — without the alias the model's own low
-    // confidence for e.g. a shaky handwritten IFSC would be lost (defaulting to 0.9).
-    ifsc: ['ifsc', 'ifsc_code'], account_number: ['account_number', 'account_no'],
-    nominee_id: ['nominee_id', 'nominee_aadhaar'],
-  };
-  const confFor = (key) => {
-    // Format-suspect values are capped low regardless of what the model claimed —
-    // the red meter is the reviewer's cue to check the paper.
-    if (suspect.includes(key)) return 0.35;
-    const candidates = KEY_ALIASES[key] || [key];
-    for (const c of candidates) {
-      const v = Number(modelConf[c]);
-      if (Number.isFinite(v) && v >= 0 && v <= 1) return v;
+// Global provider single-flight for this API process. Queue jobs, synchronous Fresh
+// Form previews, retries, and any future callers all share this same chain: the next
+// OCR pipeline starts only after the previous one has resolved or failed.
+let ocrPipelineTail = Promise.resolve();
+let ocrCooldownUntil = 0;
+
+export function runOcr(fileBuffer, mimeType, docType, onStage) {
+  const execute = async () => {
+    const waitMs = Math.max(0, ocrCooldownUntil - Date.now());
+    if (waitMs) {
+      onStage?.('RATE_LIMIT_WAIT');
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
-    return 0.9; // model filled it but gave no score
+    try {
+      return await runOcrPipeline(fileBuffer, mimeType, docType, onStage);
+    } catch (error) {
+      if (error?.status === 429) {
+        ocrCooldownUntil = Math.max(
+          ocrCooldownUntil,
+          Date.now() + Math.min(60_000, Math.max(5_000, Number(error.retryAfterMs) || 30_000))
+        );
+      }
+      throw error;
+    }
   };
-  const confidenceMap = Object.fromEntries(Object.keys(fields).map((k) => [k, Math.round(confFor(k) * 1000) / 1000]));
-  const values = Object.values(confidenceMap);
-  const confidence = values.length
-    ? values.reduce((a, b) => a + b, 0) / values.length
-    : (text ? 0.5 : 0.0);
-
-  console.log(`[ocr] ${ENGINE_NAME} extracted ${Object.keys(fields).join(', ') || '(none)'} for ${docType} (conf ${confidence.toFixed(2)})`);
-  return { text, fields, confidence, confidenceMap, engine: `${ENGINE_NAME}:${modelUsed}`.slice(0, 40) };
+  const current = ocrPipelineTail.then(execute, execute);
+  ocrPipelineTail = current.catch(() => {});
+  return current;
 }

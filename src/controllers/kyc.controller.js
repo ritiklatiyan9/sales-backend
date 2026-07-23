@@ -7,11 +7,18 @@ import { emitOcrUpdate } from '../config/socket.js';
 import documentModel from '../models/Document.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import bookingModel from '../models/Booking.model.js';
-import { extractKycFieldsWithAi } from '../services/groq.service.js';
 import { runOcr } from '../services/ocr.service.js';
 import { getVisibleUserIds, isAdminRole } from '../services/agentNetwork.service.js';
 import { hasPermission } from '../services/permissions.service.js';
-import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
+import { findOrCreateMemberByPhone } from '../services/memberQuickAdd.service.js';
+import {
+  MEMBER_TYPE_OPTIONS,
+  compareMemberTypes,
+  memberTypeFilterFromQuery,
+  memberTypeFromBody,
+  memberTypePayload,
+  normalizeMemberType,
+} from '../services/memberRoles.service.js';
 
 // Both KYC sidebar modules ('New KYC' / 'All KYCs') manage the same underlying
 // resource — Access Control's Update/Delete toggles on the "All KYCs" row are the
@@ -52,6 +59,12 @@ const TYPE_TO_MEMBER_COL = {
 const TYPE_TO_MEMBER_COLS = {
   ...Object.fromEntries(Object.entries(TYPE_TO_MEMBER_COL).map(([type, column]) => [type, [column]])),
   AADHAAR: ['aadhar_front_url', 'aadhar_back_url'],
+};
+
+const memberDocumentFieldForType = (type, value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const field = String(value).trim();
+  return (TYPE_TO_MEMBER_COLS[type] || []).includes(field) ? field : undefined;
 };
 
 /** Write the uploaded doc's public URL onto the linked client member's KYC column. */
@@ -118,8 +131,9 @@ const findAccessibleDocument = async (user, documentId) => {
 
 /**
  * POST /kyc/cases  — start a KYC for a customer BEFORE any booking exists.
- * Body: { site_id, phone } (agent quick-add — just the number) or { site_id, client_member_id }.
- * Finds/creates the CLIENT member by phone, records the referring agent on the member
+ * Body: { site_id, phone, member_type } (quick-add) or
+ *       { site_id, client_member_id, member_type } (reuse an Accounting member).
+ * Finds/creates the selected member role by phone, records the referring agent
  * (first non-admin to add the number claims the referral), and opens/reuses a
  * member-anchored kyc_case (booking_id NULL). Admins later create the booking and the
  * case + referral attach automatically.
@@ -127,6 +141,10 @@ const findAccessibleDocument = async (user, documentId) => {
 export const createCase = asyncHandler(async (req, res) => {
   const { site_id, phone, full_name, client_member_id } = req.body || {};
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
+  const requestedMemberType = memberTypeFromBody(
+    req.body,
+    client_member_id ? null : 'CLIENT'
+  );
 
   const isAdmin = isAdminRole(req.user?.role);
   const visibleUserIds = await getVisibleUserIds(req.user);
@@ -135,11 +153,25 @@ export const createCase = asyncHandler(async (req, res) => {
 
   if (client_member_id) {
     const { rows } = await pool.query(
-      `SELECT * FROM members WHERE id = $1 AND member_type = 'CLIENT'`,
+      `SELECT * FROM members WHERE id = $1`,
       [client_member_id]
     );
     member = rows[0];
-    if (!member) return res.status(404).json({ message: 'Client not found' });
+    if (!member) return res.status(404).json({ message: 'Member not found' });
+    if (Number(member.site_id) !== Number(site_id)) {
+      return res.status(409).json({
+        message: 'This member is registered under a different site. Select the matching site registration.',
+        code: 'MEMBER_SITE_CONFLICT',
+      });
+    }
+    if (requestedMemberType && member.member_type !== requestedMemberType) {
+      return res.status(409).json({
+        message: `${member.full_name} is registered as ${member.member_type}, not ${requestedMemberType}`,
+        code: 'MEMBER_ROLE_CONFLICT',
+        existing_member_id: member.id,
+        existing_member_type: member.member_type,
+      });
+    }
     // Same claim rule as the phone path: the first agent to run this customer's KYC
     // becomes their referrer (never overwrites an existing claim).
     if (!member.referred_by_user_id && !isAdmin) {
@@ -161,8 +193,14 @@ export const createCase = asyncHandler(async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      member = await findOrCreateClientByPhone(
-        { siteId: site_id, phone, fullName: full_name, user: req.user },
+      member = await findOrCreateMemberByPhone(
+        {
+          siteId: site_id,
+          phone,
+          fullName: full_name,
+          memberType: requestedMemberType,
+          user: req.user,
+        },
         client
       );
 
@@ -184,24 +222,45 @@ export const createCase = asyncHandler(async (req, res) => {
 
   res.status(201).json({
     ...kycCase,
+    ...memberTypePayload(member),
+    account_member_id: member.id,
     client_name: member.full_name,
     client_phone: member.phone,
+    member_name: member.full_name,
+    member_phone: member.phone,
   });
 });
 
 /**
- * GET /kyc/cases?site_id=&status=&pending=1&q=
+ * GET /kyc/cases?site_id=&status=&pending=1&q=&member_type=
  * Role-scoped list: admins see every case; agents see their own network's cases
  * (same visibility idiom as bookings). `pending=1` → not yet VERIFIED/REJECTED.
  */
 export const listCases = asyncHandler(async (req, res) => {
   const { site_id, status, pending, q } = req.query;
+  const memberType = memberTypeFilterFromQuery(req.query);
   const visibleUserIds = await getVisibleUserIds(req.user);
   const rows = await kycCaseModel.list(
-    { siteId: site_id, status, pending: pending === '1' || pending === 'true', q, visibleUserIds },
+    {
+      siteId: site_id,
+      status,
+      pending: pending === '1' || pending === 'true',
+      q,
+      memberType,
+      visibleUserIds,
+    },
     pool
   );
   res.json(rows);
+});
+
+/** GET /kyc/member-types — canonical role picker backed by the shared DB contract. */
+export const listMemberTypes = asyncHandler(async (_req, res) => {
+  res.json({
+    member_types: MEMBER_TYPE_OPTIONS,
+    roles: MEMBER_TYPE_OPTIONS,
+    default: 'CLIENT',
+  });
 });
 
 /**
@@ -212,9 +271,13 @@ export const listCases = asyncHandler(async (req, res) => {
 export const previewFreshForm = asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'Upload the filled KYC form first' });
   if (!req.body?.site_id) return res.status(400).json({ message: 'Select a site first' });
+  const memberType = memberTypeFromBody(req.body, 'CLIENT');
 
   const result = await runOcr(req.file.buffer, req.file.mimetype, 'KYC_FORM');
+  const roleCheck = compareMemberTypes(memberType, result.fields?.member_type);
   res.json({
+    ...memberTypePayload(memberType),
+    role_check: roleCheck,
     raw_text: result.text,
     extracted_fields: result.fields,
     confidence: result.confidence,
@@ -235,7 +298,34 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
   if (!siteId) return res.status(400).json({ message: 'Select a site first' });
 
   const memberFields = parseObjectField(req.body.member_fields);
+  const memberType = memberTypeFromBody(
+    req.body,
+    memberTypeFromBody(memberFields, 'CLIENT')
+  );
   const extractedFields = parseObjectField(req.body.extracted_fields);
+  const roleCheck = compareMemberTypes(memberType, extractedFields.member_type);
+  const detectedMemberType = roleCheck.detected;
+  const reviewedRoleOverride = ['1', 'true', 'yes'].includes(
+    String(req.body.role_mismatch_reviewed || '').trim().toLowerCase()
+  );
+  if (roleCheck.blocking && !reviewedRoleOverride) {
+    return res.status(409).json({
+      message:
+        `The scanned form is stamped ${detectedMemberType}, but ${memberType} is selected. ` +
+        'Select the matching role or explicitly confirm the reviewed override.',
+      code: 'KYC_ROLE_MISMATCH',
+      selected_role: memberType,
+      detected_role: detectedMemberType,
+      requires_reviewed_override: true,
+    });
+  }
+  // Keep both the printed role and the reviewed registration decision in OCR history.
+  // This makes an explicit mismatch override auditable instead of silently discarding
+  // what the form actually said.
+  extractedFields.selected_member_type = memberType;
+  if (roleCheck.blocking && reviewedRoleOverride) {
+    extractedFields.role_mismatch_reviewed = true;
+  }
   const confidenceMap = parseObjectField(req.body.confidence_map);
   const rawText = String(req.body.raw_text || '').slice(0, 100000);
   const confidence = Math.min(1, Math.max(0, Number(req.body.confidence) || 0));
@@ -256,8 +346,8 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
 
   try {
     await client.query('BEGIN');
-    member = await findOrCreateClientByPhone(
-      { siteId, phone, fullName, user: req.user },
+    member = await findOrCreateMemberByPhone(
+      { siteId, phone, fullName, memberType, user: req.user },
       client
     );
 
@@ -353,10 +443,20 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
   emitOcrUpdate({ caseId: kycCase.id, documentId: doc.id, status: 'DONE', stage: 'DONE' });
   res.status(201).json({
     ...kycCase,
+    ...memberTypePayload(member),
     status: 'OCR_DONE',
+    account_member_id: member.id,
     client_member_id: member.id,
     client_name: member.full_name,
     client_phone: member.phone,
+    member_name: member.full_name,
+    member_phone: member.phone,
+    role_check: {
+      ...roleCheck,
+      reviewed_override: !!(
+        roleCheck.blocking && reviewedRoleOverride
+      ),
+    },
     documentId: doc.id,
   });
 });
@@ -390,6 +490,13 @@ export const uploadDocument = asyncHandler(async (req, res) => {
   }
 
   const type = (req.body.type || 'OTHER').toUpperCase();
+  const memberDocumentField = memberDocumentFieldForType(type, req.body.member_document_field);
+  if (memberDocumentField === undefined) {
+    return res.status(400).json({
+      message: `member_document_field is not valid for ${type}`,
+      allowed_fields: TYPE_TO_MEMBER_COLS[type] || [],
+    });
+  }
   const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
   const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
 
@@ -402,6 +509,7 @@ export const uploadDocument = asyncHandler(async (req, res) => {
     client_member_id: kycCase.client_member_id,
     site_id: kycCase.site_id,
     type,
+    member_document_field: memberDocumentField,
     file_path: storageKey,
     file_hash: fileHash,
     mime_type: req.file.mimetype,
@@ -424,7 +532,13 @@ export const uploadDocument = asyncHandler(async (req, res) => {
 
   // Respond the moment the file is stored + row created — the UI no longer waits on
   // status roll-ups, job-id persistence, or the accounting mirror.
-  res.status(201).json({ documentId: doc.id, jobId, ocr_status: skipOcr ? 'DONE' : 'PENDING', type });
+  res.status(201).json({
+    documentId: doc.id,
+    jobId,
+    ocr_status: skipOcr ? 'DONE' : 'PENDING',
+    type,
+    member_document_field: doc.member_document_field || null,
+  });
 
   // Fire-and-forget bookkeeping — never blocks the HTTP response.
   (async () => {
@@ -437,7 +551,15 @@ export const uploadDocument = asyncHandler(async (req, res) => {
         }
       }
       // Mirror the document onto the accounting client record (shows on /clients/:id).
-      await linkDocToMember(type, storageKey, kycCase.client_member_id, req.body.member_document_field);
+      const linked = await linkDocToMember(type, storageKey, kycCase.client_member_id, memberDocumentField);
+      // Legacy/manual callers may omit the field. Persist the slot that the mirror
+      // selected so subsequent timeline labels and replacements remain semantic.
+      if (linked?.col && !memberDocumentField) {
+        await pool.query(
+          'UPDATE documents SET member_document_field = $1, updated_at = now() WHERE id = $2',
+          [linked.col, doc.id]
+        );
+      }
     } catch (err) {
       console.error('[kyc upload] post-processing failed:', err.message);
     }
@@ -596,7 +718,7 @@ export const publicVerifyKyc = asyncHandler(async (req, res) => {
 
   const { rows } = await pool.query(
     `SELECT k.id, k.status, k.created_at, k.verified_at,
-            m.full_name, m.phone, m.photo, m.aadhar_no, m.pan_no,
+            m.full_name, m.phone, m.photo, m.aadhar_no, m.pan_no, m.member_type,
             s.name AS site_name,
             u.name AS agent_name, u.referral_code AS agent_code
        FROM kyc_cases k
@@ -623,6 +745,9 @@ export const publicVerifyKyc = asyncHandler(async (req, res) => {
     status: k.status,
     is_verified: k.status === 'VERIFIED',
     customer_name: k.full_name,
+    member_type: normalizeMemberType(k.member_type, null),
+    registration_role: normalizeMemberType(k.member_type, null),
+    role: normalizeMemberType(k.member_type, null),
     customer_photo: k.photo,
     phone_masked: mask(k.phone),
     aadhaar_masked: mask(k.aadhar_no),
@@ -659,10 +784,20 @@ export const updateCaseCustomer = asyncHandler(async (req, res) => {
   if (!full_name) return res.status(400).json({ message: 'Name is required' });
 
   const { rows } = await pool.query(
-    `UPDATE members SET full_name = $1, phone = $2, updated_at = now() WHERE id = $3 RETURNING id, full_name, phone`,
+    `UPDATE members SET full_name = $1, phone = $2, updated_at = now()
+      WHERE id = $3
+      RETURNING id, full_name, phone, member_type`,
     [full_name, phone || null, kycCase.client_member_id]
   );
-  res.json({ caseId: kycCase.id, client_name: rows[0].full_name, client_phone: rows[0].phone });
+  res.json({
+    caseId: kycCase.id,
+    account_member_id: rows[0].id,
+    ...memberTypePayload(rows[0]),
+    client_name: rows[0].full_name,
+    client_phone: rows[0].phone,
+    member_name: rows[0].full_name,
+    member_phone: rows[0].phone,
+  });
 });
 
 /**
@@ -699,6 +834,17 @@ export const retryDocument = asyncHandler(async (req, res) => {
   if (denied) return res.status(403).json({ message: 'You are not authorised to modify this document' });
   if (!doc) return res.status(404).json({ message: 'Document not found' });
 
+  // Clicking Retry twice, or retrying while the first upload job is still active,
+  // must not create another provider request.
+  if (doc.ocr_status === 'PENDING' || doc.ocr_status === 'PROCESSING') {
+    return res.status(202).json({
+      documentId: doc.id,
+      jobId: doc.ocr_job_id || null,
+      ocr_status: doc.ocr_status,
+      deduplicated: true,
+    });
+  }
+
   await pool.query(
     `UPDATE documents SET ocr_status = 'PENDING', ocr_error = NULL, ocr_started_at = NULL, ocr_completed_at = NULL WHERE id = $1`,
     [doc.id]
@@ -711,8 +857,10 @@ export const retryDocument = asyncHandler(async (req, res) => {
   res.json({ documentId: doc.id, jobId, ocr_status: 'PENDING' });
 });
 
-/** POST /kyc/case/:id/extract-preview — AI-powered preview of extracted fields.
- * Calls Groq on the raw OCR text of all documents to get intelligent extraction. */
+/** POST /kyc/case/:id/extract-preview
+ * Aggregate the structured fields already produced by document OCR. This endpoint
+ * intentionally performs ZERO LLM calls: previewing/reopening a case is a database
+ * read, not another paid/rate-limited extraction pass. */
 export const extractPreview = asyncHandler(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM kyc_cases WHERE id = $1', [req.params.id]);
   const kycCase = rows[0];
@@ -721,12 +869,19 @@ export const extractPreview = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You are not authorised to access this KYC case' });
   }
 
-  // Get all documents with their raw OCR text
+  // Read only the latest stored OCR result for every completed document.
   const { rows: documents } = await pool.query(
-    `SELECT d.id, d.type, r.raw_text
+    `SELECT d.id, d.type, r.extracted_fields
      FROM documents d
-     LEFT JOIN ocr_results r ON d.id = r.document_id
-     WHERE d.kyc_case_id = $1 AND d.ocr_status = 'DONE'`,
+     LEFT JOIN LATERAL (
+       SELECT extracted_fields
+         FROM ocr_results o
+        WHERE o.document_id = d.id
+        ORDER BY o.id DESC
+        LIMIT 1
+     ) r ON true
+     WHERE d.kyc_case_id = $1 AND d.ocr_status = 'DONE'
+     ORDER BY d.id ASC`,
     [kycCase.id]
   );
 
@@ -734,25 +889,21 @@ export const extractPreview = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'No completed documents to extract from' });
   }
 
-  // Run all per-document extractions in parallel — the response is bounded by the
-  // slowest document instead of the sum of all of them.
-  const results = await Promise.all(
-    documents.map(async (doc) => {
-      if (!doc.raw_text?.text) return {};
-      try {
-        return await extractKycFieldsWithAi(doc.raw_text.text, doc.type);
-      } catch (err) {
-        console.error(`[preview] Groq extraction failed for doc ${doc.id}:`, err.message);
-        return {};
-      }
-    })
+  const extracted = Object.assign(
+    {},
+    ...documents.map((doc) => (
+      doc.extracted_fields && typeof doc.extracted_fields === 'object'
+        ? doc.extracted_fields
+        : {}
+    ))
   );
-  const extracted = Object.assign({}, ...results);
 
   res.json({
     caseId: kycCase.id,
     extracted: extracted || {},
     docCount: documents.length,
+    source: 'stored_ocr_results',
+    aiRequests: 0,
   });
 });
 
@@ -774,19 +925,28 @@ export const verifyCase = asyncHandler(async (req, res) => {
   // API boundary so Accounts, Booking and direct requests cannot verify a case
   // with only one side. Existing verified cases and stored files are untouched.
   const { rows: aadhaarRows } = await pool.query(
-    `SELECT count(*)::int AS ready_count
-       FROM (
-         SELECT ocr_status
-           FROM documents
-          WHERE kyc_case_id = $1 AND type = 'AADHAAR'
-          ORDER BY id ASC
-          LIMIT 2
-       ) aadhaar_sides
-      WHERE ocr_status = 'DONE'`,
+    `SELECT id, ocr_status, member_document_field
+       FROM documents
+      WHERE kyc_case_id = $1 AND type = 'AADHAAR'
+      ORDER BY id ASC`,
     [kycCase.id]
   );
-  const aadhaarReadyCount = aadhaarRows[0]?.ready_count || 0;
-  if (aadhaarReadyCount < 2) {
+  const latestExplicit = (field) => [...aadhaarRows].reverse()
+    .find((doc) => doc.member_document_field === field);
+  let aadhaarFront = latestExplicit('aadhar_front_url');
+  let aadhaarBack = latestExplicit('aadhar_back_url');
+  const usedIds = new Set([aadhaarFront?.id, aadhaarBack?.id].filter(Boolean));
+  const legacyUnlabelled = aadhaarRows.filter((doc) => !usedIds.has(doc.id)
+    && !['aadhar_front_url', 'aadhar_back_url'].includes(doc.member_document_field));
+  if (!aadhaarFront) aadhaarFront = legacyUnlabelled.shift();
+  if (!aadhaarBack) aadhaarBack = legacyUnlabelled.shift();
+  const aadhaarReadyCount = [aadhaarFront, aadhaarBack]
+    .filter((doc) => doc?.ocr_status === 'DONE').length;
+  // The standalone member-first KYC workspace supports explicit manual review even
+  // before both sides finish OCR. Booking verification keeps the strict default by
+  // omitting this flag.
+  const allowIncompleteDocuments = req.body?.allow_incomplete_documents === true;
+  if (aadhaarReadyCount < 2 && !allowIncompleteDocuments) {
     return res.status(400).json({
       message: `Aadhaar front and back are compulsory (${aadhaarReadyCount}/2 ready)`,
       code: 'AADHAAR_BOTH_SIDES_REQUIRED',

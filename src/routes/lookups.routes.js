@@ -6,7 +6,7 @@ import {
   getClientPayments, searchAgents,
 } from '../controllers/booking.controller.js';
 
-// Lookups used by the booking form: clients (existing members CLIENT) + plots inventory.
+// Shared Accounting member lookups (optionally member_type-filtered) + plot inventory.
 const router = express.Router();
 router.use(authMiddleware);
 

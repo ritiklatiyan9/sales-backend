@@ -24,9 +24,14 @@ const getCaseAndBookingId = async (documentId) => {
   return { caseId: rows[0]?.case_id || null, bookingId: rows[0]?.booking_id || null };
 };
 
-const setProcessing = (documentId) =>
+// Atomic DB claim is the cross-process/idempotency boundary. If two Node instances
+// receive the same job, only one can change PENDING → PROCESSING and call the LLM.
+const claimForProcessing = (documentId) =>
   pool.query(
-    `UPDATE documents SET ocr_status='PROCESSING', ocr_started_at=now(), updated_at=now() WHERE id=$1`,
+    `UPDATE documents
+        SET ocr_status='PROCESSING', ocr_started_at=now(), updated_at=now()
+      WHERE id=$1 AND ocr_status='PENDING'
+      RETURNING *`,
     [documentId]
   );
 
@@ -123,10 +128,10 @@ const findCachedResult = async (doc) => {
  */
 export const processDocument = async (documentId, preload) => {
   console.log(`[ocrProcessor] start document_id=${documentId}`);
-  const { rows } = await pool.query('SELECT * FROM documents WHERE id = $1', [documentId]);
+  const { rows } = await claimForProcessing(documentId);
   const doc = rows[0];
   if (!doc) {
-    console.warn(`[ocrProcessor] document ${documentId} not found — skipping`);
+    console.warn(`[ocrProcessor] document ${documentId} already claimed or not pending — skipping duplicate`);
     return;
   }
 
@@ -134,7 +139,6 @@ export const processDocument = async (documentId, preload) => {
   const stage = (s) => emitOcrUpdate({ bookingId, caseId, documentId, status: 'PROCESSING', stage: s });
 
   try {
-    await setProcessing(documentId);
     stage('FETCH');
 
     // Cache hit → skip the vision call entirely (same bytes, same doc type).

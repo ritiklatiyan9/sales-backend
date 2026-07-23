@@ -7,7 +7,15 @@ class KycCaseModel extends MasterModel {
 
   async findByBooking(bookingId, pool) {
     const { rows } = await pool.query(
-      'SELECT * FROM kyc_cases WHERE booking_id = $1 ORDER BY id ASC',
+      `SELECT k.*,
+              m.id AS account_member_id,
+              m.member_type,
+              m.member_type AS registration_role,
+              m.member_type AS role
+         FROM kyc_cases k
+         LEFT JOIN members m ON m.id = k.client_member_id
+        WHERE k.booking_id = $1
+        ORDER BY k.id ASC`,
       [bookingId]
     );
     return rows;
@@ -112,15 +120,20 @@ class KycCaseModel extends MasterModel {
    * `visibleUserIds` (array | null) scopes rows for non-admins — cases they opened,
    * or cases on bookings they own/created (legacy booking-tied cases).
    */
-  async list({ siteId, status, pending, q, visibleUserIds }, pool) {
+  async list({ siteId, status, pending, q, memberType, visibleUserIds }, pool) {
     const where = [];
     const params = [];
     if (siteId) { params.push(siteId); where.push(`k.site_id = $${params.length}`); }
     if (status) { params.push(status); where.push(`k.status = $${params.length}`); }
+    if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
     if (pending) where.push(`k.status NOT IN ('VERIFIED','REJECTED')`);
     if (q) {
       params.push(`%${q}%`);
-      where.push(`(m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR m.aadhar_no ILIKE $${params.length} OR m.pan_no ILIKE $${params.length})`);
+      where.push(`(m.full_name ILIKE $${params.length}
+                   OR m.phone ILIKE $${params.length}
+                   OR m.aadhar_no ILIKE $${params.length}
+                   OR m.pan_no ILIKE $${params.length}
+                   OR m.member_type ILIKE $${params.length})`);
     }
     if (Array.isArray(visibleUserIds)) {
       params.push(visibleUserIds);
@@ -132,8 +145,13 @@ class KycCaseModel extends MasterModel {
 
     const { rows } = await pool.query(`
       SELECT k.*,
+             m.id AS account_member_id,
              m.full_name AS client_name, m.phone AS client_phone, m.photo AS client_photo,
              m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
+             m.full_name AS member_name, m.phone AS member_phone, m.photo AS member_photo,
+             m.member_type,
+             m.member_type AS registration_role,
+             m.member_type AS role,
              b.booking_no,
              u.name AS created_by_name, u.referral_code AS created_by_code,
              s.name AS site_name,
@@ -156,6 +174,7 @@ class KycCaseModel extends MasterModel {
   async getDetail(id, pool) {
     const { rows } = await pool.query(`
       SELECT k.*,
+             m.id AS account_member_id,
              m.full_name AS client_name, m.phone AS client_phone, m.email AS client_email,
              m.photo AS client_photo, m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
              m.father_name AS client_father, m.date_of_birth AS client_dob,
@@ -170,6 +189,11 @@ class KycCaseModel extends MasterModel {
              m.co_applicant_aadhar AS client_co_applicant_aadhar,
              m.co_applicant_pan AS client_co_applicant_pan,
              m.co_applicant_address AS client_co_applicant_address,
+             m.full_name AS member_name, m.phone AS member_phone, m.email AS member_email,
+             m.photo AS member_photo,
+             m.member_type,
+             m.member_type AS registration_role,
+             m.member_type AS role,
              b.booking_no, b.status AS booking_status,
              u.name AS created_by_name, u.referral_code AS created_by_code,
              s.name AS site_name

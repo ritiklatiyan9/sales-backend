@@ -7,6 +7,11 @@ import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { isAdminRole, getVisibleUserIds } from '../services/agentNetwork.service.js';
+import {
+  memberTypeFilterFromQuery,
+  memberTypeFromBody,
+  memberTypePayload,
+} from '../services/memberRoles.service.js';
 
 // Token-payment capture fields a booking may set (mirror of the accounting plot-payment
 // taking fields). Stored on the booking and propagated to plot_payments by tokenPaymentSync.
@@ -16,9 +21,9 @@ const TOKEN_PAYMENT_FIELDS = [
 ];
 
 /**
- * Member columns a CLIENT record may set from the booking module. These all already
+ * Common member columns a record may set from the booking module. These all already
  * exist on the shared accounting `members` table — we only ever write the subset a
- * user supplies, and never touch member_type/site beyond create. Keeps every field
+ * user supplies, and never touch member_type/site beyond explicit create. Keeps every field
  * that the printable booking form / AddClient.jsx renders editable from the Members
  * screen — a field missing here silently never persists no matter what the UI shows.
  */
@@ -36,6 +41,19 @@ const CLIENT_FIELDS = [
   'co_applicant_address',
   'nominee_name', 'nominee_relation', 'nominee_phone', 'reference', 'notes', 'photo',
 ];
+const ROLE_SPECIFIC_MEMBER_FIELDS = [
+  // Employee / supervisor
+  'employee_id', 'designation', 'department', 'date_of_joining', 'salary', 'employment_type',
+  // Farmer
+  'land_area', 'crop_type', 'farm_location', 'irrigation_type', 'farming_experience',
+  // Broker
+  'license_number', 'commission_rate', 'operating_areas',
+  // Vendor
+  'business_name', 'service_type', 'payment_terms',
+  // Broker/member/employee/partner grouping
+  'team',
+];
+const ACCOUNT_MEMBER_FIELDS = [...CLIENT_FIELDS, ...ROLE_SPECIFIC_MEMBER_FIELDS];
 
 // Normalise '' → null so optional date/number-ish columns don't choke on empty strings.
 const clean = (v) => (v === '' ? null : v);
@@ -75,9 +93,19 @@ const revertDrawAllotment = async (bookingId, actorId) => {
  * see only bookings owned by (or created by) users inside their own network. */
 export const listBookings = asyncHandler(async (req, res) => {
   const { site_id, status, kyc_status, q, client_member_id, agent_user_id } = req.query;
+  const memberType = memberTypeFilterFromQuery(req.query);
   const visibleUserIds = await getVisibleUserIds(req.user); // null = unrestricted
   const rows = await bookingModel.list(
-    { siteId: site_id, status, kycStatus: kyc_status, q, clientMemberId: client_member_id, agentUserId: agent_user_id, visibleUserIds },
+    {
+      siteId: site_id,
+      status,
+      kycStatus: kyc_status,
+      q,
+      clientMemberId: client_member_id,
+      agentUserId: agent_user_id,
+      memberType,
+      visibleUserIds,
+    },
     pool
   );
   res.json(rows);
@@ -115,6 +143,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
     SELECT b.id, b.booking_no, b.status, b.kyc_status, b.booking_date, b.created_at,
            b.token_amount, b.booked_by, b.buyer_name,
            m.full_name AS client_name, m.photo AS client_photo,
+           m.member_type, m.member_type AS registration_role, m.member_type AS role,
            p.plot_no, p.block AS plot_block
     FROM bookings b
     LEFT JOIN members m ON m.id = b.client_member_id
@@ -260,6 +289,28 @@ export const createBooking = asyncHandler(async (req, res) => {
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
   if (!client_member_id) return res.status(400).json({ message: 'client_member_id is required' });
 
+  // Resolve the shared Accounting member once up front. This turns an otherwise
+  // opaque FK failure into a useful response and prevents cross-site bookings.
+  const { rows: memberRows } = await pool.query(
+    `SELECT m.id, m.site_id, m.member_type, m.full_name,
+            m.referred_by_user_id, m.created_by,
+            ru.id AS ref_id, ru.team_id AS ref_team, ru.role AS ref_role,
+            cu.id AS cre_id, cu.team_id AS cre_team, cu.role AS cre_role
+       FROM members m
+       LEFT JOIN users ru ON ru.id = m.referred_by_user_id
+       LEFT JOIN users cu ON cu.id = m.created_by
+      WHERE m.id = $1`,
+    [client_member_id]
+  );
+  const bookingMember = memberRows[0];
+  if (!bookingMember) return res.status(404).json({ message: 'Member not found' });
+  if (Number(bookingMember.site_id) !== Number(site_id)) {
+    return res.status(409).json({
+      message: 'This member is registered under a different site. Select the matching site registration.',
+      code: 'MEMBER_SITE_CONFLICT',
+    });
+  }
+
   // Optional token-payment capture fields (only what the form supplied; '' → null).
   const tokenData = {};
   for (const f of TOKEN_PAYMENT_FIELDS) {
@@ -286,22 +337,11 @@ export const createBooking = asyncHandler(async (req, res) => {
     ownership = { agent_user_id: rows[0].id, team_id: rows[0].team_id || null };
     referral_source = 'form';
   } else {
-    const { rows: memberRows } = await pool.query(
-      `SELECT m.referred_by_user_id, m.created_by,
-              ru.id AS ref_id, ru.team_id AS ref_team, ru.role AS ref_role,
-              cu.id AS cre_id, cu.team_id AS cre_team, cu.role AS cre_role
-         FROM members m
-         LEFT JOIN users ru ON ru.id = m.referred_by_user_id
-         LEFT JOIN users cu ON cu.id = m.created_by
-        WHERE m.id = $1`,
-      [client_member_id]
-    );
-    const mem = memberRows[0];
-    if (mem?.ref_id) {
-      ownership = { agent_user_id: mem.ref_id, team_id: mem.ref_team || null };
+    if (bookingMember.ref_id) {
+      ownership = { agent_user_id: bookingMember.ref_id, team_id: bookingMember.ref_team || null };
       referral_source = 'member';
-    } else if (mem?.cre_id && !isAdminRole(mem.cre_role)) {
-      ownership = { agent_user_id: mem.cre_id, team_id: mem.cre_team || null };
+    } else if (bookingMember.cre_id && !isAdminRole(bookingMember.cre_role)) {
+      ownership = { agent_user_id: bookingMember.cre_id, team_id: bookingMember.cre_team || null };
       referral_source = 'member';
     }
   }
@@ -342,9 +382,18 @@ export const createBooking = asyncHandler(async (req, res) => {
   // plot sync so plots.booking_by is populated for the payment's "Booked By").
   const token_sync = await syncTokenPayment(created, pool);
 
-  // Re-read: the adoption rollup above may have advanced status/kyc_status.
-  const fresh = adoptedCount ? await bookingModel.findById(created.id, pool) : created;
-  res.status(201).json({ ...fresh, booking_no, plot_sync, token_sync, referral_source });
+  // Re-read with member joins: adoption may have advanced status/kyc_status and every
+  // creation response should expose the same role contract as list/detail.
+  const fresh = await bookingModel.getDetail(created.id, pool);
+  res.status(201).json({
+    ...fresh,
+    ...memberTypePayload(bookingMember),
+    booking_no,
+    plot_sync,
+    token_sync,
+    referral_source,
+    adopted_kyc_cases: adoptedCount,
+  });
 });
 
 /** GET /bookings/:id  → booking + kyc cases + documents (with latest OCR result) */
@@ -483,24 +532,32 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   });
 });
 
-/** GET /clients/search?site_id=&q= — searches existing members (CLIENT).
+/** GET /clients/search?site_id=&q=&member_type= — searches shared Accounting members.
  * Includes the referring agent (who added the number) + the latest KYC case status so
  * the booking form can show "KYC verified · referred by AGT-XXXXX" on selection. */
 export const searchClients = asyncHandler(async (req, res) => {
   const { site_id, q } = req.query;
+  const memberType = memberTypeFilterFromQuery(req.query);
   const params = [];
-  const where = [`m.member_type = 'CLIENT'`];
+  const where = [];
   if (site_id) { params.push(site_id); where.push(`m.site_id = $${params.length}`); }
+  if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
   if (q) {
     params.push(`%${q}%`);
-    where.push(`(m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR m.aadhar_no ILIKE $${params.length} OR m.pan_no ILIKE $${params.length})`);
+    where.push(`(m.full_name ILIKE $${params.length}
+                 OR m.phone ILIKE $${params.length}
+                 OR m.aadhar_no ILIKE $${params.length}
+                 OR m.pan_no ILIKE $${params.length}
+                 OR m.member_type ILIKE $${params.length})`);
   }
+  const whereSql = where.length ? where.join(' AND ') : 'true';
   // The LATERAL prefers the case a NEW booking would adopt (booking-less, or stranded
   // on a CANCELLED booking) so kyc_attachable tells the form whether "documents attach
   // automatically" is actually true; otherwise it falls back to the member's strongest
   // case for display.
   const { rows } = await pool.query(
     `SELECT m.id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no, m.photo, m.occupation, m.father_name,
+            m.member_type, m.member_type AS registration_role, m.member_type AS role,
             u.name AS referred_by_name, u.referral_code AS referred_by_code,
             k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
      FROM members m
@@ -515,7 +572,7 @@ export const searchClients = asyncHandler(async (req, res) => {
                  (kc.status = 'VERIFIED') DESC, kc.id DESC
         LIMIT 1
      ) k ON true
-     WHERE ${where.join(' AND ')} ORDER BY m.full_name ASC LIMIT 50`,
+     WHERE ${whereSql} ORDER BY m.full_name ASC LIMIT 100`,
     params
   );
   res.json(rows);
@@ -536,7 +593,8 @@ export const searchAgents = asyncHandler(async (req, res) => {
     where.push(`(full_name ILIKE $${params.length} OR phone ILIKE $${params.length})`);
   }
   const { rows } = await pool.query(
-    `SELECT id, full_name, phone, member_type, photo
+    `SELECT id, full_name, phone, member_type,
+            member_type AS registration_role, member_type AS role, photo
        FROM members WHERE ${where.join(' AND ')}
       ORDER BY full_name ASC LIMIT 100`,
     params
@@ -544,43 +602,114 @@ export const searchAgents = asyncHandler(async (req, res) => {
   res.json(rows);
 });
 
-/** GET /clients/:id — full CLIENT member record (for the edit screen). */
+/** GET /clients/:id — full shared Accounting member record (legacy route name). */
 export const getClient = asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT * FROM members WHERE id = $1 AND member_type = 'CLIENT'`,
+    `SELECT m.*, m.member_type AS registration_role, m.member_type AS role
+       FROM members m WHERE m.id = $1`,
     [req.params.id]
   );
-  if (!rows[0]) return res.status(404).json({ message: 'Client not found' });
+  if (!rows[0]) return res.status(404).json({ message: 'Member not found' });
   res.json(rows[0]);
 });
 
-/** POST /clients — creates a new member of type CLIENT (reuses accounting members). */
+/**
+ * POST /clients — role-aware registration directly in the shared Accounting members
+ * table (legacy route name retained for existing frontends).
+ */
 export const createClient = asyncHandler(async (req, res) => {
-  const { site_id } = req.body;
-  if (!site_id || !req.body.full_name) {
+  const siteId = Number(req.body?.site_id);
+  const fullName = String(req.body?.full_name || '').trim();
+  if (!Number.isInteger(siteId) || siteId <= 0 || !fullName) {
     return res.status(400).json({ message: 'site_id and full_name are required' });
   }
+  const memberType = memberTypeFromBody(req.body, 'CLIENT');
+  const memberInput = { ...req.body, full_name: fullName };
+  if (memberInput.gender !== undefined && memberInput.gender !== '' && memberInput.gender !== null) {
+    const gender = String(memberInput.gender).trim().toUpperCase();
+    if (!['MALE', 'FEMALE', 'OTHER'].includes(gender)) {
+      return res.status(400).json({ message: 'gender must be MALE, FEMALE or OTHER' });
+    }
+    memberInput.gender = gender;
+  }
+  const phoneDigits = String(memberInput.phone || '').replace(/\D/g, '');
+  if (memberInput.phone && (phoneDigits.length < 6 || phoneDigits.length > 15)) {
+    return res.status(400).json({ message: 'Enter a valid mobile number' });
+  }
+  if (phoneDigits) memberInput.phone = phoneDigits;
 
   const cols = ['site_id', 'member_type', 'status', 'created_by'];
-  const vals = [site_id, 'CLIENT', 'ACTIVE', req.user?.id || null];
+  const vals = [siteId, memberType, 'ACTIVE', req.user?.id || null];
   // A customer registered by an agent carries that agent as their referrer — bookings
   // created later auto-attach the agent from this column.
   if (!isAdminRole(req.user?.role)) {
     cols.push('referred_by_user_id');
     vals.push(req.user?.id || null);
   }
-  for (const f of CLIENT_FIELDS) {
-    if (req.body[f] !== undefined) { cols.push(f); vals.push(clean(req.body[f])); }
+  for (const f of ACCOUNT_MEMBER_FIELDS) {
+    if (memberInput[f] !== undefined) { cols.push(f); vals.push(clean(memberInput[f])); }
   }
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
-  const { rows } = await pool.query(
-    `INSERT INTO members (${cols.join(', ')}) VALUES (${placeholders}) RETURNING *`,
-    vals
-  );
-  res.status(201).json(rows[0]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (phoneDigits) {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [`member_quick_add:${siteId}:${phoneDigits.slice(-10)}`]
+      );
+      const { rows: existingRows } = await client.query(
+        `SELECT * FROM members
+          WHERE site_id = $1
+            AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') <> ''
+            AND RIGHT(regexp_replace(COALESCE(phone, ''), '\\D', '', 'g'), 10) = RIGHT($2, 10)
+          ORDER BY id DESC LIMIT 1`,
+        [siteId, phoneDigits]
+      );
+      const existing = existingRows[0];
+      if (existing) {
+        if (existing.member_type !== memberType) {
+          throw Object.assign(
+            new Error(
+              `Mobile number ${phoneDigits} is already registered as ${existing.member_type} ` +
+              `for ${existing.full_name}. Select ${existing.member_type} or use another number.`
+            ),
+            {
+              status: 409,
+              code: 'MEMBER_ROLE_CONFLICT',
+              existing_member_id: existing.id,
+              existing_member_type: existing.member_type,
+            }
+          );
+        }
+        await client.query('COMMIT');
+        return res.status(200).json({
+          ...existing,
+          ...memberTypePayload(existing),
+          reused: true,
+        });
+      }
+    }
+
+    const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
+    const { rows } = await client.query(
+      `INSERT INTO members (${cols.join(', ')}) VALUES (${placeholders}) RETURNING *`,
+      vals
+    );
+    await client.query('COMMIT');
+    return res.status(201).json({
+      ...rows[0],
+      ...memberTypePayload(rows[0]),
+      reused: false,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
-/** PUT /clients/:id — update any of the supported CLIENT member fields. */
+/** PUT /clients/:id — update a shared member; admins may explicitly change its role. */
 export const updateClient = asyncHandler(async (req, res) => {
   // members.gender has a DB CHECK (MALE/FEMALE/OTHER) — OCR/typed input arrives as
   // "Male"; coerce or skip instead of failing the whole update.
@@ -590,19 +719,28 @@ export const updateClient = asyncHandler(async (req, res) => {
   }
   const sets = [];
   const vals = [];
-  for (const f of CLIENT_FIELDS) {
+  for (const f of ACCOUNT_MEMBER_FIELDS) {
     if (req.body[f] !== undefined) { vals.push(clean(req.body[f])); sets.push(`${f} = $${vals.length}`); }
+  }
+  if (req.body.member_type !== undefined || req.body.registration_role !== undefined || req.body.applicant_role !== undefined) {
+    if (!isAdminRole(req.user?.role)) {
+      return res.status(403).json({ message: 'Only admins can change an existing member role' });
+    }
+    const updatedMemberType = memberTypeFromBody(req.body, null);
+    if (!updatedMemberType) return res.status(400).json({ message: 'member_type cannot be blank' });
+    vals.push(updatedMemberType);
+    sets.push(`member_type = $${vals.length}`);
   }
   if (!sets.length) return res.status(400).json({ message: 'No editable fields provided' });
   sets.push('updated_at = now()');
   vals.push(req.params.id);
 
   const { rows } = await pool.query(
-    `UPDATE members SET ${sets.join(', ')} WHERE id = $${vals.length} AND member_type = 'CLIENT' RETURNING *`,
+    `UPDATE members SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`,
     vals
   );
-  if (!rows[0]) return res.status(404).json({ message: 'Client not found' });
-  res.json(rows[0]);
+  if (!rows[0]) return res.status(404).json({ message: 'Member not found' });
+  res.json({ ...rows[0], ...memberTypePayload(rows[0]) });
 });
 
 /**
@@ -645,24 +783,24 @@ export const availablePlots = asyncHandler(async (req, res) => {
   res.json(rows);
 });
 
-/** POST /clients/:id/photo — upload profile photo for a client. */
+/** POST /clients/:id/photo — upload profile photo for any shared member. */
 export const uploadClientPhoto = asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
   const { id } = req.params;
   const { rows: existing } = await pool.query(
-    'SELECT * FROM members WHERE id = $1 AND member_type = \'CLIENT\'',
+    'SELECT * FROM members WHERE id = $1',
     [id]
   );
-  if (!existing[0]) return res.status(404).json({ message: 'Client not found' });
+  if (!existing[0]) return res.status(404).json({ message: 'Member not found' });
 
   const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
   const photoUrl = getPublicKycUrl(storageKey);
 
   const { rows } = await pool.query(
-    'UPDATE members SET photo = $1, updated_at = now() WHERE id = $2 AND member_type = \'CLIENT\' RETURNING *',
+    'UPDATE members SET photo = $1, updated_at = now() WHERE id = $2 RETURNING *',
     [photoUrl, id]
   );
 
-  res.json(rows[0]);
+  res.json({ ...rows[0], ...memberTypePayload(rows[0]) });
 });

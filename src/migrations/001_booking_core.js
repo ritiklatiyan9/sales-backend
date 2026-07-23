@@ -88,6 +88,7 @@ const migrate = async () => {
         site_id           INTEGER REFERENCES sites(id) ON DELETE SET NULL,
         type              VARCHAR(20) NOT NULL DEFAULT 'OTHER'
                             CHECK (type IN ('AADHAAR','PAN','PHOTO','CHEQUE','VOTER_ID','PASSPORT','DL','OTHER')),
+        member_document_field VARCHAR(80),
         file_path         TEXT NOT NULL,
         file_hash         VARCHAR(80),
         mime_type         VARCHAR(120),
