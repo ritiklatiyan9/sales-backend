@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { DEFAULT_DRAW_TERMS, money, openingDate, todayIST, validDate, validatePayment, validateWinner, workflowError } from '../services/drawWorkflow.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import drawModel from '../models/Draw.model.js';
@@ -65,7 +66,7 @@ const buildDetail = async (id, db = pool) => {
     drawModel.getEvents(id, db),
   ]);
   if (!registration) return null;
-  const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+  const totalPaid = payments.reduce((sum, p) => sum + Math.round(Number(p.amount || 0) * 100), 0) / 100;
   const required = Number(registration.required_amount || 0);
   return {
     ...registration,
@@ -115,6 +116,9 @@ export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
     required_amount: amount > 0 ? amount : null,
     scheme_name: row?.draw_scheme_name || null,
     configured: amount > 0,
+    wait_days: row?.draw_wait_days || 10,
+    opening_date: row?.draw_opening_date || '',
+    terms: row?.draw_terms || DEFAULT_DRAW_TERMS,
   });
 });
 
@@ -129,19 +133,30 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
   const { required_amount, scheme_name } = req.body;
   const siteId = parseInt(req.body.site_id, 10);
   if (!siteId || siteId <= 0) return res.status(400).json({ message: 'A valid site_id is required' });
-  const amount = Number(required_amount);
+  const amount = money(required_amount, 'Required amount');
+  const previous = await getDrawSettings(siteId);
+  const wait_days = Number(req.body.wait_days ?? previous?.draw_wait_days ?? 10);
+  const opening_date = req.body.opening_date === undefined ? previous?.draw_opening_date : req.body.opening_date;
+  if (![10, 25].includes(wait_days)) throw workflowError('Choose a 10-day or 25-day draw period');
+  openingDate(opening_date, wait_days);
+  const terms = String(req.body.terms ?? previous?.draw_terms ?? DEFAULT_DRAW_TERMS).trim().replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n');
+  if ((terms.match(/\n/g) || []).length > 24) throw workflowError('Use at most 25 lines of terms so the form fits on two pages');
+  if (!terms || terms.length > 4500) throw workflowError('Terms must contain 1–4500 characters');
   // Upper bound keeps the value inside NUMERIC(15,2) instead of a raw pg overflow error.
   if (!amount || amount <= 0 || amount > 9_999_999_999_999) {
     return res.status(400).json({ message: 'required_amount (draw registration amount) must be greater than zero' });
   }
   const { rows: siteRows } = await pool.query('SELECT id FROM sites WHERE id = $1', [siteId]);
   if (!siteRows[0]) return res.status(404).json({ message: 'Site not found' });
-  const row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name) });
+  const row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms });
   res.json({
     site_id: Number(row.site_id),
     required_amount: Number(row.draw_required_amount),
     scheme_name: row.draw_scheme_name,
     configured: true,
+    wait_days: row.draw_wait_days,
+    opening_date: row.draw_opening_date || '',
+    terms: row.draw_terms,
   });
 });
 
@@ -160,7 +175,8 @@ export const createDraw = asyncHandler(async (req, res) => {
     referral_code, amount,
   } = req.body;
 
-  if (!site_id) return res.status(400).json({ message: 'site_id is required' });
+  if (!Number.isInteger(Number(site_id)) || Number(site_id) <= 0) throw workflowError('A valid site_id is required');
+  if (!client_member_id && !/^(?:91|0)?[6-9]\d{9}$/.test(String(phone || '').replace(/\D/g, ''))) throw workflowError('Enter a valid Indian mobile number');
   if (!client_member_id && !phone) {
     return res.status(400).json({ message: 'client_member_id or phone is required' });
   }
@@ -172,7 +188,7 @@ export const createDraw = asyncHandler(async (req, res) => {
   if (hasFirstPayment && !isAdminRole(req.user?.role)) {
     return res.status(403).json({ message: 'Only admins record draw payments — register the customer and an admin will manage the ledger' });
   }
-  const firstAmount = hasFirstPayment ? Number(amount) : 0;
+  const firstAmount = hasFirstPayment ? validatePayment(req.body) : 0;
   if (hasFirstPayment && (!firstAmount || firstAmount <= 0)) {
     return res.status(400).json({ message: 'Initial payment amount must be greater than zero' });
   }
@@ -182,6 +198,11 @@ export const createDraw = asyncHandler(async (req, res) => {
   if (!required || required <= 0) {
     return res.status(400).json({ message: 'The draw amount for this site has not been set — an Admin must configure it in Draw Settings first' });
   }
+
+  const scheduledDate = openingDate(setting.draw_opening_date, req.body.wait_days ?? setting.draw_wait_days);
+  if (!client_member_id && (!String(full_name || '').trim() || String(full_name).length > 255)) throw workflowError('Customer name is required (up to 255 characters)');
+  const requestKey = req.body.request_key || null;
+  if (requestKey && !/^[a-zA-Z0-9_-]{8,100}$/.test(requestKey)) throw workflowError('Invalid registration request key');
 
   // An explicit referral code wins the ownership attribution — resolved up front so
   // a bad code fails before anything is created.
@@ -204,6 +225,14 @@ export const createDraw = asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    if (requestKey) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`draw_request:${req.user.id}:${requestKey}`]);
+      const { rows } = await client.query('SELECT id FROM draw_registrations WHERE created_by = $1 AND request_key = $2', [req.user.id, requestKey]);
+      if (rows[0]) {
+        await client.query('COMMIT');
+        return res.json(await buildDetail(rows[0].id));
+      }
+    }
     let memberId = client_member_id;
     if (!memberId) {
       const member = await findOrCreateClientByPhone(
@@ -232,14 +261,9 @@ export const createDraw = asyncHandler(async (req, res) => {
       else if (!isAdminRole(req.user?.role)) ownership = { agent_user_id: req.user.id };
     }
 
-    // Register → KYC: the registration opens (or reuses) the customer's KYC case in
-    // the same transaction, exactly like the agent "New KYC" quick-add. The wizard
-    // then walks straight into document upload.
-    const visibleUserIds = await getVisibleUserIds(req.user);
-    const kycCase = await kycCaseModel.getOrCreateForMember(
-      { memberId, siteId: site_id, createdBy: req.user?.id, visibleUserIds },
-      client
-    );
+    // Fast intake only. Open KYC explicitly after the booking amount is collected.
+    const { rows: members } = await client.query('SELECT site_id FROM members WHERE id = $1', [memberId]);
+    if (!members[0] || Number(members[0].site_id) !== Number(site_id)) throw workflowError('Customer does not belong to the selected site');
 
     const created = await drawModel.create({
       site_id,
@@ -249,7 +273,9 @@ export const createDraw = asyncHandler(async (req, res) => {
       required_amount: required,
       status: 'REGISTERED',
       qr_token: crypto.randomBytes(16).toString('hex'),
-      kyc_case_id: kycCase.id,
+      workflow_version: 1,
+      draw_opening_date: scheduledDate,
+      request_key: requestKey,
       notes: clean(notes) || null,
       created_by: req.user?.id || null,
     }, client);
@@ -257,7 +283,7 @@ export const createDraw = asyncHandler(async (req, res) => {
 
     const registration_no = await drawModel.generateRegistrationNo(created.id, created.created_at, client);
     await drawModel.logEvent(created.id, 'REGISTERED', { registration_no, required_amount: required }, req.user?.id, client);
-    await drawModel.logEvent(created.id, 'KYC_OPENED', { kyc_case_id: kycCase.id, kyc_status: kycCase.status }, req.user?.id, client);
+
 
     if (hasFirstPayment) {
       const data = { draw_registration_id: created.id, amount: firstAmount, created_by: req.user?.id || null };
@@ -325,7 +351,9 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
     return res.status(403).json({ message: 'Only admins record draw payments — agents register customers and complete their KYC' });
   }
-  const paymentAmount = Number(req.body.amount);
+  const paymentAmount = validatePayment(req.body);
+  const requestKey = req.body.request_key || null;
+  if (requestKey && !/^[a-zA-Z0-9_-]{8,100}$/.test(requestKey)) throw workflowError('Invalid payment request key');
   if (!paymentAmount || paymentAmount <= 0) {
     return res.status(400).json({ message: 'amount must be greater than zero' });
   }
@@ -342,6 +370,14 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
+    if (requestKey) {
+      const { rows: prior } = await client.query('SELECT id, amount, payment_from FROM draw_payments WHERE draw_registration_id = $1 AND request_key = $2', [registration.id, requestKey]);
+      if (prior[0]) {
+        if (Number(prior[0].amount) !== paymentAmount || prior[0].payment_from !== (req.body.payment_from || 'CASH')) throw workflowError('This payment request was already saved with different details. Refresh the ledger before entering a new payment.', 409);
+        await client.query('COMMIT');
+        return res.json(await buildDetail(registration.id));
+      }
+    }
     if (registration.status === 'CANCELLED') {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'This draw registration is cancelled — payments are closed' });
@@ -351,7 +387,7 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
       return res.status(400).json({ message: 'Shop already allotted — further payments belong on the booking, not the draw ledger' });
     }
 
-    const data = { draw_registration_id: registration.id, amount: paymentAmount, created_by: req.user?.id || null };
+    const data = { draw_registration_id: registration.id, request_key: requestKey, amount: paymentAmount, created_by: req.user?.id || null };
     for (const f of DRAW_PAYMENT_FIELDS) {
       if (req.body[f] === undefined) continue;
       const v = clean(req.body[f]);
@@ -397,6 +433,7 @@ export const deleteDrawPayment = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
+    if (['ALLOTTED', 'CANCELLED'].includes(registration.status)) throw workflowError('This ledger is closed. Correct an allotted payment in Accounting.', 409);
     const { rows: deleted } = await client.query(
       'DELETE FROM draw_payments WHERE id = $1 AND draw_registration_id = $2 RETURNING id, amount',
       [req.params.paymentId, registration.id]
@@ -436,7 +473,7 @@ export const deleteDrawPayment = asyncHandler(async (req, res) => {
  * POST /draws/:id/issue-slip — generate the Official Draw Entry Slip (lottery coupon).
  * ADMIN ONLY: the slip certifies the money side (ledger covers required_amount) and
  * the KYC side (customer VERIFIED) — both re-verified inside the lock, never trusted
- * from the client. Flow: Register → KYC → payments → slip.
+ * from the client. Flow: Register → payment → KYC → documents → draw → allotment.
  */
 export const issueSlip = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
@@ -467,10 +504,10 @@ export const issueSlip = asyncHandler(async (req, res) => {
     // same way the model does — the linked case, falling back to the member's newest.
     const { rows: kycRows } = await client.query(
       `SELECT kc.status FROM kyc_cases kc
-        WHERE kc.id = $1::int OR kc.client_member_id = $2
+        WHERE (kc.id = $1::int OR ($4::int = 0 AND kc.client_member_id = $2)) AND kc.site_id = $3
         ORDER BY (kc.id = $1::int) DESC NULLS LAST, kc.id DESC
-        LIMIT 1`,
-      [registration.kyc_case_id, registration.client_member_id]
+        LIMIT 1 FOR SHARE`,
+      [registration.kyc_case_id, registration.client_member_id, registration.site_id, registration.workflow_version || 0]
     );
     if (kycRows[0]?.status !== 'VERIFIED') {
       await client.query('ROLLBACK');
@@ -489,13 +526,17 @@ export const issueSlip = asyncHandler(async (req, res) => {
       });
     }
 
+    if (!registration.draw_opening_date) throw workflowError('Set the draw opening date before issuing documents');
+    const { rows: settings } = await client.query('SELECT draw_terms FROM project_settings WHERE site_id = $1', [registration.site_id]);
+    const terms = settings[0]?.draw_terms || DEFAULT_DRAW_TERMS;
+
     const slipNo = `SLIP-${new Date(registration.created_at).getFullYear()}-${String(registration.id).padStart(6, '0')}`;
     await client.query(
       `UPDATE draw_registrations
           SET slip_no = $1, slip_issued_at = now(), slip_issued_by = $2,
-              status = 'SLIP_ISSUED', updated_at = now()
+              status = 'SLIP_ISSUED', terms_snapshot = $4, updated_at = now()
         WHERE id = $3`,
-      [slipNo, req.user?.id || null, registration.id]
+      [slipNo, req.user?.id || null, registration.id, terms]
     );
     await drawModel.logEvent(registration.id, 'SLIP_ISSUED', { slip_no: slipNo, total_paid: total }, req.user?.id, client);
     await client.query('COMMIT');
@@ -516,39 +557,29 @@ export const markWinner = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Only Admin / Super Admin can mark draw winners' });
   }
   const winner = req.body.winner !== false;
-  const registration = await drawModel.findById(req.params.id, pool);
-  if (!registration) return res.status(404).json({ message: 'Draw registration not found' });
-
-  // Status preconditions are re-checked INSIDE the UPDATE so a concurrent
-  // allot/cancel can never be overwritten by a stale read (check-then-act race).
-  if (winner) {
-    const { rows: updated } = await pool.query(
-      `UPDATE draw_registrations
-          SET is_winner = TRUE, winner_marked_at = now(), winner_marked_by = $1,
-              status = 'WINNER', updated_at = now()
-        WHERE id = $2 AND status = 'SLIP_ISSUED'
-        RETURNING id`,
-      [req.user.id, registration.id]
-    );
-    if (!updated[0]) {
-      return res.status(400).json({ message: `Only entries with an issued slip can win (current status: ${registration.status})` });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM draw_registrations WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const registration = rows[0];
+    if (!registration) throw workflowError('Draw registration not found', 404);
+    if (winner) {
+      await client.query('SELECT id FROM kyc_cases WHERE client_member_id = $1 AND site_id = $2 FOR SHARE', [registration.client_member_id, registration.site_id]);
+      const kyc = await drawModel.getDetail(registration.id, client);
+      const total = await drawModel.getTotalPaid(registration.id, client);
+      validateWinner(registration, { total, kycStatus: kyc.kyc_status, slipNumber: req.body.slip_no });
+      await client.query(`UPDATE draw_registrations SET is_winner = TRUE, winner_marked_at = now(), winner_marked_by = $1, status = 'WINNER', updated_at = now() WHERE id = $2`, [req.user.id, registration.id]);
+      await drawModel.logEvent(registration.id, 'WINNER_MARKED', { slip_no: registration.slip_no, method: 'PHYSICAL_BUCKET' }, req.user.id, client);
+    } else {
+      if (registration.status !== 'WINNER') throw workflowError('Only a winner awaiting allotment can be unmarked', 409);
+      await client.query(`UPDATE draw_registrations SET is_winner = FALSE, winner_marked_at = NULL, winner_marked_by = NULL, status = 'SLIP_ISSUED', updated_at = now() WHERE id = $1`, [registration.id]);
+      await drawModel.logEvent(registration.id, 'WINNER_UNMARKED', { slip_no: registration.slip_no }, req.user.id, client);
     }
-    await drawModel.logEvent(registration.id, 'WINNER_MARKED', { slip_no: registration.slip_no }, req.user.id, pool).catch(() => {});
-  } else {
-    const { rows: updated } = await pool.query(
-      `UPDATE draw_registrations
-          SET is_winner = FALSE, winner_marked_at = NULL, winner_marked_by = NULL,
-              status = CASE WHEN status = 'WINNER' THEN 'SLIP_ISSUED' ELSE status END,
-              updated_at = now()
-        WHERE id = $1 AND status <> 'ALLOTTED'
-        RETURNING id`,
-      [registration.id]
-    );
-    if (!updated[0]) {
-      return res.status(400).json({ message: 'Cannot unmark a winner after the shop has been allotted' });
-    }
-    await drawModel.logEvent(registration.id, 'WINNER_UNMARKED', { slip_no: registration.slip_no }, req.user.id, pool).catch(() => {});
-  }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally { client.release(); }
 
   const detail = await buildDetail(req.params.id, pool);
   res.json(detail);
@@ -619,7 +650,10 @@ export const allotShop = asyncHandler(async (req, res) => {
   const plotId = parseInt(req.body.plot_id);
   if (!plotId) return res.status(400).json({ message: 'plot_id is required' });
 
+  const paymentPlan = req.body.payment_plan || 'FULL';
+  if (!['FULL', 'INSTALLMENT'].includes(paymentPlan)) throw workflowError('Select FULL or INSTALLMENT payment plan');
   let bookingForSync = null;
+  let ledger_sync;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -636,6 +670,12 @@ export const allotShop = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: `Only verified winners can be allotted a shop (current status: ${registration.status})` });
     }
+
+    await client.query('SELECT id FROM kyc_cases WHERE client_member_id = $1 AND site_id = $2 FOR UPDATE', [registration.client_member_id, registration.site_id]);
+    const liveKyc = await drawModel.getDetail(registration.id, client);
+    if (liveKyc.kyc_status !== 'VERIFIED') throw workflowError('KYC must be verified before allotment', 409);
+    // Already-selected legacy winners predate scheduling; do not strand their allotment.
+    if ((registration.workflow_version > 0 && !registration.draw_opening_date) || registration.draw_opening_date > todayIST()) throw workflowError('The draw is not open yet', 409);
 
     // Belt-and-braces: the ledger must still cover the registration amount at the
     // moment of allotment (an admin may have corrected payments since the slip).
@@ -663,7 +703,7 @@ export const allotShop = asyncHandler(async (req, res) => {
     // Same commitment guard as plotBookingSync (PROTECTED_STATUSES + BOOKED) —
     // never clobber a unit already committed to someone.
     const committed = new Set(['BOOKED', 'SOLD', 'REGISTRY', 'UNDER CANCELLATION', 'CANCELLED', 'TRANSFERRED']);
-    if (committed.has(String(plot.status || '').toUpperCase()) && plot.buyer_name) {
+    if (committed.has(String(plot.status || '').toUpperCase())) {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: `Shop ${[plot.block, plot.plot_no].filter(Boolean).join(' ')} is already ${plot.status} to ${plot.buyer_name}` });
     }
@@ -699,10 +739,10 @@ export const allotShop = asyncHandler(async (req, res) => {
       client_member_id: registration.client_member_id,
       agent_user_id: registration.agent_user_id || null,
       team_id: teamId,
-      sale_price: Number(plot.sale_price) || 0,
+      sale_price: money(req.body.sale_price ?? plot.sale_price, 'Unit sale price'),
       token_amount: 0, // draw payments live in the separate Draw Payment Ledger
-      payment_plan: 'FULL',
-      booking_date: new Date().toISOString().slice(0, 10),
+      payment_plan: paymentPlan,
+      booking_date: todayIST(),
       status: 'CONFIRMED',
       kyc_status: 'NOT_STARTED',
       booked_by: req.user?.email || null,
@@ -715,7 +755,7 @@ export const allotShop = asyncHandler(async (req, res) => {
     await client.query(
       `UPDATE draw_registrations
           SET allotted_plot_id = $1, allotted_at = now(), allotted_by = $2,
-              booking_id = $3, status = 'ALLOTTED', updated_at = now()
+              booking_id = $3, kyc_case_id = (SELECT id FROM kyc_cases WHERE booking_id = $3 ORDER BY id DESC LIMIT 1), status = 'ALLOTTED', updated_at = now()
         WHERE id = $4`,
       [plot.id, req.user.id, booking.id, registration.id]
     );
@@ -724,6 +764,9 @@ export const allotShop = asyncHandler(async (req, res) => {
       { plot_id: plot.id, plot_no: plot.plot_no, block: plot.block, booking_id: booking.id, booking_no },
       req.user.id, client
     );
+    await client.query(`UPDATE plots SET status = 'BOOKED', buyer_name = (SELECT full_name FROM members WHERE id = $1), booking_date = $2, sale_price = $3 WHERE id = $4`, [registration.client_member_id, booking.booking_date, booking.sale_price, plot.id]);
+    ledger_sync = await syncDrawLedgerToPlot(registration.id, client);
+    if (!ledger_sync.ok) throw workflowError('Payment transfer failed; allotment was rolled back. Retry after resolving the ledger issue.', 409);
     await client.query('COMMIT');
     bookingForSync = { ...booking, booking_no };
   } catch (err) {
@@ -733,12 +776,10 @@ export const allotShop = asyncHandler(async (req, res) => {
     client.release();
   }
 
-  // Propagate to the accounting plots ledger (BOOKED + buyer + commission) after
-  // commit — fire-and-forget, a sync failure never voids the allotment itself.
+  // The unit and receipt ledger are already committed atomically. Complete existing
+  // agent attribution/commission enrichment after commit; report its result to the UI.
   const plot_sync = await syncPlotBookingToAccounting(bookingForSync, pool);
-  // Mirror every Draw Payment Ledger receipt into the shared plot_payments so the
-  // booking's payments page shows the money received (pending, Accounting approves).
-  const ledger_sync = await syncDrawLedgerToPlot(req.params.id, pool);
+
 
   const detail = await buildDetail(req.params.id, pool);
   res.json({ ...detail, plot_sync, ledger_sync });
@@ -753,13 +794,14 @@ export const updateDraw = asyncHandler(async (req, res) => {
   if (!isDeciderRole(req.user?.role)) {
     return res.status(403).json({ message: 'Only Admin / Super Admin decide the draw amount' });
   }
-  const { required_amount, scheme_name, notes } = req.body;
+  const { required_amount, scheme_name, notes, draw_opening_date } = req.body;
   const hasAmount = required_amount !== undefined && required_amount !== null && required_amount !== '';
-  const amount = hasAmount ? Number(required_amount) : null;
+  const amount = hasAmount ? money(required_amount, 'Required amount') : null;
+  if (draw_opening_date !== undefined && (!validDate(draw_opening_date) || draw_opening_date < todayIST())) throw workflowError('Select a current or future opening date');
   if (hasAmount && (!amount || amount <= 0)) {
     return res.status(400).json({ message: 'required_amount (draw registration amount) must be greater than zero' });
   }
-  if (!hasAmount && scheme_name === undefined && notes === undefined) {
+  if (!hasAmount && scheme_name === undefined && notes === undefined && draw_opening_date === undefined) {
     return res.status(400).json({ message: 'Nothing to update' });
   }
 
@@ -780,8 +822,11 @@ export const updateDraw = asyncHandler(async (req, res) => {
       return res.status(400).json({ message: `The draw amount is locked once the slip is issued (current status: ${registration.status})` });
     }
 
+    if (draw_opening_date !== undefined && ['WINNER', 'ALLOTTED', 'CANCELLED'].includes(registration.status)) throw workflowError('Opening date is locked after selection or cancellation', 409);
+    if (draw_opening_date !== undefined && draw_opening_date !== registration.draw_opening_date) await drawModel.logEvent(registration.id, 'DRAW_SCHEDULED', { from: registration.draw_opening_date, to: draw_opening_date }, req.user.id, client);
     const sets = [];
     const params = [];
+    if (draw_opening_date !== undefined) { params.push(draw_opening_date); sets.push(`draw_opening_date = $${params.length}`); }
     if (hasAmount) { params.push(amount); sets.push(`required_amount = $${params.length}`); }
     if (scheme_name !== undefined) { params.push(clean(scheme_name)); sets.push(`scheme_name = $${params.length}`); }
     if (notes !== undefined) { params.push(clean(notes)); sets.push(`notes = $${params.length}`); }
@@ -845,7 +890,7 @@ export const deleteDraw = asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: regRows } = await client.query(
-      'SELECT id, status FROM draw_registrations WHERE id = $1 FOR UPDATE',
+      'SELECT id, status, slip_no FROM draw_registrations WHERE id = $1 FOR UPDATE',
       [req.params.id]
     );
     const registration = regRows[0];
@@ -853,6 +898,7 @@ export const deleteDraw = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
+    if (registration.slip_no || await drawModel.getTotalPaid(registration.id, client) > 0) throw workflowError('Paid or issued registrations must be retained. Cancel instead of deleting.', 409);
     if (!['REGISTERED', 'ELIGIBLE', 'CANCELLED'].includes(registration.status)) {
       await client.query('ROLLBACK');
       return res.status(409).json({
@@ -908,6 +954,7 @@ export const publicVerifyDraw = asyncHandler(async (req, res) => {
     total_paid: d.total_paid,
     is_eligible: d.is_eligible,
     slip_issued_at: d.slip_issued_at,
+    draw_opening_date: d.draw_opening_date,
     allotment: d.status === 'ALLOTTED' ? {
       plot_no: d.allotted_plot_no,
       block: d.allotted_plot_block,
@@ -919,4 +966,41 @@ export const publicVerifyDraw = asyncHandler(async (req, res) => {
     } : null,
     timeline,
   });
+});
+
+/** A paginated front-desk queue, with the same network visibility as draw details. */
+export const listWorkflow = asyncHandler(async (req, res) => {
+  const siteId = Number(req.query.site_id);
+  if (!Number.isInteger(siteId) || siteId <= 0) throw workflowError('Select a site');
+  const stage = req.query.stage || null;
+  if (stage && !['PAYMENT', 'KYC', 'DOCUMENTS', 'DRAW', 'ALLOTMENT', 'BOOKED', 'CANCELLED'].includes(stage)) throw workflowError('Invalid workflow stage');
+  const page = Math.max(1, Math.min(100000, parseInt(req.query.page, 10) || 1));
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  res.json(await drawModel.workflow({ siteId, stage, page, q: String(req.query.q || ''), visibleUserIds }, pool));
+});
+
+/** Money first. KYC creation is explicit, scoped and idempotent under the row lock. */
+export const startDrawKyc = asyncHandler(async (req, res) => {
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM draw_registrations WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const registration = rows[0];
+    if (!registration) throw workflowError('Registration not found', 404);
+    if (visibleUserIds && !visibleUserIds.includes(registration.agent_user_id) && !visibleUserIds.includes(registration.created_by)) throw workflowError('This registration belongs to another network', 403);
+    if (registration.status === 'CANCELLED') throw workflowError('Registration is cancelled', 409);
+    const total = await drawModel.getTotalPaid(registration.id, client);
+    if (Number(registration.required_amount) <= 0 || total < Number(registration.required_amount)) throw workflowError('Collect the full booking amount before starting KYC', 409);
+    if (!registration.kyc_case_id) {
+      const kycCase = await kycCaseModel.getOrCreateForMember({ memberId: registration.client_member_id, siteId: registration.site_id, createdBy: req.user.id, visibleUserIds }, client);
+      await client.query('UPDATE draw_registrations SET kyc_case_id = $1, updated_at = now() WHERE id = $2', [kycCase.id, registration.id]);
+      await drawModel.logEvent(registration.id, 'KYC_OPENED', { kyc_case_id: kycCase.id }, req.user.id, client);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally { client.release(); }
+  res.json(await buildDetail(req.params.id));
 });

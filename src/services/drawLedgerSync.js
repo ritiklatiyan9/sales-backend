@@ -11,13 +11,27 @@ import { derivePaymentType, up } from './tokenPaymentSync.js';
  * existing cashflow/daybook triggers + approval flow work unchanged.
  *
  * Design (mirrors tokenPaymentSync):
- *   - Fully defensive: failures are logged + swallowed, an allotment is never voided.
+ *   - Returns an explicit result; the allotment caller rolls back if transfer fails.
  *   - Idempotent via draw_payments.plot_payment_id — re-running skips receipts whose
  *     mirrored row still exists; a dangling link (row deleted in Accounting) re-inserts.
  *   - Never touches mirrored rows after insert — Accounting owns them from there.
  */
 export const syncDrawLedgerToPlot = async (registrationId, db = pool) => {
+  if (db === pool) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await syncDrawLedgerToPlot(registrationId, client);
+      await client.query(result.ok ? 'COMMIT' : 'ROLLBACK');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally { client.release(); }
+  }
   try {
+    // All callers lock the registration, including retry/backfill jobs.
+    await db.query('SELECT id FROM draw_registrations WHERE id = $1 FOR UPDATE', [registrationId]);
     const { rows: regRows } = await db.query(
       `SELECT r.id, r.registration_no, r.status, r.allotted_plot_id, r.client_member_id,
               p.site_id AS plot_site_id, p.booking_by,

@@ -1,7 +1,7 @@
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
-  createDraw, listDraws, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
+  listWorkflow, startDrawKyc, createDraw, listDraws, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
   issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
   getDrawSettingsHandler, setDrawSettings,
 } from '../controllers/draw.controller.js';
@@ -13,6 +13,8 @@ router.get('/', listDraws);
 router.post('/', createDraw);
 // NB: fixed paths must be registered before '/:id' so they aren't parsed as ids.
 router.post('/scan', scanDraw);
+router.get('/workflow', listWorkflow);
+router.post('/:id/start-kyc', startDrawKyc);
 router.get('/settings', getDrawSettingsHandler);
 router.put('/settings', setDrawSettings);
 router.get('/:id', getDraw);

@@ -1,3 +1,4 @@
+import { WORKFLOW_STAGE_SQL } from '../services/drawWorkflow.js';
 import MasterModel from './MasterModel.js';
 
 class DrawModel extends MasterModel {
@@ -7,7 +8,8 @@ class DrawModel extends MasterModel {
 
   /**
    * The customer's KYC case for a registration: the linked r.kyc_case_id when it
-   * still exists, else the member's newest case. The fallback matters because
+   * still exists; legacy rows fall back to the member's newest case. New intake
+   * requires an explicitly opened KYC after payment. The legacy fallback matters because
    * adoptForBooking deletes duplicate cases (FK sets our link NULL) and because
    * registrations created before migration 013 never had a link.
    * NB: kyc.id/kyc.status are selected AFTER r.* so the resolved values win.
@@ -15,7 +17,7 @@ class DrawModel extends MasterModel {
   get kycCaseLateral() {
     return `
       SELECT kc.id, kc.status FROM kyc_cases kc
-      WHERE kc.id = r.kyc_case_id OR kc.client_member_id = r.client_member_id
+      WHERE (kc.id = r.kyc_case_id OR (r.workflow_version = 0 AND kc.client_member_id = r.client_member_id)) AND kc.site_id = r.site_id
       ORDER BY (kc.id = r.kyc_case_id) DESC NULLS LAST, kc.id DESC
       LIMIT 1
     `;
@@ -62,6 +64,42 @@ class DrawModel extends MasterModel {
       LIMIT 500
     `, params);
     return rows;
+  }
+
+  /** Bounded workflow queue: scoped counts and one page, never all customer dossiers. */
+  async workflow({ siteId, q = '', stage, page = 1, visibleUserIds }, db) {
+    const params = [siteId];
+    const where = ['r.site_id = $1'];
+    if (Array.isArray(visibleUserIds)) {
+      params.push(visibleUserIds);
+      where.push(`(r.agent_user_id = ANY($${params.length}) OR r.created_by = ANY($${params.length}))`);
+    }
+    if (q) {
+      params.push(`%${q.slice(0, 100)}%`);
+      where.push(`(m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR r.registration_no ILIKE $${params.length} OR r.slip_no ILIKE $${params.length})`);
+    }
+    const cte = `WITH queue AS (
+      SELECT r.id, r.registration_no, r.slip_no, r.status, r.required_amount,
+        r.draw_opening_date, r.booking_id, r.created_at,
+        m.full_name AS client_name, m.phone AS client_phone,
+        kyc.status AS kyc_status, COALESCE(pay.total_paid, 0)::float AS total_paid,
+        ${WORKFLOW_STAGE_SQL} AS stage
+      FROM draw_registrations r
+      JOIN members m ON m.id = r.client_member_id
+      LEFT JOIN LATERAL (${this.kycCaseLateral}) kyc ON true
+      LEFT JOIN LATERAL (SELECT SUM(amount) AS total_paid FROM draw_payments WHERE draw_registration_id = r.id) pay ON true
+      WHERE ${where.join(' AND ')}
+    )`;
+    const values = [...params, stage || null, 25, (page - 1) * 25];
+    const n = params.length;
+    const { rows } = await db.query(`${cte}
+      SELECT (SELECT COALESCE(json_agg(items), '[]'::json) FROM (
+        SELECT * FROM queue WHERE ($${n + 1}::text IS NULL OR stage = $${n + 1})
+        ORDER BY created_at DESC, id DESC LIMIT $${n + 2} OFFSET $${n + 3}
+      ) items) AS items,
+      (SELECT count(*)::int FROM queue WHERE ($${n + 1}::text IS NULL OR stage = $${n + 1})) AS total,
+      (SELECT COALESCE(json_object_agg(stage, count), '{}'::json) FROM (SELECT stage, count(*)::int FROM queue GROUP BY stage) counts) AS counts`, values);
+    return { ...rows[0], page, page_size: 25 };
   }
 
   /** Full detail: registration + client + site + agent + allotted plot + booking labels. */
