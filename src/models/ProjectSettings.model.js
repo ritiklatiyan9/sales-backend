@@ -38,14 +38,19 @@ const FIELDS = [
   'company_legal_name', 'company_brand_name', 'company_address', 'company_city',
   'company_phone', 'company_email', 'company_gstin', 'company_website', 'payable_to',
   'logo_url', 'bank_name', 'bank_account_no', 'bank_ifsc', 'bank_branch',
-  'payment_terms', 'milestones',
+  'payment_terms', 'milestones', 'document_config',
 ];
 
 let ensured = false;
+let ensuring;
 async function ensure() {
   if (ensured) return;
-  await pool.query(ENSURE_SQL);
-  ensured = true;
+  if (!ensuring) ensuring = (async () => {
+    await pool.query(ENSURE_SQL);
+    await pool.query("ALTER TABLE project_settings ADD COLUMN IF NOT EXISTS document_config JSONB NOT NULL DEFAULT '{}'::jsonb");
+    ensured = true;
+  })().finally(() => { ensuring = null; });
+  await ensuring;
 }
 
 export async function ensureTable() {
@@ -60,8 +65,8 @@ export async function getBySite(siteId) {
 
 /**
  * Draw Settings — the per-site draw money DECIDED BY Admin/Super Admin. Deliberately
- * NOT in FIELDS: the general PUT /project-settings endpoint is not role-gated, so the
- * draw amount is only writable through the decider-gated PUT /draws/settings.
+ * NOT in FIELDS: draw rules are owned by the dedicated PUT /draws/settings endpoint. General
+ * company/document updates cannot accidentally replace the draw amount.
  * Lazy ALTER keeps the same works-before-migration behaviour as the table itself.
  */
 let drawEnsured = false;
@@ -71,7 +76,24 @@ async function ensureDraw() {
   await pool.query(`
     ALTER TABLE project_settings
       ADD COLUMN IF NOT EXISTS draw_required_amount NUMERIC(15,2),
-      ADD COLUMN IF NOT EXISTS draw_scheme_name VARCHAR(150)
+      ADD COLUMN IF NOT EXISTS draw_scheme_name VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS draw_wait_days INTEGER NOT NULL DEFAULT 10,
+      ADD COLUMN IF NOT EXISTS draw_opening_date DATE,
+      ADD COLUMN IF NOT EXISTS draw_terms TEXT
+  `);
+  // Migration 021 adds these columns and indexes explicitly. Keep the read/write
+  // endpoint self-healing for installations that have the older migrations but have
+  // not run 021 yet; all statements are additive and safe to repeat.
+  await pool.query(`
+    ALTER TABLE draw_registrations
+      ADD COLUMN IF NOT EXISTS workflow_version INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS draw_opening_date DATE,
+      ADD COLUMN IF NOT EXISTS terms_snapshot TEXT,
+      ADD COLUMN IF NOT EXISTS request_key VARCHAR(100)
+  `);
+  await pool.query(`
+    ALTER TABLE draw_payments
+      ADD COLUMN IF NOT EXISTS request_key VARCHAR(100)
   `);
   drawEnsured = true;
 }
@@ -85,9 +107,9 @@ export async function getDrawSettings(siteId) {
   return rows[0] || null;
 }
 
-export async function upsertDrawSettings(siteId, { required_amount, scheme_name, wait_days, opening_date, terms }) {
+export async function upsertDrawSettings(siteId, { required_amount, scheme_name, wait_days, opening_date, terms }, db = pool) {
   await ensureDraw();
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `INSERT INTO project_settings (site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (site_id) DO UPDATE
@@ -110,7 +132,8 @@ export async function upsertBySite(siteId, data) {
   for (const f of FIELDS) {
     if (data[f] === undefined) continue;
     cols.push(f);
-    if (f === 'milestones') vals.push(JSON.stringify(Array.isArray(data[f]) ? data[f] : []));
+    if (f === 'document_config') vals.push(JSON.stringify(data[f]));
+    else if (f === 'milestones') vals.push(JSON.stringify(Array.isArray(data[f]) ? data[f] : []));
     else vals.push(data[f] === '' ? null : data[f]);
   }
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');

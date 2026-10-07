@@ -34,7 +34,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
   let id;
   try {
     await t.test(
-      'settings and quick intake create a member but defer KYC',
+      'settings and quick intake create a member with linked pending KYC',
       async () => {
         assert.equal(
           (
@@ -53,7 +53,8 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         const created = await call(controller.createDraw, { body });
         assert.equal(created.status, 201, JSON.stringify(created.data));
         id = created.data.id;
-        assert.equal(created.data.kyc_case_id, null);
+        assert.ok(created.data.kyc_case_id);
+        assert.equal(created.data.kyc_status, 'OPEN');
         assert.equal(created.data.status, 'REGISTERED');
         assert.ok(created.data.draw_opening_date > todayIST());
         assert.equal((await call(controller.createDraw, { body })).data.id, id);
@@ -68,7 +69,34 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
       },
     );
     await t.test(
-      'payment precedes KYC and retry does not double-charge',
+      'manual site date stays optional for existing draws and can reschedule pending draws explicitly',
+      async () => {
+        const original = (await call(controller.getDraw, { params: { id } })).data.draw_opening_date;
+        const date = new Date(`${todayIST()}T00:00:00Z`);
+        date.setUTCDate(date.getUTCDate() + 35);
+        const manualDate = date.toISOString().slice(0, 10);
+        const body = { site_id: 1, required_amount: 5000, wait_days: 10, opening_date: manualDate };
+        const saved = await call(controller.setDrawSettings, { body });
+        assert.equal(saved.status, 200, JSON.stringify(saved.data));
+        assert.equal(saved.data.opening_date, manualDate);
+        assert.equal(saved.data.updated_registrations, 0);
+        assert.equal((await call(controller.getDraw, { params: { id } })).data.draw_opening_date, original);
+
+        const rescheduled = await call(controller.setDrawSettings, { body: { ...body, apply_to_existing: true } });
+        assert.equal(rescheduled.status, 200, JSON.stringify(rescheduled.data));
+        assert.equal(rescheduled.data.updated_registrations, 1);
+        const draw = (await call(controller.getDraw, { params: { id } })).data;
+        assert.equal(draw.draw_opening_date, manualDate);
+        assert.equal(draw.events.filter((event) => event.event_type === 'DRAW_SCHEDULED').length, 1);
+        assert.equal((await call(controller.setDrawSettings, { body: { ...body, apply_to_existing: true } })).data.updated_registrations, 0);
+
+        await fixture.query('UPDATE draw_registrations SET draw_opening_date = NULL WHERE id = $1', [id]);
+        assert.equal((await call(controller.setDrawSettings, { body: { ...body, apply_to_existing: true } })).data.updated_registrations, 1);
+        assert.equal((await call(controller.getDraw, { params: { id } })).data.draw_opening_date, manualDate);
+      },
+    );
+    await t.test(
+      'payment retry does not double-charge and keeps the linked KYC',
       async () => {
         assert.equal(
           (await call(controller.startDrawKyc, { params: { id } })).status,
@@ -112,14 +140,6 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
           403,
         );
         assert.equal(
-          (await call(controller.startDrawKyc, { params: { id } })).status,
-          200,
-        );
-        assert.equal(
-          (await call(controller.startDrawKyc, { params: { id } })).status,
-          200,
-        );
-        assert.equal(
           (await fixture.query('SELECT count(*)::int AS n FROM kyc_cases'))
             .rows[0].n,
           1,
@@ -127,16 +147,12 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
       },
     );
     await t.test(
-      'documents require verified KYC and preserve issued terms',
+      'documents can be issued without KYC and preserve issued terms',
       async () => {
-        assert.equal(
-          (await call(controller.issueSlip, { params: { id } })).status,
-          400,
-        );
-        await fixture.query("UPDATE kyc_cases SET status = 'VERIFIED'");
         const issued = await call(controller.issueSlip, { params: { id } });
         assert.equal(issued.status, 200, JSON.stringify(issued.data));
         assert.ok(issued.data.slip_no);
+        assert.ok(issued.data.kyc_case_id);
         const terms = issued.data.terms_snapshot;
         await call(controller.setDrawSettings, {
           body: {
@@ -154,6 +170,20 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
           (await call(controller.issueSlip, { params: { id } })).status,
           409,
         );
+        assert.equal(
+          (await call(controller.startDrawKyc, { params: { id } })).status,
+          200,
+        );
+        assert.equal(
+          (await call(controller.startDrawKyc, { params: { id } })).status,
+          200,
+        );
+        assert.equal(
+          (await fixture.query('SELECT count(*)::int AS n FROM kyc_cases'))
+            .rows[0].n,
+          1,
+        );
+        await fixture.query("UPDATE kyc_cases SET status = 'VERIFIED'");
       },
     );
     await t.test(
@@ -210,12 +240,21 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
     await t.test(
       'allotment rolls back if the accounting receipt cannot be inserted',
       async () => {
+        const bookingDate = todayIST();
+        const dueDate = new Date(`${bookingDate}T00:00:00Z`);
+        dueDate.setUTCFullYear(dueDate.getUTCFullYear() + 1);
+        const schedule = [
+          { installment_name: 'Installment 1 · Booking', amount: 250000, due_date: bookingDate },
+          { installment_name: 'Installment 2', amount: 750000, due_date: dueDate.toISOString().slice(0, 10) },
+        ];
+        const missing = await call(controller.allotShop, { params: { id }, body: { plot_id: 1, payment_plan: 'INSTALLMENT' } });
+        assert.equal(missing.status, 400);
         await fixture.query(
           'ALTER TABLE plot_payments ADD CONSTRAINT fail_test CHECK (amount < 1000)',
         );
         const failed = await call(controller.allotShop, {
           params: { id },
-          body: { plot_id: 1, payment_plan: 'INSTALLMENT' },
+          body: { plot_id: 1, payment_plan: 'INSTALLMENT', installments: schedule },
         });
         assert.equal(failed.status, 409, JSON.stringify(failed));
         assert.equal(
@@ -228,6 +267,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
             .status,
           'AVAILABLE',
         );
+        assert.equal((await fixture.query('SELECT count(*)::int AS n FROM plot_installments')).rows[0].n, 0);
         assert.equal(
           (
             await fixture.query(
@@ -245,12 +285,20 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
     await t.test(
       'allotment creates installment booking with KYC and one mirrored receipt',
       async () => {
+        const bookingDate = todayIST();
+        const dueDate = new Date(`${bookingDate}T00:00:00Z`);
+        dueDate.setUTCFullYear(dueDate.getUTCFullYear() + 1);
         const allotted = await call(controller.allotShop, {
           params: { id },
           body: {
             plot_id: 1,
             sale_price: 1050000,
             payment_plan: 'INSTALLMENT',
+            installments: [
+              { installment_name: 'Installment 1 · Booking', amount: 262500, due_date: bookingDate },
+              { installment_name: 'Installment 2', amount: 787500, due_date: dueDate.toISOString().slice(0, 10) },
+            ],
+            installment_settings: { interest_enabled: true, interest_rate: 12, interest_type: 'per_year', grace_period_days: 15 },
           },
         });
         assert.equal(allotted.status, 200, JSON.stringify(allotted));
@@ -259,6 +307,14 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         const booking = (await fixture.query('SELECT * FROM bookings')).rows[0];
         assert.equal(booking.payment_plan, 'INSTALLMENT');
         assert.equal(Number(booking.sale_price), 1050000);
+        assert.equal(Number(booking.first_installment_amount), 262500);
+        const plot = (await fixture.query('SELECT * FROM plots WHERE id = 1')).rows[0];
+        assert.equal(plot.installments_enabled, true);
+        assert.equal(Number(plot.first_installment), 262500);
+        assert.equal(Number(plot.interest_rate), 12);
+        const installments = (await fixture.query('SELECT * FROM plot_installments WHERE plot_id = 1 ORDER BY sort_order')).rows;
+        assert.equal(installments.length, 2);
+        assert.deepEqual(installments.map((row) => Number(row.amount)), [262500, 787500]);
         const mirror = await syncDrawLedgerToPlot(id, fixture.pool);
         assert.equal(mirror.ok, true);
         assert.equal(mirror.created, 0);
@@ -274,7 +330,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
               body: { plot_id: 1 },
             })
           ).status,
-          400,
+          409,
         );
         assert.equal(
           (
@@ -341,8 +397,8 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         });
         assert.equal(second.status, 201);
         const nextId = second.data.id;
-        assert.equal(second.data.kyc_case_id, null);
-        assert.equal(second.data.kyc_status, null);
+        assert.ok(second.data.kyc_case_id);
+        assert.equal(second.data.kyc_status, 'OPEN');
         assert.equal(
           (await call(controller.startDrawKyc, { params: { id: nextId } }))
             .status,
@@ -405,6 +461,10 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         });
         assert.equal(allotted.status, 200, JSON.stringify(allotted));
         assert.equal(allotted.data.status, 'ALLOTTED');
+        const plot = (await fixture.query('SELECT installments_enabled, first_installment FROM plots WHERE id = 2')).rows[0];
+        assert.equal(plot.installments_enabled, false);
+        assert.equal(Number(plot.first_installment), 0);
+        assert.equal((await fixture.query('SELECT count(*)::int AS n FROM plot_installments WHERE plot_id = 2')).rows[0].n, 0);
       },
     );
     await t.test(

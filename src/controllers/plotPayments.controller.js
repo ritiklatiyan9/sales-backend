@@ -58,7 +58,8 @@ export const listPlotPayments = asyncHandler(async (req, res) => {
                    SUM(amount) FILTER (WHERE payment_type = 'CASH') AS received_cash,
                    COUNT(*) AS payment_count
               FROM plot_payments
-             WHERE COALESCE(cheque_status, '') NOT IN ('BOUNCED', 'RETURNED')
+             WHERE UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+               AND LOWER(COALESCE(status, 'pending')) NOT IN ('rejected', 'cancelled')
              GROUP BY plot_id
        ) t ON t.plot_id = p.id
       WHERE p.id = $1`,

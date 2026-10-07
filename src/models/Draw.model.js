@@ -9,7 +9,7 @@ class DrawModel extends MasterModel {
   /**
    * The customer's KYC case for a registration: the linked r.kyc_case_id when it
    * still exists; legacy rows fall back to the member's newest case. New intake
-   * requires an explicitly opened KYC after payment. The legacy fallback matters because
+   * links a pending KYC immediately. The legacy fallback matters because
    * adoptForBooking deletes duplicate cases (FK sets our link NULL) and because
    * registrations created before migration 013 never had a link.
    * NB: kyc.id/kyc.status are selected AFTER r.* so the resolved values win.

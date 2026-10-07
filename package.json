@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "src/server.js",
-  "description": "Booking & KYC module API — co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
+  "description": "Booking & KYC module API \u2014 co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
@@ -31,7 +31,19 @@
     "test:member-roles": "node --test src/services/memberRoles.service.test.mjs",
     "test:mistral-ocr": "node --test src/services/mistralOcr.service.test.mjs src/services/ocrFallback.service.test.mjs src/services/ocrSingleFlight.service.test.mjs",
     "migrate:booking-workflow": "node src/migrations/021_booking_workflow.js",
-    "test:booking-workflow": "node --test src/services/drawWorkflow.test.mjs src/controllers/drawWorkflow.controller.test.mjs"
+    "migrate:draw-kyc-backfill": "node src/migrations/022_backfill_draw_kyc_cases.js",
+    "migrate:document-settings": "node src/migrations/023_document_settings.js",
+    "test:document-settings": "node --test src/services/documentSettings.test.mjs",
+    "test:booking-workflow": "node --test src/services/drawWorkflow.test.mjs src/services/drawInstallmentPlan.test.mjs src/controllers/drawWorkflow.controller.test.mjs",
+    "migrate:booking-first-installment": "node src/migrations/024_booking_first_installment.js",
+    "test:booking-draw-credits": "node --test src/controllers/bookingDrawCredits.test.mjs",
+    "migrate:form-studio-attendance": "node src/migrations/025_form_studio_attendance.js",
+    "seed:mount-valley-form": "node src/scripts/seed_mount_valley_form.js",
+    "test:form-studio-attendance": "node --test src/controllers/formStudioAttendance.test.mjs",
+    "migrate:agreement-templates": "node src/migrations/026_agreement_templates.js",
+    "test:agreement-templates": "node --test src/services/agreementTemplate.test.mjs",
+    "migrate:booking-form-studio": "node src/migrations/027_booking_form_studio.js",
+    "test:booking-form-studio": "node --test src/controllers/bookingFormStudio.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.700.0",

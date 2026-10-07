@@ -10,6 +10,10 @@ import teamRoutes from './team.routes.js';
 import adminRoutes from './admin.routes.js';
 import homeLayoutRoutes from './homeLayout.routes.js';
 import drawRoutes from './draw.routes.js';
+import applicationFormRoutes from './applicationForm.routes.js';
+import agreementTemplateRoutes from './agreementTemplate.routes.js';
+import bookingFormRoutes from './bookingForm.routes.js';
+import drawAttendanceRoutes from './drawAttendance.routes.js';
 import plotPaymentRoutes from './plotPayments.routes.js';
 import { publicVerifyDraw } from '../controllers/draw.controller.js';
 import { publicVerifyKyc } from '../controllers/kyc.controller.js';
@@ -34,6 +38,10 @@ router.use('/teams', teamRoutes);     // Team management (admin only)
 router.use('/admin', adminRoutes);    // Access control: sites + module permissions
 router.use('/home-layout', homeLayoutRoutes); // Per-user launcher screen layout
 router.use('/draws', drawRoutes);     // Draw-based shop allotment (lottery) module
+router.use('/application-forms', applicationFormRoutes);
+router.use('/agreement-templates', agreementTemplateRoutes); // Agreement Form Studio
+router.use('/booking-forms', bookingFormRoutes);
+router.use('/draw-attendance', drawAttendanceRoutes);
 router.use('/plot-payments', plotPaymentRoutes); // Shared accounting plot ledger (admin)
 
 export default router;

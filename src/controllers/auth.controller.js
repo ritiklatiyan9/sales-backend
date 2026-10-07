@@ -26,6 +26,9 @@ const issueTokens = async (user) => {
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_RESEND_SECONDS = 30;
+// Keep login available when SMTP is absent or its credentials have expired.
+// Enable the second factor only after the mail transport has been verified.
+const LOGIN_OTP_ENABLED = process.env.LOGIN_OTP_ENABLED === 'true';
 
 const maskEmail = (email) => {
   const [local, domain] = String(email).split('@');
@@ -68,8 +71,8 @@ const startOtpChallenge = async (user, res) => {
   });
 };
 
-/** Admins verify with a second step whenever the mailer is configured. */
-const needsOtp = (user) => isAdminRole(user.role) && mailerEnabled();
+/** Admin OTP is deliberately opt-in: configured-but-broken SMTP must not lock out admins. */
+const needsOtp = (user) => LOGIN_OTP_ENABLED && isAdminRole(user.role) && mailerEnabled();
 
 /**
  * POST /auth/login

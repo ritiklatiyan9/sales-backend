@@ -4,8 +4,8 @@ The new frontend module is **Booking Payments** (`/booking-payments`). Quick int
 
 1. Register a customer using name and Indian mobile number. Existing site members are reused. Each submission has a retry key; registration does not open a KYC case.
 2. An admin/sub-admin collects the configured booking amount and prints the numbered receipt from the payment ledger. Non-cash payments require a reference. Retrying the same payment request cannot insert another receipt.
-3. After the full booking amount is recorded, staff print the KYC form, open the existing KYC workspace, upload documents and verify the customer. The workspace links back to draw documents.
-4. An admin/sub-admin issues the unique slip and two-page draw booking form. Both full payment and verified, linked KYC are checked on the server. Terms are copied into the registration at issue time.
+3. After the full booking amount is recorded, staff can print the KYC form, open the existing KYC workspace, upload documents and verify the customer. The workspace links back to draw documents.
+4. An admin/sub-admin can issue the unique slip and two-page draw booking form as soon as full payment is recorded, even when KYC has not started or is pending. Terms are copied into the registration at issue time. Verified KYC is still required before recording the physical draw result or allotting a unit.
 5. Staff record the exact number physically picked from the bucket. Only admin/super-admin can record a selection, on or after the scheduled opening date in Asia/Kolkata. The software does not perform a random selection.
 6. Admin/super-admin chooses an available unit, agreed price and FULL/INSTALLMENT plan. Unit reservation, booking creation, KYC adoption and receipt transfer commit together. The existing accounting approval, commission enrichment and subsequent payment flows continue.
 

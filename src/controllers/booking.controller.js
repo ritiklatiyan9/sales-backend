@@ -1,3 +1,6 @@
+import { allotDrawBooking } from './draw.controller.js';
+import { ensureBookingCreditFields, listBookingDrawCredits } from '../services/bookingDrawCredits.js';
+import { money } from '../services/drawWorkflow.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import bookingModel from '../models/Booking.model.js';
@@ -274,6 +277,15 @@ export const getDashboard = asyncHandler(async (req, res) => {
   });
 });
 
+export const getBookingDrawCredits = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Only admins can view booking payment credits' });
+  const siteId = Number(req.query.site_id);
+  const memberId = Number(req.query.client_member_id);
+  if (!Number.isInteger(siteId) || siteId <= 0 || !Number.isInteger(memberId) || memberId <= 0) return res.status(400).json({ message: 'Valid site_id and client_member_id are required' });
+  const credits = await listBookingDrawCredits(siteId, memberId);
+  res.json(['admin', 'super_admin'].includes(req.user?.role) ? credits : credits.map(r => r.eligible ? { ...r, eligible: false, reason: 'An admin or super admin must apply draw payments during allotment' } : r));
+});
+
 /** POST /bookings — admin roles only (agents do KYC; they never create bookings). */
 export const createBooking = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
@@ -288,6 +300,12 @@ export const createBooking = asyncHandler(async (req, res) => {
 
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
   if (!client_member_id) return res.status(400).json({ message: 'client_member_id is required' });
+
+  await ensureBookingCreditFields();
+  if (req.body.draw_registration_id != null) {
+    const result = await allotDrawBooking({ registrationId: req.body.draw_registration_id, body: req.body, user: req.user });
+    return res.status(201).json({ ...result.booking, draw_registration_id: Number(req.body.draw_registration_id), draw_credit_amount: result.draw_credit_amount, plot_sync: result.plot_sync, ledger_sync: result.ledger_sync, token_sync: result.token_sync });
+  }
 
   // Resolve the shared Accounting member once up front. This turns an otherwise
   // opaque FK failure into a useful response and prevents cross-site bookings.
@@ -354,6 +372,7 @@ export const createBooking = asyncHandler(async (req, res) => {
     sale_price: sale_price || 0,
     token_amount: token_amount || 0,
     payment_plan: payment_plan || 'FULL',
+    first_installment_amount: payment_plan === 'INSTALLMENT' && req.body.first_installment_amount ? money(req.body.first_installment_amount, 'First installment amount') : null,
     booking_date: booking_date || new Date().toISOString().slice(0, 10),
     status: 'KYC_PENDING',
     kyc_status: 'NOT_STARTED',

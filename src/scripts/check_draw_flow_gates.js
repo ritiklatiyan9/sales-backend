@@ -32,22 +32,15 @@ const main = async () => {
       ORDER BY role, id`
   );
   const users = Object.fromEntries(rows.map((r) => [r.role, r]));
-  // ONLY pre-slip registrations whose resolved KYC is NOT verified: on such a row the
-  // admin slip call is guaranteed to be rejected by the KYC gate (400) before any
-  // write. A VERIFIED+ELIGIBLE row would let issueSlip COMMIT a real slip — never
-  // point this check at one.
+  // Use a pre-slip registration for read checks and calls that are rejected by role
+  // middleware before any write. Never call the successful admin issue-slip path here.
   const { rows: draws } = await pool.query(
     `SELECT r.id FROM draw_registrations r
-     LEFT JOIN LATERAL (
-       SELECT kc.status FROM kyc_cases kc
-        WHERE kc.id = r.kyc_case_id OR kc.client_member_id = r.client_member_id
-        ORDER BY (kc.id = r.kyc_case_id) DESC NULLS LAST, kc.id DESC LIMIT 1
-     ) k ON true
-     WHERE r.status IN ('REGISTERED','ELIGIBLE') AND COALESCE(k.status, '') <> 'VERIFIED'
+     WHERE r.status IN ('REGISTERED','ELIGIBLE')
      ORDER BY r.id DESC LIMIT 1`
   );
   if (!users.agent || !users.admin || !draws[0]) {
-    console.log('SKIP: need an active agent, an admin and one pre-slip draw registration with unverified KYC');
+    console.log('SKIP: need an active agent, an admin and one pre-slip draw registration');
     process.exit(0);
   }
   const drawId = draws[0].id;
@@ -86,14 +79,6 @@ const main = async () => {
     expect('sub_admin set amount → 403', (await call('PATCH', `/draws/${drawId}`, subAdmin, { required_amount: 5000 })).status, 403);
     expect('sub_admin set draw settings → 403', (await call('PUT', '/draws/settings', subAdmin, { site_id: 1, required_amount: 5000 })).status, 403);
   }
-
-  // Admin: slip on an unverified-KYC draw must be blocked by the KYC gate (400), not
-  // 403 — and never succeed (the selection above guarantees the KYC gate fires).
-  const slip = await call('POST', `/draws/${drawId}/issue-slip`, admin);
-  const kycGated = slip.status === 400 && /KYC/i.test(slip.body?.message || '');
-  const slipMsg = `admin slip pre-KYC → 400 KYC gate: got ${slip.status} "${slip.body?.message}"`;
-  checks.push([kycGated, slipMsg]);
-  console.log(`${kycGated ? 'PASS' : 'FAIL'} ${slipMsg}`);
 
   // Detail carries the KYC linkage fields.
   const detail = await call('GET', `/draws/${drawId}`, admin);

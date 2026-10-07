@@ -1,3 +1,4 @@
+import { ensureBookingCreditFields } from '../services/bookingDrawCredits.js';
 import MasterModel from './MasterModel.js';
 
 class BookingModel extends MasterModel {
@@ -65,6 +66,7 @@ class BookingModel extends MasterModel {
 
   /** Full detail: booking + client + plot + kyc cases + documents + latest ocr result. */
   async getDetail(id, pool) {
+    await ensureBookingCreditFields(pool);
     const { rows } = await pool.query(`
       SELECT b.*,
              m.id AS account_member_id,

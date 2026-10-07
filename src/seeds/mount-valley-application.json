@@ -1,0 +1,55 @@
+{
+  "form_title": "Draw Application Form",
+  "applicant_subtitle": "Mount Valley Residency · Applicant particulars & draw registration",
+  "brand_name": "Defence Garden",
+  "legal_name": "",
+  "contact_line": "",
+  "logo_url": "",
+  "accent_color": "#234234",
+  "heading_font": "Georgia",
+  "body_font": "Arial",
+  "image_height": 96,
+  "applicant_section": "Applicant details",
+  "project_section": "Project & draw particulars",
+  "terms_title": "Terms & Conditions",
+  "terms_subtitle": "Terms recorded when this draw application was issued.",
+  "terms": "",
+  "verification_title": "Your application, verified",
+  "verification_note": "Scan the QR code to verify this registration. Keep your application, customer slip and payment receipts together.",
+  "commercial_title": "Naya Baazar",
+  "commercial_location": "UNN",
+  "commercial_tagline": "Crafted for commerce. Designed for community.",
+  "commercial_eyebrow": "MOUNT VALLEY RESIDENCY · COMMERCIAL OVERVIEW",
+  "commercial_image": "/images/naya-bazar-commercial-light.png",
+  "commercial_image_caption": "Artist’s impression · Commercial concept shown for illustration.",
+  "commercial_heading": "A place for everyday business and community.",
+  "commercial_description": "Naya Baazar is the commercial concept for Mount Valley Residency. The illustrated layout brings shopfronts together along a central pedestrian route, with shared gathering spaces and landscaped edges. It presents a connected setting for local retail, services and daily visits. Refer to the approved project documents for the final layout, unit details and specifications.",
+  "commercial_disclosure": "Illustrations describe the commercial concept and do not establish an allotment, a guaranteed return or an approved specification. Confirm availability, permitted use and final details with the project office.",
+  "slip_title": "Draw Slip & Token",
+  "slip_subtitle": "Keep your customer slip. Detach the draw token along the marked line.",
+  "slip_instructions_title": "On the day of the draw",
+  "slip_instructions": "Bring this customer slip and the detached draw token to the venue. Present the token QR at the attendance desk so the team can mark your arrival. Follow the team’s instructions for placing the token in the draw. Keep this slip and your payment receipts for your records.",
+  "token_title": "Draw Token",
+  "token_note": "Present the QR at the attendance desk, then follow the team’s instructions for the draw. Retain your customer slip.",
+  "applicant_signature": "Applicant signature",
+  "office_signature": "Authorised signature",
+  "footer_text": "Mount Valley Residency · Naya Baazar",
+  "features": [
+    {
+      "title": "Thoughtfully planned shops",
+      "body": "Connected shopfronts create a clear retail frontage along the illustrated commercial route."
+    },
+    {
+      "title": "A walkable commercial setting",
+      "body": "A central pedestrian spine connects the shopping areas and shared spaces in the concept."
+    },
+    {
+      "title": "A gathering place for people",
+      "body": "Open gathering spaces support everyday visits, local services and community activity."
+    },
+    {
+      "title": "Landscaped edges",
+      "body": "Planting and green pockets soften the built form and frame the shared public areas."
+    }
+  ]
+}
