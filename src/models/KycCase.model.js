@@ -120,13 +120,17 @@ class KycCaseModel extends MasterModel {
    * `visibleUserIds` (array | null) scopes rows for non-admins — cases they opened,
    * or cases on bookings they own/created (legacy booking-tied cases).
    */
-  async list({ siteId, status, pending, q, memberType, visibleUserIds }, pool) {
+  async list({ siteId, status, pending, q, memberType, visibleUserIds, currentMembers = false }, pool) {
     const where = [];
+    const resultWhere = [];
     const params = [];
     if (siteId) { params.push(siteId); where.push(`k.site_id = $${params.length}`); }
-    if (status) { params.push(status); where.push(`k.status = $${params.length}`); }
+    // Status filters follow case selection so an old pending case cannot override
+    // the member's verified case in the current register.
+    const statusWhere = currentMembers ? resultWhere : where;
+    if (status) { params.push(status); statusWhere.push(`k.status = $${params.length}`); }
     if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
-    if (pending) where.push(`k.status NOT IN ('VERIFIED','REJECTED')`);
+    if (pending) statusWhere.push(`k.status NOT IN ('VERIFIED','REJECTED')`);
     if (q) {
       params.push(`%${q}%`);
       where.push(`(m.full_name ILIKE $${params.length}
@@ -142,8 +146,25 @@ class KycCaseModel extends MasterModel {
                    OR b.created_by = ANY($${params.length}))`);
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    // Match Accounting's strongest-case rule without discarding old cases or
+    // their documents. History remains available through the ungrouped list.
+    const currentCasesSql = currentMembers ? `WITH current_cases AS (
+      SELECT k.*, ROW_NUMBER() OVER (
+        PARTITION BY k.client_member_id, k.site_id
+        ORDER BY CASE k.status WHEN 'VERIFIED' THEN 4 WHEN 'OCR_DONE' THEN 3 WHEN 'OCR_PENDING' THEN 2 ELSE 1 END DESC,
+                 k.updated_at DESC NULLS LAST, k.id DESC
+      ) AS member_case_rank
+      FROM kyc_cases k
+      JOIN members m ON m.id = k.client_member_id AND m.site_id = k.site_id
+      LEFT JOIN bookings b ON b.id = k.booking_id
+      ${whereSql}
+    )` : '';
+    const finalWhereSql = currentMembers
+      ? `WHERE k.member_case_rank = 1${resultWhere.length ? ` AND ${resultWhere.join(' AND ')}` : ''}`
+      : whereSql;
 
     const { rows } = await pool.query(`
+      ${currentCasesSql}
       SELECT k.*,
              m.id AS account_member_id,
              m.full_name AS client_name, m.phone AS client_phone, m.photo AS client_photo,
@@ -158,14 +179,13 @@ class KycCaseModel extends MasterModel {
              (SELECT count(*)::int FROM documents d WHERE d.kyc_case_id = k.id) AS document_count,
              (SELECT count(*)::int FROM documents d WHERE d.kyc_case_id = k.id AND d.ocr_status = 'DONE') AS ocr_done_count,
              (SELECT count(*)::int FROM documents d WHERE d.kyc_case_id = k.id AND d.ocr_status IN ('PENDING','PROCESSING')) AS ocr_pending_count
-      FROM kyc_cases k
+      FROM ${currentMembers ? 'current_cases' : 'kyc_cases'} k
       LEFT JOIN members  m ON m.id = k.client_member_id
       LEFT JOIN bookings b ON b.id = k.booking_id
       LEFT JOIN users    u ON u.id = k.created_by
       LEFT JOIN sites    s ON s.id = k.site_id
-      ${whereSql}
-      ORDER BY k.created_at DESC
-      LIMIT 500
+      ${finalWhereSql}
+      ORDER BY k.created_at DESC, k.id DESC
     `, params);
     return rows;
   }

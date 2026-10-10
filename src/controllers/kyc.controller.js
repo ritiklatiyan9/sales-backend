@@ -232,7 +232,7 @@ export const createCase = asyncHandler(async (req, res) => {
 });
 
 /**
- * GET /kyc/cases?site_id=&status=&pending=1&q=&member_type=
+ * GET /kyc/cases?site_id=&status=&pending=1&q=&member_type=&current_members=1
  * Role-scoped list: admins see every case; agents see their own network's cases
  * (same visibility idiom as bookings). `pending=1` → not yet VERIFIED/REJECTED.
  */
@@ -248,6 +248,7 @@ export const listCases = asyncHandler(async (req, res) => {
       q,
       memberType,
       visibleUserIds,
+      currentMembers: req.query.current_members === '1' || req.query.current_members === 'true',
     },
     pool
   );
