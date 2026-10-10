@@ -136,11 +136,6 @@ export const getDashboard = asyncHandler(async (req, res) => {
   // Ownership filter applied to every booking-derived aggregate below. $2 (or $3 where
   // a query already uses $2 for something else) is always the visibleUserIds array.
   const bookingScope = (alias, param) => (scoped ? `AND (${alias}.agent_user_id = ANY($${param}) OR ${alias}.created_by = ANY($${param}))` : '');
-  // Mirrors KycCase.model.js list()'s visibility clause: a case is "mine" if I created
-  // it directly, OR I own/created the booking it's since been adopted into.
-  const kycScope = (caseAlias, bookingAlias, param) => (scoped
-    ? `AND (${caseAlias}.created_by = ANY($${param}) OR ${bookingAlias}.agent_user_id = ANY($${param}) OR ${bookingAlias}.created_by = ANY($${param}))`
-    : '');
 
   const recentSelect = `
     SELECT b.id, b.booking_no, b.status, b.kyc_status, b.booking_date, b.created_at,
@@ -159,7 +154,6 @@ export const getDashboard = asyncHandler(async (req, res) => {
   const trendParams = scoped ? [siteId, days, visibleUserIds] : [siteId, days];
   const listParams = scoped ? [siteId, visibleUserIds] : [siteId];
   const activityParams = scoped ? [siteId, visibleUserIds] : [siteId];
-  const myKycParams = scoped ? [siteId, visibleUserIds] : [siteId];
 
   const [kpi, docs, dist, trend, recent, queue, topExec, activity, myKyc] = await Promise.all([
     pool.query(
@@ -247,18 +241,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
        ORDER BY ev.at DESC LIMIT 20`,
       activityParams
     ),
-    // Member-first KYC pipeline (agent's primary workflow) — covers cases that have no
-    // booking yet, which the booking-derived aggregates above never see.
-    pool.query(
-      `SELECT count(*)::int AS total,
-              count(*) FILTER (WHERE k.status NOT IN ('VERIFIED','REJECTED'))::int AS pending,
-              count(*) FILTER (WHERE k.status = 'VERIFIED')::int AS verified,
-              count(*) FILTER (WHERE k.booking_id IS NULL)::int AS not_booked
-       FROM kyc_cases k
-       LEFT JOIN bookings b ON b.id = k.booking_id
-       WHERE k.site_id = $1 ${kycScope('k', 'b', 2)}`,
-      myKycParams
-    ),
+    kycCaseModel.currentMemberSummary({ siteId, visibleUserIds }, pool),
   ]);
 
   res.json({
@@ -270,7 +253,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
     queue: queue.rows,
     top_executive: topExec.rows[0] || null,
     activity: activity.rows,
-    my_kyc: myKyc.rows[0],
+    my_kyc: myKyc,
     scoped,
     days,
     generated_at: new Date().toISOString(),

@@ -1,5 +1,19 @@
 import MasterModel from './MasterModel.js';
 
+// Shared by the current-member register and dashboard. Accounting uses the same
+// strongest-status, newest-update ordering when selecting a member's KYC.
+const currentMemberCasesSql = (whereSql) => `WITH current_cases AS (
+  SELECT k.*, ROW_NUMBER() OVER (
+    PARTITION BY k.client_member_id, k.site_id
+    ORDER BY CASE k.status WHEN 'VERIFIED' THEN 4 WHEN 'OCR_DONE' THEN 3 WHEN 'OCR_PENDING' THEN 2 ELSE 1 END DESC,
+             k.updated_at DESC NULLS LAST, k.id DESC
+  ) AS member_case_rank
+  FROM kyc_cases k
+  JOIN members m ON m.id = k.client_member_id AND m.site_id = k.site_id
+  LEFT JOIN bookings b ON b.id = k.booking_id
+  ${whereSql}
+)`;
+
 class KycCaseModel extends MasterModel {
   constructor() {
     super('kyc_cases');
@@ -148,17 +162,7 @@ class KycCaseModel extends MasterModel {
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     // Match Accounting's strongest-case rule without discarding old cases or
     // their documents. History remains available through the ungrouped list.
-    const currentCasesSql = currentMembers ? `WITH current_cases AS (
-      SELECT k.*, ROW_NUMBER() OVER (
-        PARTITION BY k.client_member_id, k.site_id
-        ORDER BY CASE k.status WHEN 'VERIFIED' THEN 4 WHEN 'OCR_DONE' THEN 3 WHEN 'OCR_PENDING' THEN 2 ELSE 1 END DESC,
-                 k.updated_at DESC NULLS LAST, k.id DESC
-      ) AS member_case_rank
-      FROM kyc_cases k
-      JOIN members m ON m.id = k.client_member_id AND m.site_id = k.site_id
-      LEFT JOIN bookings b ON b.id = k.booking_id
-      ${whereSql}
-    )` : '';
+    const currentCasesSql = currentMembers ? currentMemberCasesSql(whereSql) : '';
     const finalWhereSql = currentMembers
       ? `WHERE k.member_case_rank = 1${resultWhere.length ? ` AND ${resultWhere.join(' AND ')}` : ''}`
       : whereSql;
@@ -188,6 +192,24 @@ class KycCaseModel extends MasterModel {
       ORDER BY k.created_at DESC, k.id DESC
     `, params);
     return rows;
+  }
+
+  /** Dashboard counts the same current members as the KYC register. */
+  async currentMemberSummary({ siteId, visibleUserIds }, pool) {
+    const scoped = Array.isArray(visibleUserIds);
+    const whereSql = `WHERE k.site_id = $1${scoped
+      ? ' AND (k.created_by = ANY($2) OR b.agent_user_id = ANY($2) OR b.created_by = ANY($2))'
+      : ''}`;
+    const { rows } = await pool.query(`
+      ${currentMemberCasesSql(whereSql)}
+      SELECT count(*)::int AS total,
+             count(*) FILTER (WHERE k.status NOT IN ('VERIFIED','REJECTED'))::int AS pending,
+             count(*) FILTER (WHERE k.status = 'VERIFIED')::int AS verified,
+             count(*) FILTER (WHERE k.booking_id IS NULL)::int AS not_booked
+      FROM current_cases k
+      WHERE k.member_case_rank = 1
+    `, scoped ? [siteId, visibleUserIds] : [siteId]);
+    return rows[0];
   }
 
   /** Case + member/booking/creator labels (header data for the KYC workspace). */
