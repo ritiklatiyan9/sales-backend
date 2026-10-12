@@ -17,6 +17,7 @@ import drawAttendanceRoutes from './drawAttendance.routes.js';
 import plotPaymentRoutes from './plotPayments.routes.js';
 import { publicVerifyDraw } from '../controllers/draw.controller.js';
 import { publicVerifyKyc } from '../controllers/kyc.controller.js';
+import { publicWebsiteRoutes, websiteManagementRoutes } from './websiteBooking.routes.js';
 
 const router = express.Router();
 
@@ -26,6 +27,8 @@ router.get('/health', (req, res) => res.json({ status: 'ok', service: 'booking-a
 // the form/slip can confirm it is genuine on the website.
 router.get('/public/draws/verify', publicVerifyDraw);
 router.get('/public/kyc/verify', publicVerifyKyc);
+router.use('/public/website', publicWebsiteRoutes);
+router.use('/website-management', websiteManagementRoutes);
 
 router.use('/auth', authRoutes);
 router.use('/bookings', bookingRoutes);

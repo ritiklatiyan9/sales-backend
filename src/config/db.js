@@ -24,6 +24,14 @@ const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+});
+
+// Idle TLS disconnects are recoverable: pg discards that connection and opens
+// another on demand. An unhandled pool event would crash the whole booking API.
+pool.on('error', (error) => {
+  console.error('[booking-api] Database connection interrupted:', error.code || 'CONNECTION_ERROR');
 });
 
 export const connectDB = async () => {

@@ -5,11 +5,16 @@ import morgan from 'morgan';
 import path from 'path';
 import indexRoutes from './routes/index.js';
 import errorMiddleware from './middlewares/error.middleware.js';
+import { websiteWebhookHandler } from './routes/websiteBooking.routes.js';
 
 const app = express();
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(morgan('dev'));
+app.use(morgan((tokens,req,res) => [tokens.method(req,res),
+  // Request tokens authorize recovery; keep them out of HTTP access logs.
+  tokens.url(req,res).replace(/(\/public\/website\/requests\/)[a-f0-9]{64}/g,'$1[redacted]'),
+  tokens.status(req,res),tokens['response-time'](req,res),'ms'].join(' ')));
+if (process.env.TRUST_PROXY) app.set('trust proxy',process.env.TRUST_PROXY.split(',').map(value=>value.trim()));
 
 const corsOriginValue = String(process.env.CORS_ORIGIN || '').trim();
 const configuredCorsOrigins = corsOriginValue && corsOriginValue !== '*'
@@ -50,6 +55,7 @@ app.options('*', cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
 
+app.post('/public/website/webhook',express.raw({type:'application/json',limit:'256kb'}),websiteWebhookHandler);
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 

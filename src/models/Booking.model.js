@@ -1,9 +1,44 @@
 import { ensureBookingCreditFields } from '../services/bookingDrawCredits.js';
 import MasterModel from './MasterModel.js';
+import { assertBookingPlotAvailable, assertWebsitePaymentImmutable } from '../services/websitePlotGuard.js';
 
 class BookingModel extends MasterModel {
   constructor() {
     super('bookings');
+  }
+
+  async create(data,db) {
+    const ownsTransaction=typeof db.connect==='function' && typeof db.release!=='function';
+    const client=ownsTransaction?await db.connect():db;
+    try {
+      if(ownsTransaction)await client.query('BEGIN');
+      await assertBookingPlotAvailable(client,{plotId:data.plot_id,siteId:data.site_id});
+      const booking=await super.create(data,client);
+      if(ownsTransaction)await client.query('COMMIT');
+      return booking;
+    } catch(error){if(ownsTransaction)await client.query('ROLLBACK');throw error;}
+    finally{if(ownsTransaction)client.release();}
+  }
+
+  async update(id,data,db) {
+    await assertWebsitePaymentImmutable(db,id,data);
+    if(data.status!==undefined && !['DRAFT','KYC_PENDING','KYC_DONE','CONFIRMED','CANCELLED'].includes(data.status))throw Object.assign(new Error('Select a valid booking status'),{status:400,code:'BOOKING_STATUS_INVALID'});
+    const checksAssignment=data.plot_id!==undefined || (data.status!==undefined && data.status!=='CANCELLED');
+    if(!checksAssignment)return super.update(id,data,db);
+    const ownsTransaction=typeof db.connect==='function' && typeof db.release!=='function';
+    const client=ownsTransaction?await db.connect():db;
+    try {
+      if(ownsTransaction)await client.query('BEGIN');
+      const existing=await super.findById(id,client);
+      if(!existing){if(ownsTransaction)await client.query('COMMIT');return null;}
+      const resultingPlot=data.plot_id!==undefined?data.plot_id:existing.plot_id;
+      const resultingStatus=data.status!==undefined?data.status:existing.status;
+      if(resultingPlot && resultingStatus!=='CANCELLED')await assertBookingPlotAvailable(client,{plotId:resultingPlot,siteId:existing.site_id,bookingId:Number(id)});
+      const booking=await super.update(id,data,client);
+      if(ownsTransaction)await client.query('COMMIT');
+      return booking;
+    }catch(error){if(ownsTransaction)await client.query('ROLLBACK');throw error;}
+    finally{if(ownsTransaction)client.release();}
   }
 
   /** List with joined client/plot labels + KYC/OCR rollup indicators.

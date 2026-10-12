@@ -26,7 +26,7 @@ import pool from '../config/db.js';
 // Statuses we will NOT overwrite when the plot is already committed to a DIFFERENT
 // buyer — protects against clobbering a real sale/registry on a plot the booker
 // picked by mistake. Fresh/holding statuses are always bookable.
-const PROTECTED_STATUSES = new Set(['SOLD', 'REGISTRY', 'UNDER CANCELLATION', 'CANCELLED', 'TRANSFERRED']);
+const PROTECTED_STATUSES = new Set(['BOOKED', 'SOLD', 'REGISTRY', 'UNDER CANCELLATION', 'CANCELLED', 'TRANSFERRED']);
 
 /**
  * Resolve the "Booking By" name + (optional) commission agent member id.

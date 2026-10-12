@@ -66,6 +66,16 @@ const removePendingTokenPayment = async (booking, db) => {
  */
 export const syncTokenPayment = async (booking, db = pool) => {
   try {
+    // Captured website money is an immutable gateway receipt even while Accounting
+    // has not approved its BANK entry. Cancellation must never delete that money.
+    const {rows:tables}=await db.query("SELECT to_regclass('public.website_booking_requests') AS requests_table");
+    if(tables[0]?.requests_table && booking?.id) {
+      const {rows:website}=await db.query('SELECT id,plot_payment_id FROM website_booking_requests WHERE booking_id=$1 AND payment_verified_at IS NOT NULL',[booking.id]);
+      if(website[0]) {
+        if(String(booking.status||'').toUpperCase()==='CANCELLED')await db.query('UPDATE website_booking_requests SET refund_required=(amount_refunded_paise<amount_paise),updated_at=now() WHERE id=$1',[website[0].id]);
+        return {ok:true,skipped:'website_payment_locked',payment_id:website[0].plot_payment_id};
+      }
+    }
     const tokenAmount = parseFloat(booking?.token_amount) || 0;
     const isCancelled = String(booking?.status || '').toUpperCase() === 'CANCELLED';
 

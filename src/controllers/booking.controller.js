@@ -15,6 +15,7 @@ import {
   memberTypeFromBody,
   memberTypePayload,
 } from '../services/memberRoles.service.js';
+import { websitePaymentForBooking } from '../services/websitePlotGuard.js';
 
 // Token-payment capture fields a booking may set (mirror of the accounting plot-payment
 // taking fields). Stored on the booking and propagated to plot_payments by tokenPaymentSync.
@@ -496,6 +497,7 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const booking = await bookingModel.findById(id, pool);
   if (!booking) return res.status(404).json({ message: 'Booking not found' });
+  if(await websitePaymentForBooking(pool,booking.id))return res.status(409).json({message:'This booking has a captured website payment. Cancel it through the booking workflow and resolve any refund; its audit record cannot be deleted.',code:'WEBSITE_PAYMENT_LOCKED'});
 
   // KYC belongs to the CUSTOMER, not the booking: detach the booking's cases (with
   // their documents intact) back to member-anchored cases instead of letting the FK

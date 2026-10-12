@@ -10,12 +10,15 @@ const server = http.createServer(app);
 
 initSocket(server);   // socket.io (OCR events emitted in-process; no Redis relay)
 
-connectDB()
-  .then(async () => {
+async function start() {
+  try {
+    await connectDB();
     await recoverOcrQueue(pool);
     server.listen(PORT, () => console.log(`[booking-api] running on port ${PORT}`));
-  })
-  .catch((err) => {
-    console.error('[booking-api] Failed to connect to DB', err);
-    process.exit(1);
-  });
+  } catch (err) {
+    console.error('[booking-api] Failed to connect to DB:', err.code || 'CONNECTION_ERROR');
+    // A temporary network failure must not leave the local integration stopped.
+    setTimeout(start, 5000);
+  }
+}
+void start();

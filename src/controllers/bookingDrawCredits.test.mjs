@@ -5,6 +5,7 @@ import { createBooking, getBookingDrawCredits } from './booking.controller.js';
 import { createDraw, setDrawSettings, addDrawPayment } from './draw.controller.js';
 import { listPlotPayments } from './plotPayments.controller.js';
 import { todayIST } from '../services/drawWorkflow.js';
+import { migrateWebsiteBookings } from '../migrations/028_website_bookings.js';
 
 const admin = { id:1, role:'admin', email:'admin@example.test' };
 const call = (handler, { body = {}, params = {}, query = {}, user = admin } = {}) => new Promise(resolve => {
@@ -15,6 +16,7 @@ const call = (handler, { body = {}, params = {}, query = {}, user = admin } = {}
 test('new-booking draw credits preserve receipts, enforce ownership and transfer atomically once', async t => {
   const f = await drawFixture();
   try {
+    await migrateWebsiteBookings(f.pool);
     await call(setDrawSettings, { body:{ site_id:1, required_amount:5000, wait_days:10 } });
     const created = await call(createDraw, { body:{ site_id:1, full_name:'Credit customer', phone:'9888877777' } });
     assert.equal(created.status,201,JSON.stringify(created.data));
@@ -34,7 +36,13 @@ test('new-booking draw credits preserve receipts, enforce ownership and transfer
       assert.deepEqual((await lookup({ client_member_id:9999 })).data,[]);
       assert.equal((await call(getBookingDrawCredits,{user:{id:2,role:'agent'},query:{site_id:1,client_member_id:memberId}})).status,403);
     });
-    const payload = { site_id:1,client_member_id:memberId,draw_registration_id:drawId,plot_id:1,sale_price:1000000,payment_plan:'INSTALLMENT',first_installment_amount:6000,token_amount:2500,token_payment_from:'UPI',token_bank_details:'UTR-NEW-002',token_payment_date:todayIST(),expected_draw_credit_amount:5000 };
+    // Current Accounting policy requires a complete full-price schedule with a
+    // 25% booking installment; the original fixture predated this validation.
+    const bookingDay=todayIST();
+    const nextDue=new Date(Date.parse(`${bookingDay}T12:00:00Z`)+30*86400000).toISOString().slice(0,10);
+    const payload = { site_id:1,client_member_id:memberId,draw_registration_id:drawId,plot_id:1,sale_price:1000000,payment_plan:'INSTALLMENT',first_installment_amount:250000,
+      installments:[{installment_name:'Booking installment',amount:250000,due_date:bookingDay},{installment_name:'Remaining balance',amount:750000,due_date:nextDue}],
+      token_amount:2500,token_payment_from:'UPI',token_bank_details:'UTR-NEW-002',token_payment_date:bookingDay,expected_draw_credit_amount:5000 };
     assert.equal((await call(createBooking,{body:payload})).status,400);
     await f.query("UPDATE draw_registrations SET status='WINNER', is_winner=true, draw_opening_date=$1, slip_no='TEST-SLIP-1' WHERE id=$2",[todayIST(),drawId]);
     assert.equal((await call(createBooking,{body:payload})).status,409); // KYC still required
@@ -44,6 +52,17 @@ test('new-booking draw credits preserve receipts, enforce ownership and transfer
     await t.test('cross-customer, cross-project and stale totals cannot claim a receipt',async () => {
       for (const override of [{client_member_id:memberId+1},{site_id:2},{expected_draw_credit_amount:4999}]) assert.equal((await call(createBooking,{body:{...payload,...override}})).status,409);
       assert.equal((await f.query('SELECT count(*)::int AS n FROM bookings')).rows[0].n,0);
+    });
+    await t.test('an active website hold blocks draw allotment and preserves every original receipt',async()=>{
+      await f.query(`INSERT INTO website_booking_requests(site_id,plot_id,plot_number,request_token_hash,idempotency_key_hash,payload_hash,buyer_name,buyer_phone,buyer_email,buyer_address,terms_snapshot,amount_paise,hold_expires_at,gateway_receipt,status)
+        VALUES(1,1,'A-1',$1,$2,$3,'Website customer','9876543210','website@example.test','Isolated test address','Isolated test terms',100000,now()+interval '15 minutes','WB-draw-guard-fixture','AWAITING_PAYMENT')`,['a'.repeat(64),'b'.repeat(64),'c'.repeat(64)]);
+      const blocked=await call(createBooking,{body:payload});
+      assert.equal(blocked.status,409,JSON.stringify(blocked.data));
+      assert.match(blocked.data.message,/website booking request/i);
+      assert.equal((await f.query('SELECT count(*)::int AS n FROM bookings')).rows[0].n,0);
+      assert.equal((await f.query('SELECT count(*)::int AS n FROM plot_payments')).rows[0].n,0);
+      assert.equal((await f.query('SELECT count(*)::int AS n FROM draw_payments WHERE plot_payment_id IS NOT NULL')).rows[0].n,0);
+      await f.query("UPDATE website_booking_requests SET status='EXPIRED',hold_expires_at=now()-interval '1 minute' WHERE gateway_receipt='WB-draw-guard-fixture'");
     });
     await t.test('a failure while collecting additional money rolls back the booking and every draw mirror',async () => {
       await f.query('ALTER TABLE plot_payments ADD CONSTRAINT reject_new_money CHECK (amount <> 2500)');
@@ -59,7 +78,7 @@ test('new-booking draw credits preserve receipts, enforce ownership and transfer
       const result = await call(createBooking,{body:payload});
       assert.equal(result.status,201,JSON.stringify(result.data));
       assert.equal(Number(result.data.token_amount),2500);
-      assert.equal(Number(result.data.first_installment_amount),6000);
+      assert.equal(Number(result.data.first_installment_amount),250000);
       assert.equal(result.data.draw_credit_amount,5000);
       const ledger = (await f.query('SELECT * FROM plot_payments ORDER BY id')).rows;
       assert.equal(ledger.length,3);

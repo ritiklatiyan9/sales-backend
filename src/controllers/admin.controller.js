@@ -20,6 +20,7 @@ export const BOOKING_MODULES = [
   'booking_company_details', 'booking_payment_details',
   'booking_new_entry', 'booking_draws', 'booking_form_studio', 'booking_document_studio', 'booking_draw_attendance',
   'booking_agreement_studio',
+  'booking_website_management',
 ];
 
 const requireAdmin = (req, res) => {
