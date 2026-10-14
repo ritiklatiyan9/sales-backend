@@ -154,6 +154,40 @@ test('disabled by default, real status only, no buyer PII, duplicates fail close
   }finally{await f.close();}
 });
 
+test('current ownership displays through resale history while duplicate checkout stays blocked',async()=>{
+  const f=await fixture();try{
+    await f.enable();
+    await f.db.query("INSERT INTO plots(site_id,plot_no,block,status) VALUES(5,'A03','A','RESALE'),(5,'A04','A','RESALE')");
+    let data=await f.service.plots();
+    for(const [number,status] of [['A-3','BOOKED'],['A-4','REGISTRY']]) {
+      const plot=data.plots.find(plot=>plot.number===number);
+      assert.equal(plot.status,status);
+      assert.equal(plot.mapping_conflict,true);
+      assert.equal(plot.bookable,false);
+      await assert.rejects(f.service.createOrder(buyer(number)),{code:'PLOT_MAPPING_CONFLICT'});
+    }
+    await f.db.query("INSERT INTO plots(site_id,plot_no,block,status) VALUES(5,'A04','A','BOOKED')");
+    data=await f.service.plots();
+    assert.equal(data.plots.find(plot=>plot.number==='A-4').status,'UNKNOWN','two current ownership rows remain ambiguous');
+  }finally{await f.close();}
+});
+
+test('active bookings immediately display booked before ledger sync, cancellation and registry remain authoritative',async()=>{
+  const f=await fixture();try{
+    await f.enable();
+    await f.db.query("INSERT INTO bookings(site_id,plot_id,status) VALUES(5,1,'CONFIRMED'),(5,4,'KYC_PENDING'),(6,2,'CONFIRMED')");
+    let data=await f.service.plots();
+    assert.equal(data.plots.find(plot=>plot.number==='A-1').status,'BOOKED');
+    assert.equal(data.plots.find(plot=>plot.number==='A-1').bookable,false);
+    assert.equal(data.plots.find(plot=>plot.number==='A-4').status,'REGISTRY');
+    assert.equal(data.plots.find(plot=>plot.number==='A-2').status,'COMPANY','other project bookings cannot change this project');
+    await f.db.query("UPDATE bookings SET status='CANCELLED' WHERE plot_id=1");
+    data=await f.service.plots();
+    assert.equal(data.plots.find(plot=>plot.number==='A-1').status,'COMPANY');
+    assert.equal(data.plots.find(plot=>plot.number==='A-1').bookable,true);
+  }finally{await f.close();}
+});
+
 test('management guards current database role, validates settings and cannot use another site publicly',async()=>{
   const f=await fixture();try{
     for(const id of [2,3,4])await assert.rejects(f.service.getSettings({id,role:'admin'},5),{status:403});

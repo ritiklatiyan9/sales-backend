@@ -85,7 +85,9 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
     };
   }
   async function inventory(id, client = db) {
-    const { rows } = await client.query('SELECT id,site_id,plot_no,block,plot_size,sale_price,status FROM plots WHERE site_id=$1 ORDER BY id', [id]);
+    const { rows } = await client.query(`SELECT p.id,p.site_id,p.plot_no,p.block,p.plot_size,p.sale_price,p.status,
+      EXISTS(SELECT 1 FROM bookings b WHERE b.plot_id=p.id AND b.site_id=p.site_id AND b.status<>'CANCELLED') AS has_active_booking
+      FROM plots p WHERE p.site_id=$1 ORDER BY p.id`, [id]);
     const groups = new Map();
     for (const plot of rows) {
       const number = normalizeWebsitePlotNumber(plot.plot_no, plot.block);
@@ -111,14 +113,18 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
     return { site_id: id, status_display_enabled: settings.status_display_enabled, updated_at: clock().toISOString(),
       plots: WEBSITE_PLOT_NUMBERS.map((number) => {
         const candidates = groups.get(number) || [];
-        const plot = candidates.length === 1 ? candidates[0] : null;
-        const status = plot ? normalizeWebsiteStatus(plot.status) : 'UNKNOWN';
+        // Resale history shares map numbers with the current ownership row.
+        // Display the one current row, but keep duplicate identities out of checkout.
+        const current = candidates.filter(plot => !['RESALE', 'CANCELLED', 'TRANSFERRED'].includes(String(plot.status || '').trim().toUpperCase()));
+        const plot = current.length === 1 ? current[0] : null;
+        const ledgerStatus = plot ? normalizeWebsiteStatus(plot.status) : 'UNKNOWN';
+        const status = plot?.has_active_booking && ledgerStatus === 'COMPANY' ? 'BOOKED' : ledgerStatus;
         const isHeld = !!plot && heldIds.has(String(plot.id));
         return { number, status: settings.status_display_enabled ? status : 'UNKNOWN',
-          bookable: !!plot && settings.booking_enabled && settings.status_display_enabled && gateway.ready && Number(settings.booking_amount)>0 && status==='COMPANY' && !isHeld,
+          bookable: candidates.length === 1 && !!plot && settings.booking_enabled && settings.status_display_enabled && gateway.ready && Number(settings.booking_amount)>0 && status==='COMPANY' && !isHeld,
           held: settings.status_display_enabled ? isHeld : false,
           area_sqyd: plot ? Number(plot.plot_size) || null : null, sale_price: plot ? Number(plot.sale_price) || null : null,
-          mapped: !!plot };
+          mapped: candidates.length === 1, mapping_conflict: candidates.length > 1 };
       }),
     };
   }
