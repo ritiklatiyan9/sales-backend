@@ -79,7 +79,8 @@ async function ensureDraw() {
       ADD COLUMN IF NOT EXISTS draw_scheme_name VARCHAR(150),
       ADD COLUMN IF NOT EXISTS draw_wait_days INTEGER NOT NULL DEFAULT 10,
       ADD COLUMN IF NOT EXISTS draw_opening_date DATE,
-      ADD COLUMN IF NOT EXISTS draw_terms TEXT
+      ADD COLUMN IF NOT EXISTS draw_terms TEXT,
+      ADD COLUMN IF NOT EXISTS draw_enabled BOOLEAN NOT NULL DEFAULT true
   `);
   // Migration 021 adds these columns and indexes explicitly. Keep the read/write
   // endpoint self-healing for installations that have the older migrations but have
@@ -101,26 +102,27 @@ async function ensureDraw() {
 export async function getDrawSettings(siteId) {
   await ensureDraw();
   const { rows } = await pool.query(
-    'SELECT site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms, updated_at FROM project_settings WHERE site_id = $1',
+    'SELECT site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms, draw_enabled, updated_at FROM project_settings WHERE site_id = $1',
     [siteId]
   );
   return rows[0] || null;
 }
 
-export async function upsertDrawSettings(siteId, { required_amount, scheme_name, wait_days, opening_date, terms }, db = pool) {
+export async function upsertDrawSettings(siteId, { required_amount, scheme_name, wait_days, opening_date, terms, enabled = true }, db = pool) {
   await ensureDraw();
   const { rows } = await db.query(
-    `INSERT INTO project_settings (site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO project_settings (site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms, draw_enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (site_id) DO UPDATE
        SET draw_required_amount = EXCLUDED.draw_required_amount,
            draw_scheme_name = EXCLUDED.draw_scheme_name,
            draw_wait_days = EXCLUDED.draw_wait_days,
            draw_opening_date = EXCLUDED.draw_opening_date,
            draw_terms = EXCLUDED.draw_terms,
+           draw_enabled = EXCLUDED.draw_enabled,
            updated_at = now()
-     RETURNING site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms, updated_at`,
-    [siteId, required_amount, scheme_name ?? null, wait_days, opening_date || null, terms]
+     RETURNING site_id, draw_required_amount, draw_scheme_name, draw_wait_days, draw_opening_date, draw_terms, draw_enabled, updated_at`,
+    [siteId, required_amount, scheme_name ?? null, wait_days, opening_date || null, terms, enabled]
   );
   return rows[0];
 }

@@ -1,5 +1,6 @@
 import express from 'express';
 import authRoutes from './auth.routes.js';
+import clientPortalRoutes from './clientPortal.routes.js';
 import bookingRoutes from './booking.routes.js';
 import lookupRoutes from './lookups.routes.js';
 import kycRoutes from './kyc.routes.js';
@@ -9,6 +10,7 @@ import agentRoutes from './agent.routes.js';
 import teamRoutes from './team.routes.js';
 import adminRoutes from './admin.routes.js';
 import homeLayoutRoutes from './homeLayout.routes.js';
+import sidebarLayoutRoutes from './sidebarLayout.routes.js';
 import drawRoutes from './draw.routes.js';
 import applicationFormRoutes from './applicationForm.routes.js';
 import agreementTemplateRoutes from './agreementTemplate.routes.js';
@@ -31,6 +33,8 @@ router.use('/public/website', publicWebsiteRoutes);
 router.use('/website-management', websiteManagementRoutes);
 
 router.use('/auth', authRoutes);
+router.use('/client-portal', clientPortalRoutes);
+router.use('/sidebar-layout', sidebarLayoutRoutes); // Shared order across all staff and sites
 router.use('/bookings', bookingRoutes);
 router.use('/', lookupRoutes);   // /clients/search, /clients, /clients/:id, /plots/available
 router.use('/kyc', kycRoutes);

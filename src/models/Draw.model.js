@@ -6,6 +6,18 @@ class DrawModel extends MasterModel {
     super('draw_registrations');
   }
 
+  /** Includes legacy rows without keys; the member index bounds this lookup. */
+  async findActiveEnrollment({ siteId, clientMemberId, key, name, excludeId = null }, db) {
+    const { rows } = await db.query(`
+      SELECT id, registration_no, agent_user_id, created_by FROM draw_registrations
+      WHERE site_id = $1 AND client_member_id = $2 AND status <> 'CANCELLED'
+        AND (enrollment_key = $3 OR (enrollment_key IS NULL
+          AND upper(regexp_replace(btrim(COALESCE(scheme_name, '')), '\\s+', ' ', 'g')) = $4))
+        AND ($5::integer IS NULL OR id <> $5)
+      ORDER BY id DESC LIMIT 1`, [siteId, clientMemberId, key, (name || '').toUpperCase(), excludeId]);
+    return rows[0] || null;
+  }
+
   /**
    * The customer's KYC case for a registration: the linked r.kyc_case_id when it
    * still exists; legacy rows fall back to the member's newest case. New intake
@@ -68,6 +80,12 @@ class DrawModel extends MasterModel {
 
   /** Bounded workflow queue: scoped counts and one page, never all customer dossiers. */
   async workflow({ siteId, q = '', stage, page = 1, visibleUserIds }, db) {
+    const { rows: websiteTables } = await db.query("SELECT to_regclass('public.website_booking_requests') IS NOT NULL AS has_website_requests");
+    const bookingMethod = websiteTables[0]?.has_website_requests
+      ? `CASE WHEN EXISTS (SELECT 1 FROM website_booking_requests w
+          WHERE w.booking_id = r.booking_id AND w.site_id = r.site_id AND w.status = 'APPROVED')
+          THEN 'WEBSITE' ELSE 'DIRECT' END`
+      : "'DIRECT'::text";
     const params = [siteId];
     const where = ['r.site_id = $1'];
     if (Array.isArray(visibleUserIds)) {
@@ -76,28 +94,39 @@ class DrawModel extends MasterModel {
     }
     if (q) {
       params.push(`%${q.slice(0, 100)}%`);
-      where.push(`(m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR r.registration_no ILIKE $${params.length} OR r.slip_no ILIKE $${params.length})`);
+      where.push(`(m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR r.registration_no ILIKE $${params.length} OR r.slip_no ILIKE $${params.length} OR r.scheme_name ILIKE $${params.length})`);
     }
     const cte = `WITH queue AS (
-      SELECT r.id, r.registration_no, r.slip_no, r.status, r.required_amount,
+      SELECT r.id, r.registration_no, r.slip_no, r.status, r.required_amount, r.scheme_name,
         r.draw_opening_date, r.booking_id, r.created_at,
+        ${bookingMethod} AS booking_method,
+        COALESCE(NULLIF(BTRIM(broker_member.full_name), ''),
+          NULLIF(BTRIM(registration_broker.name), ''), NULLIF(BTRIM(booking_broker.name), '')) AS broker_name,
         m.full_name AS client_name, m.phone AS client_phone,
-        kyc.status AS kyc_status, COALESCE(pay.total_paid, 0)::float AS total_paid,
+        kyc.status AS kyc_status, COALESCE(pay.total_paid, 0) AS total_paid,
         ${WORKFLOW_STAGE_SQL} AS stage
       FROM draw_registrations r
       JOIN members m ON m.id = r.client_member_id
+      LEFT JOIN bookings b ON b.id = r.booking_id AND b.site_id = r.site_id
+      LEFT JOIN members broker_member ON broker_member.id = b.booking_agent_id AND broker_member.site_id = r.site_id
+      LEFT JOIN users registration_broker ON registration_broker.id = r.agent_user_id
+      LEFT JOIN users booking_broker ON booking_broker.id = b.agent_user_id
       LEFT JOIN LATERAL (${this.kycCaseLateral}) kyc ON true
       LEFT JOIN LATERAL (SELECT SUM(amount) AS total_paid FROM draw_payments WHERE draw_registration_id = r.id) pay ON true
       WHERE ${where.join(' AND ')}
     )`;
     const values = [...params, stage || null, 25, (page - 1) * 25];
     const n = params.length;
-    const { rows } = await db.query(`${cte}
-      SELECT (SELECT COALESCE(json_agg(items), '[]'::json) FROM (
+    const { rows } = await db.query(`${cte}, filtered AS (
         SELECT * FROM queue WHERE ($${n + 1}::text IS NULL OR stage = $${n + 1})
+      )
+      SELECT (SELECT COALESCE(json_agg(items), '[]'::json) FROM (
+        SELECT * FROM filtered
         ORDER BY created_at DESC, id DESC LIMIT $${n + 2} OFFSET $${n + 3}
       ) items) AS items,
-      (SELECT count(*)::int FROM queue WHERE ($${n + 1}::text IS NULL OR stage = $${n + 1})) AS total,
+      (SELECT count(*)::int FROM filtered) AS total,
+      (SELECT json_build_object('total_paid', COALESCE(SUM(total_paid), 0),
+        'required_amount', COALESCE(SUM(required_amount), 0)) FROM filtered) AS totals,
       (SELECT COALESCE(json_object_agg(stage, count), '{}'::json) FROM (SELECT stage, count(*)::int FROM queue GROUP BY stage) counts) AS counts`, values);
     return { ...rows[0], page, page_size: 25 };
   }

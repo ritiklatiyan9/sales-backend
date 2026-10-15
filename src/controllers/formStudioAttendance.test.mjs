@@ -18,7 +18,7 @@ const template={...seed,terms:'1. Registration. Read your application carefully.
 test('site templates and attendance use isolated PostgreSQL',async t=>{
  const f=await drawFixture();
  try {
-  await f.db.exec(`CREATE TABLE user_sites(user_id INTEGER,site_id INTEGER);CREATE TABLE user_permissions(user_id INTEGER,module TEXT,can_read BOOLEAN,can_write BOOLEAN,can_update BOOLEAN,can_delete BOOLEAN);INSERT INTO user_sites VALUES(2,1);`);
+  await f.db.exec(`CREATE TABLE IF NOT EXISTS user_sites(user_id INTEGER,site_id INTEGER);CREATE TABLE user_permissions(user_id INTEGER,module TEXT,can_read BOOLEAN,can_write BOOLEAN,can_update BOOLEAN,can_delete BOOLEAN);`);
   await migrateFormStudioAttendance(f.pool);await migrateFormStudioAttendance(f.pool);
   await call(setDrawSettings,{body:{site_id:1,required_amount:5000,wait_days:10}});
   const created=await call(createDraw,{body:{site_id:1,phone:'9876543210',full_name:'Test Applicant',request_key:'attendance-fixture'}});
@@ -27,6 +27,7 @@ test('site templates and attendance use isolated PostgreSQL',async t=>{
   await f.query(`UPDATE draw_registrations SET slip_no='SLIP-TEST-0001',qr_token='test-qr',status='SLIP_ISSUED',terms_snapshot='Original issued terms',draw_opening_date=$1 WHERE id=$2`,[date,drawId]);
   await t.test('validates uploaded references and design input',()=>{
    assert.equal(validateApplicationTemplate(template).brand_name,template.brand_name);
+   for (const image_height of [52,60,64,68]) assert.equal(validateApplicationTemplate({...template,image_height}).image_height,image_height);
    assert.throws(()=>validateApplicationTemplate({...template,commercial_image:'javascript:alert(1)'}));
    assert.throws(()=>validateApplicationTemplate({...template,heading_font:'unknown'}));
    assert.throws(()=>validateApplicationTemplate({...template,terms:'x'.repeat(4501)}));

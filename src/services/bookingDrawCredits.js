@@ -13,10 +13,12 @@ export async function ensureBookingCreditFields(db = pool) {
 
 export async function listBookingDrawCredits(siteId, memberId, db = pool) {
   const { rows } = await db.query(`
-    SELECT r.id, r.registration_no, r.slip_no, r.status, r.is_winner, r.booking_id,
-           r.draw_opening_date, r.workflow_version, r.required_amount, kyc.status AS kyc_status,
+    SELECT r.id, r.site_id, r.client_member_id, r.scheme_name, r.registration_no, r.slip_no, r.status, r.is_winner, r.booking_id,
+           r.draw_opening_date, r.created_at, r.notes, r.workflow_version, r.required_amount,
+           kyc.id AS kyc_case_id, kyc.status AS kyc_status, au.name AS agent_name, au.referral_code AS agent_referral_code,
            COALESCE(pay.total_paid,0)::float AS total_paid, COALESCE(pay.payments,'[]'::json) AS payments
     FROM draw_registrations r
+    LEFT JOIN users au ON au.id = r.agent_user_id
     LEFT JOIN LATERAL (${drawModel.kycCaseLateral}) kyc ON true
     LEFT JOIN LATERAL (
       SELECT SUM(p.amount) AS total_paid, json_agg(json_build_object(

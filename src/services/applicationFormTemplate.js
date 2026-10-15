@@ -24,7 +24,7 @@ export function validateApplicationTemplate(input) {
   if (!/^#[0-9a-fA-F]{6}$/.test(input.accent_color || '')) throw workflowError('Choose a valid accent colour');
   if (!['Georgia', 'Times New Roman', 'Arial'].includes(input.heading_font)) throw workflowError('Choose a supported heading font');
   if (!['Arial', 'Helvetica Neue', 'Georgia'].includes(input.body_font)) throw workflowError('Choose a supported body font');
-  if (![80, 90, 96, 105].includes(Number(input.image_height))) throw workflowError('Choose a supported artwork height');
+  if (![52, 60, 64, 68, 80, 90, 96, 105].includes(Number(input.image_height))) throw workflowError('Choose a supported artwork height');
   if (!Array.isArray(input.features) || input.features.length > 4) throw workflowError('Use up to four commercial highlights');
   out.features = input.features.map(feature => {
     if (!feature || typeof feature.title !== 'string' || feature.title.length > 80 || typeof feature.body !== 'string' || feature.body.length > 300) throw workflowError('Each highlight needs a title (80 characters) and description (300 characters)');

@@ -1,8 +1,66 @@
-# Booking API — website booking integration
+# Booking API
+
+## Client registration, staff profile and named draws
+
+Run `npm run migrate:client-flow` before starting this version. The repeatable migrations 029–033 add private staff and client credential tables, explicit KYC identity links, lookup indexes, a normalized mobile duplicate guard, and named-draw enrollment protection. Existing members, KYC, draw history and financial entries are retained. Sub-admins and agents use assigned sites; Admin and Super Admin retain access to all sites.
+
+The Booking sidebar has **Clients** (`/clients`) for every authenticated site user. Register a name and Indian mobile number; optionally add PAN, Aadhaar, supporting Aadhaar front/back and PAN files, and an agent referral code. Uploaded identity files can fill blank fields through OCR before registration; users review the extracted details before saving. A client photo can be captured with the camera or uploaded. Registration creates or reuses the shared Accounting CLIENT and an accessible KYC case. Reusing a phone preserves the existing name and referring agent, fills missing identifiers/contact details, and rejects conflicting PAN/Aadhaar or referral claims. Registered details prefill KYC; documents and photos use the existing KYC storage and are not automatically marked verified.
+
+**New Booking** (`/bookings/new`) starts with registered-client mobile lookup. Select the person and enter a draw name/code such as A1 or B5, then continue into the existing payment, KYC, slip, physical result and allotment workflow. A client can have separate entries in multiple named draws. Retries reuse the request; a second active entry for the same normalized draw name returns `409 DRAW_ALREADY_ENROLLED`. Cancelling an entry permits a new enrollment. Staff can switch to Direct booking.
+
+**My Profile** (`/profile`) updates name, email, mobile and password. Super Admin, Admin and Sub-Admin can sign in with registered email/password or phone/password. Staff may enroll Aadhaar as an initial phone password from Profile using their current password. The existing users table has no trusted Aadhaar field/link, so existing staff must enroll it once rather than borrowing a client’s KYC identity. Aadhaar is hashed in `booking_staff_identities`, never returned as plain text. A new custom password replaces the initial Aadhaar password and works with both email and phone. Sensitive profile changes revoke old access/refresh tokens and OTP challenges while issuing replacement tokens to the current browser. An Accounting password change also disables an older Aadhaar credential.
+
+New/extended APIs:
+
+- `POST /auth/login`: `{identifier,password}`; legacy `{email,password}` remains accepted.
+- `PATCH /auth/profile`: own `{name,email,phone,current_password,new_password,aadhaar_number}`; send only fields being changed. Role/permission changes are rejected.
+- `GET /clients?site_id=&q=&page=&limit=`: paginated directory with masked PAN/Aadhaar and grouped draw counts. Search uses indexed name/mobile prefixes.
+- `POST /clients`: `{site_id,full_name,phone,pan_no?,aadhar_no?,agent_referral_code?,father_name?,date_of_birth?,gender?,address?,city?,state?,pincode?,registration:true}`.
+- `POST /clients/identity/preview`: multipart `file`, `site_id`, and `type` (`AADHAAR` or `PAN`). Site-authorized OCR preview, limited to 10 MB PDF/JPG/PNG/WebP, with normalized `member_fields` and a short-lived `preview_key`. No client or KYC record is created by a preview.
+- `POST /clients/:id/documents`: multipart `file`, `type` (`AADHAAR`, `PAN`, `PHOTO`, `OTHER`), optional `member_document_field`, and optional `preview_key`; `GET` lists accessible documents with view URLs. A preview is reused only for the same actor, site, type and file bytes within 10 minutes. Photos allow JPG/PNG/WebP up to 5 MB and also update the shared client photo.
+- `POST /draws`: existing contract with registered `client_member_id`, `scheme_name`, and a stable `request_key`.
+
+Validation: `npm run test:client-flow` in both Booking repositories; `npm run test:booking-workflow` in this backend; `npm run build:booking` in the frontend. Database tests run on isolated PostgreSQL and do not create live clients, staff credentials, payments or draw entries.
+
+## Shared sidebar
+
+Clients has its own `booking_clients` entry in Access Control. Directory reads require View; client registration, identity preview and intake attachments require View and Create. Existing accounts with no stored Clients permission retain access. Shared client search/detail lookups stay available to permitted booking, draw and KYC flows.
+
+Run `npm run migrate:shared-sidebar` to add the singleton `booking_sidebar_layout` setting. Every authenticated staff user reads the same order from `GET /sidebar-layout`; only current Admin and Super Admin roles may save with `PUT /sidebar-layout` and `{layout,revision}`. Each of the fixed sections and menu route keys must occur exactly once. Writes use the revision as an atomic comparison and return `409 SIDEBAR_LAYOUT_CONFLICT` if another administrator saved first. Re-running the migration preserves the saved order. This setting has no site/user filter and does not change module permissions or site assignments.
+
+The desktop sidebar and phone drawer have local menu search, Enter to open the first result, Escape to clear, and Ctrl/Command+K to focus search. Admins choose **Arrange**, drag the grip (or use Space/arrow keys or move buttons), then **Save for all users**. Items can move between sections. **Default order** changes only the draft until saved; Cancel discards the draft. Active windows refresh the global order within 30 seconds and when focused. New modules are reconciled into existing layouts. Validate with `npm run test:sidebar` in both Booking repositories.
+
+## Site draw availability and agreement access
+
+Run `npm run migrate:site-draw-enabled` for the additive `project_settings.draw_enabled` setting. `GET /draws/settings?site_id=` returns `enabled` and `configured` independently; draw initiation is available only when both are true. Admin/Super Admin can save the boolean `enabled` through `PUT /draws/settings`. Existing configured sites remain enabled by default. Omitting `enabled` when saving older clients preserves the stored value. Disabling blocks new `POST /draws` enrollments with `409 DRAW_DISABLED`; existing registrations, payments and issued documents retain their usual access. Settings reads enforce assigned-site access for agents and sub-admins. Validate with `npm run test:site-draw-enabled`.
+
+Agreement template reads require a View grant for `booking_agreements` or `booking_agreement_studio`, plus site access. A print-only reader does not receive studio modification rights. Admin roles retain their existing bypass. Validate with `npm run test:agreement-templates`.
+
+## Application form duplex printing
+
+Application Form Studio and issued forms use four A4 faces in sequence: applicant, terms, commercial, and slip/token. Print all four pages, one page per side, double-sided with **long-edge flip**, **100% / actual size**, and browser headers/footers disabled. Pages 1/2 share sheet 1; pages 3/4 share sheet 2. The page 4 token cut is fixed at 216 mm from the top. Page 3 has no content from 211 mm down, including its footer, leaving a 5 mm alignment allowance behind the cut. The shaded reserve is a studio guide and does not print. Publishing and the print button check the reserved area and reject overflowing content.
+
+Mount Valley Residency / Unn Commercial has separate ₹1,00,000 non-refundable earnest-money and 30% of total collected plot-cancellation clauses. The reviewed copy can be previewed with `node src/scripts/update_mount_valley_terms.js`; applying it requires `--apply --revision=<reviewed revision>` and saves a private backup. It changes only this site's draft/published template and future issue terms; recorded `terms_snapshot` values are retained. `npm run test:form-studio-attendance` covers the template workflow and policy copy; frontend `npm run test:form-studio` covers four-page order and reserved-area overflow.
+
+## Private client dashboard and KYC identity links
+
+**Client login is currently disabled.** `CLIENT_PORTAL_ENABLED` defaults to false and is set to false in the local environment. Client phone sign-in, refresh, and every client portal API return no client access, including requests with previously issued client tokens. Staff and linked broker login remain available. The Clients staff page uses a directory-first phone layout with Clients/Register tabs, document reading, camera/upload controls and a sticky save action.
+
+The retained client portal is available only if explicitly enabled with `CLIENT_PORTAL_ENABLED=true`. In that mode, verified CLIENT members can sign in at `/login` using their KYC mobile and Aadhaar. First successful sign-in creates a private `booking_client_accounts` entry and links only verified CLIENT records with the same normalized mobile and exact Aadhaar. It never creates or modifies a shared staff `users` account. Clients land at `/client-portal`, which has their own bookings, draw entries, payments, masked KYC details, documents and password change.
+
+Client JWTs use a distinct issuer, audience and purpose-specific keys derived from `CLIENT_PORTAL_SECRET`. Accounting and Booking staff APIs reject these tokens. Client refresh is at `/client-portal/auth/refresh`; ownership is resolved from private account/member links on every request. Record IDs or client-supplied site/member filters cannot grant access. Payment visibility uses owned booking token references and owned draw payments; historical plot ownership never exposes another buyer’s ledger. Documents stream through an authenticated ownership check. Password changes and logout revoke client sessions; the old Aadhaar cannot restore a chosen custom password.
+
+Set independent random `CLIENT_PORTAL_SECRET` and `CLIENT_PORTAL_IDENTITY_SECRET` values in the backend environment. Keep the identity key stable when rotating signing keys; it protects identity matching without storing raw Aadhaar in the account table. Never expose these through frontend variables.
+
+Staff phone login remains limited to Super Admin, Admin, Sub-Admin and `agent` users explicitly linked to a verified BROKER member. An operator/referrer is never assumed to be the KYC subject. **Link staff login** on a KYC page requires an authorized Admin/Super Admin, explicit account selection and the actor’s current password. Initial Sub-Admin and broker links require this confirmation. Linked profiles display imported mobile, source KYC and masked Aadhaar. Ordinary OCR/KYC edits cannot silently reset account credentials.
+
+`npm run migrate:client-flow` includes all required migrations. Run `npm run test:client-portal` and `npm run test:kyc-login` for isolated ownership, credential and token-isolation checks. No test signs into a real customer’s account or creates live financial rows.
+
+## Website inventory
 
 The River Green website reads OM ASSOCIATES inventory from the existing shared PostgreSQL database. `WEBSITE_SITE_ID` explicitly selects the project; no public request can select another site. The website's existing geometry has 200 identities (A, B, C and S units); H units and A-44 are outside that geometry. Leading zeroes, spaces and hyphens normalize to those identities. Duplicate identities are `UNKNOWN`, cannot be purchased, and appear in Website Management diagnostics so staff can resolve the accounting records.
 
-## Local setup
+## Website booking setup
 
 1. Keep the Razorpay key id and secret in this backend's ignored `.env` as `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`. Add a stable random `WEBSITE_REQUEST_TOKEN_SECRET`. Never use a `VITE_` variable for secrets.
 2. Set `WEBSITE_SITE_ID=5` for the confirmed OM ASSOCIATES project.

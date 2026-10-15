@@ -219,7 +219,7 @@ class KycCaseModel extends MasterModel {
              m.id AS account_member_id,
              m.full_name AS client_name, m.phone AS client_phone, m.email AS client_email,
              m.photo AS client_photo, m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
-             m.father_name AS client_father, m.date_of_birth AS client_dob,
+             m.father_name AS client_father, m.date_of_birth AS client_dob, m.gender AS client_gender,
              m.address AS client_address, m.city AS client_city, m.state AS client_state,
              m.pincode AS client_pincode,
              m.co_applicant_name AS client_co_applicant_name,

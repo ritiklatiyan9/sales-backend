@@ -16,6 +16,14 @@ import {
   memberTypePayload,
 } from '../services/memberRoles.service.js';
 import { websitePaymentForBooking } from '../services/websitePlotGuard.js';
+import { clientIdentityIntake } from '../services/clientIdentityIntake.service.js';
+import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
+import { hasPermission } from '../services/permissions.service.js';
+import {
+  clientRegistryError, clientSearchFilter, maskClientIdentity, memberPhoneSql,
+  normalizeClientIdentity, normalizeClientPhone, registerClientMember, resolveClientReferral,
+} from '../services/clientRegistry.service.js';
+import { uploadDocument } from './kyc.controller.js';
 
 // Token-payment capture fields a booking may set (mirror of the accounting plot-payment
 // taking fields). Stored on the booking and propagated to plot_payments by tokenPaymentSync.
@@ -266,8 +274,36 @@ export const getBookingDrawCredits = asyncHandler(async (req, res) => {
   const siteId = Number(req.query.site_id);
   const memberId = Number(req.query.client_member_id);
   if (!Number.isInteger(siteId) || siteId <= 0 || !Number.isInteger(memberId) || memberId <= 0) return res.status(400).json({ message: 'Valid site_id and client_member_id are required' });
+  await requireSiteAccess(req.user, siteId);
   const credits = await listBookingDrawCredits(siteId, memberId);
   res.json(['admin', 'super_admin'].includes(req.user?.role) ? credits : credits.map(r => r.eligible ? { ...r, eligible: false, reason: 'An admin or super admin must apply draw payments during allotment' } : r));
+});
+
+/** One selected-client fetch hydrates the booking form and its draw dropdown. */
+export const getBookingIntake = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Only admins can prepare property bookings' });
+  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const memberId = Number(req.query.client_member_id);
+  if (!Number.isInteger(memberId) || memberId <= 0) return res.status(400).json({ message: 'Select a valid registered client' });
+  const { rows } = await pool.query(`
+    SELECT m.*, u.name AS referred_by_name, u.referral_code AS referred_by_code,
+           k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
+    FROM members m
+    LEFT JOIN users u ON u.id = m.referred_by_user_id
+    LEFT JOIN LATERAL (
+      SELECT kc.id, kc.status, (kc.booking_id IS NULL OR b.status = 'CANCELLED') AS attachable FROM kyc_cases kc
+      LEFT JOIN bookings b ON b.id = kc.booking_id
+      WHERE kc.client_member_id = m.id AND kc.site_id = m.site_id
+      ORDER BY (kc.booking_id IS NULL OR b.status = 'CANCELLED') DESC,
+               (kc.status = 'VERIFIED') DESC, kc.id DESC LIMIT 1
+    ) k ON true
+    WHERE m.id = $1 AND m.site_id = $2 AND m.member_type = 'CLIENT'`, [memberId, site.id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Client not found at the selected site' });
+  const credits = await listBookingDrawCredits(site.id, memberId);
+  const draws = ['admin', 'super_admin'].includes(req.user.role) ? credits : credits.map(draw => draw.eligible
+    ? { ...draw, eligible: false, reason: 'An admin or super admin must apply draw payments during allotment' } : draw);
+  res.set?.('Cache-Control', 'private, no-store');
+  res.json({ client: { ...rows[0], ...memberTypePayload(rows[0]) }, draws });
 });
 
 /** POST /bookings — admin roles only (agents do KYC; they never create bookings). */
@@ -285,6 +321,7 @@ export const createBooking = asyncHandler(async (req, res) => {
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
   if (!client_member_id) return res.status(400).json({ message: 'client_member_id is required' });
 
+  await requireSiteAccess(req.user, site_id);
   await ensureBookingCreditFields();
   if (req.body.draw_registration_id != null) {
     const result = await allotDrawBooking({ registrationId: req.body.draw_registration_id, body: req.body, user: req.user });
@@ -536,50 +573,111 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   });
 });
 
-/** GET /clients/search?site_id=&q=&member_type= — searches shared Accounting members.
- * Includes the referring agent (who added the number) + the latest KYC case status so
- * the booking form can show "KYC verified · referred by AGT-XXXXX" on selection. */
+// Identity lookups are shared within an authorised site. Case/documents retain
+// their separate network ownership; list/search never expose complete KYC IDs.
+const clientLookupSelect = `
+  SELECT m.id, m.site_id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no,
+         m.photo, m.occupation, m.father_name, m.created_at,
+         m.member_type, m.member_type AS registration_role, m.member_type AS role,
+         u.name AS referred_by_name, u.referral_code AS referred_by_code,
+         u.name AS referral_agent_name, u.referral_code,
+         k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
+    FROM members m
+    LEFT JOIN users u ON u.id = m.referred_by_user_id
+    LEFT JOIN LATERAL (
+      SELECT kc.id, kc.status, (kc.booking_id IS NULL OR b.status = 'CANCELLED') AS attachable
+        FROM kyc_cases kc LEFT JOIN bookings b ON b.id = kc.booking_id
+       WHERE kc.client_member_id = m.id AND kc.site_id = m.site_id
+       ORDER BY (kc.booking_id IS NULL OR b.status = 'CANCELLED') DESC,
+                (kc.status = 'VERIFIED') DESC, kc.id DESC LIMIT 1
+    ) k ON true`;
+
 export const searchClients = asyncHandler(async (req, res) => {
-  const { site_id, q } = req.query;
+  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const params = [site.id];
+  const where = ['m.site_id = $1'];
   const memberType = memberTypeFilterFromQuery(req.query);
-  const params = [];
-  const where = [];
-  if (site_id) { params.push(site_id); where.push(`m.site_id = $${params.length}`); }
   if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
-  if (q) {
-    params.push(`%${q}%`);
-    where.push(`(m.full_name ILIKE $${params.length}
-                 OR m.phone ILIKE $${params.length}
-                 OR m.aadhar_no ILIKE $${params.length}
-                 OR m.pan_no ILIKE $${params.length}
-                 OR m.member_type ILIKE $${params.length})`);
+  const phoneOnly = ['true', '1', 'yes'].includes(String(req.query.phone_only || '').toLowerCase());
+  if (phoneOnly) {
+    const search = clientSearchFilter(req.query.q, params);
+    if (search) where.push(search);
+  } else {
+    // Retain the shared Members/KYC picker contract. The dedicated phone-only
+    // picker and /clients directory use indexed prefixes; older general lookups
+    // also need partial names, identity numbers and accounting member roles.
+    const q = String(req.query.q || '').trim().slice(0, 120);
+    if (q) {
+      params.push(`%${q.replace(/[\\%_]/g, '\\$&')}%`);
+      const parameter = `$${params.length}`;
+      const matches = ['full_name', 'phone', 'aadhar_no', 'pan_no', 'member_type']
+        .map(field => `m.${field} ILIKE ${parameter}`);
+      if (/^[+\d\s().-]+$/.test(q)) {
+        let digits = q.replace(/\D/g, '');
+        if ((digits.length === 12 && digits.startsWith('91')) || (digits.length === 11 && digits.startsWith('0'))) digits = digits.slice(-10);
+        if (digits) {
+          params.push(`%${digits}%`);
+          matches.push(`${memberPhoneSql()} LIKE $${params.length}`);
+        }
+      }
+      where.push(`(${matches.join(' OR ')})`);
+    }
   }
-  const whereSql = where.length ? where.join(' AND ') : 'true';
-  // The LATERAL prefers the case a NEW booking would adopt (booking-less, or stranded
-  // on a CANCELLED booking) so kyc_attachable tells the form whether "documents attach
-  // automatically" is actually true; otherwise it falls back to the member's strongest
-  // case for display.
-  const { rows } = await pool.query(
-    `SELECT m.id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no, m.photo, m.occupation, m.father_name,
-            m.member_type, m.member_type AS registration_role, m.member_type AS role,
-            u.name AS referred_by_name, u.referral_code AS referred_by_code,
-            k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
-     FROM members m
-     LEFT JOIN users u ON u.id = m.referred_by_user_id
-     LEFT JOIN LATERAL (
-       SELECT kc.id, kc.status,
-              (kc.booking_id IS NULL OR b.status = 'CANCELLED') AS attachable
-         FROM kyc_cases kc
-         LEFT JOIN bookings b ON b.id = kc.booking_id
-        WHERE kc.client_member_id = m.id
-        ORDER BY (kc.booking_id IS NULL OR b.status = 'CANCELLED') DESC,
-                 (kc.status = 'VERIFIED') DESC, kc.id DESC
-        LIMIT 1
-     ) k ON true
-     WHERE ${whereSql} ORDER BY m.full_name ASC LIMIT 100`,
-    params
-  );
-  res.json(rows);
+  const limit = Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || (phoneOnly ? 25 : 100))));
+  params.push(limit);
+  const { rows } = await pool.query(`${clientLookupSelect}
+    WHERE ${where.join(' AND ')} ORDER BY m.full_name, m.id DESC LIMIT $${params.length}`, params);
+  res.json(rows.map(maskClientIdentity));
+});
+
+/** GET /clients?site_id=&q=&page=&limit= — bounded reusable client directory. */
+const requireClientRegistryPermission = async (user, action = 'can_read') => {
+  const flags = action === 'can_read' ? ['can_read'] : ['can_read', action];
+  const allowed = await Promise.all(flags.map(flag => hasPermission(user, 'booking_clients', flag)));
+  if (allowed.some(value => !value)) throw clientRegistryError('Access Control has not granted this Clients action for your account', 403);
+};
+
+export const listClients = asyncHandler(async (req, res) => {
+  await requireClientRegistryPermission(req.user);
+  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const params = [site.id];
+  const where = ['m.site_id = $1'];
+  const memberType = memberTypeFilterFromQuery({ member_type: 'CLIENT', ...req.query });
+  if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
+  const search = clientSearchFilter(req.query.q, params);
+  if (search) where.push(search);
+  const page = Math.max(1, Math.trunc(Number(req.query.page) || 1));
+  const limit = Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || 25)));
+  const whereSql = where.join(' AND ');
+  const [count, records] = await Promise.all([
+    pool.query(`SELECT count(*)::int AS total FROM members m WHERE ${whereSql}`, params),
+    pool.query(`WITH selected AS (
+      SELECT m.id FROM members m WHERE ${whereSql}
+      ORDER BY m.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    ) ${clientLookupSelect}
+      JOIN selected selected_member ON selected_member.id = m.id
+      ORDER BY m.id DESC`, [...params, limit, (page - 1) * limit]),
+  ]);
+  const memberIds = records.rows.map((member) => member.id);
+  // A single grouped count for this page, rather than a query per member.
+  const counts = memberIds.length ? await pool.query(
+    `SELECT client_member_id, count(*)::int AS draw_count FROM draw_registrations
+      WHERE site_id = $1 AND client_member_id = ANY($2::int[])
+      GROUP BY client_member_id`, [site.id, memberIds],
+  ) : { rows: [] };
+  const drawCounts = new Map(counts.rows.map((row) => [Number(row.client_member_id), row.draw_count]));
+  const total = count.rows[0].total;
+  res.json({
+    items: records.rows.map((member) => maskClientIdentity({ ...member, draw_count: drawCounts.get(Number(member.id)) || 0 })),
+    total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
+  });
+});
+
+export const lookupClientReferral = asyncHandler(async (req, res) => {
+  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const code = req.query.code || req.params.code;
+  if (!code) throw clientRegistryError('Agent referral code is required');
+  res.json(await resolveClientReferral(code, site.id, pool));
 });
 
 /**
@@ -589,6 +687,7 @@ export const searchClients = asyncHandler(async (req, res) => {
  */
 export const searchAgents = asyncHandler(async (req, res) => {
   const { site_id, q } = req.query;
+  await requireSiteAccess(req.user, site_id);
   const params = [];
   const where = [`member_type NOT IN ('CLIENT','FARMER','VENDOR')`];
   if (site_id) { params.push(site_id); where.push(`site_id = $${params.length}`); }
@@ -607,144 +706,154 @@ export const searchAgents = asyncHandler(async (req, res) => {
 });
 
 /** GET /clients/:id — full shared Accounting member record (legacy route name). */
+const requireClientMember = async (user, id, db = pool) => {
+  const memberId = Number(id);
+  if (!Number.isInteger(memberId) || memberId <= 0) throw clientRegistryError('Enter a valid client ID');
+  const { rows } = await db.query('SELECT * FROM members WHERE id = $1', [memberId]);
+  if (!rows[0]) throw clientRegistryError('Member not found', 404);
+  await requireSiteAccess(user, rows[0].site_id, db);
+  return rows[0];
+};
+
 export const getClient = asyncHandler(async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT m.*, m.member_type AS registration_role, m.member_type AS role
-       FROM members m WHERE m.id = $1`,
-    [req.params.id]
-  );
-  if (!rows[0]) return res.status(404).json({ message: 'Member not found' });
-  res.json(rows[0]);
+  const member = await requireClientMember(req.user, req.params.id);
+  const { rows } = await pool.query(`SELECT u.name, u.referral_code FROM users u WHERE u.id = $1`, [member.referred_by_user_id]);
+  res.json({ ...member, ...memberTypePayload(member), referred_by_name: rows[0]?.name || null,
+    referred_by_code: rows[0]?.referral_code || null, referral_agent_name: rows[0]?.name || null,
+    referral_code: rows[0]?.referral_code || null });
 });
 
-/**
- * POST /clients — role-aware registration directly in the shared Accounting members
- * table (legacy route name retained for existing frontends).
- */
+/** POST /clients — legacy role-aware create plus the reusable client register. */
 export const createClient = asyncHandler(async (req, res) => {
-  const siteId = Number(req.body?.site_id);
-  const fullName = String(req.body?.full_name || '').trim();
-  if (!Number.isInteger(siteId) || siteId <= 0 || !fullName) {
-    return res.status(400).json({ message: 'site_id and full_name are required' });
+  const memberInput = { ...req.body };
+  if (memberInput.gender) {
+    memberInput.gender = String(memberInput.gender).trim().toUpperCase();
+    if (!['MALE', 'FEMALE', 'OTHER'].includes(memberInput.gender)) throw clientRegistryError('gender must be MALE, FEMALE or OTHER');
   }
-  const memberType = memberTypeFromBody(req.body, 'CLIENT');
-  const memberInput = { ...req.body, full_name: fullName };
-  if (memberInput.gender !== undefined && memberInput.gender !== '' && memberInput.gender !== null) {
-    const gender = String(memberInput.gender).trim().toUpperCase();
-    if (!['MALE', 'FEMALE', 'OTHER'].includes(gender)) {
-      return res.status(400).json({ message: 'gender must be MALE, FEMALE or OTHER' });
-    }
-    memberInput.gender = gender;
-  }
-  const phoneDigits = String(memberInput.phone || '').replace(/\D/g, '');
-  if (memberInput.phone && (phoneDigits.length < 6 || phoneDigits.length > 15)) {
-    return res.status(400).json({ message: 'Enter a valid mobile number' });
-  }
-  if (phoneDigits) memberInput.phone = phoneDigits;
-
-  const cols = ['site_id', 'member_type', 'status', 'created_by'];
-  const vals = [siteId, memberType, 'ACTIVE', req.user?.id || null];
-  // A customer registered by an agent carries that agent as their referrer — bookings
-  // created later auto-attach the agent from this column.
-  if (!isAdminRole(req.user?.role)) {
-    cols.push('referred_by_user_id');
-    vals.push(req.user?.id || null);
-  }
-  for (const f of ACCOUNT_MEMBER_FIELDS) {
-    if (memberInput[f] !== undefined) { cols.push(f); vals.push(clean(memberInput[f])); }
-  }
+  const memberType = memberTypeFromBody(memberInput, 'CLIENT');
+  if (memberType === 'CLIENT') await requireClientRegistryPermission(req.user, 'can_write');
+  const visibleUserIds = await getVisibleUserIds(req.user);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    if (phoneDigits) {
-      await client.query(
-        'SELECT pg_advisory_xact_lock(hashtext($1))',
-        [`member_quick_add:${siteId}:${phoneDigits.slice(-10)}`]
-      );
-      const { rows: existingRows } = await client.query(
-        `SELECT * FROM members
-          WHERE site_id = $1
-            AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') <> ''
-            AND RIGHT(regexp_replace(COALESCE(phone, ''), '\\D', '', 'g'), 10) = RIGHT($2, 10)
-          ORDER BY id DESC LIMIT 1`,
-        [siteId, phoneDigits]
-      );
-      const existing = existingRows[0];
-      if (existing) {
-        if (existing.member_type !== memberType) {
-          throw Object.assign(
-            new Error(
-              `Mobile number ${phoneDigits} is already registered as ${existing.member_type} ` +
-              `for ${existing.full_name}. Select ${existing.member_type} or use another number.`
-            ),
-            {
-              status: 409,
-              code: 'MEMBER_ROLE_CONFLICT',
-              existing_member_id: existing.id,
-              existing_member_type: existing.member_type,
-            }
-          );
-        }
-        await client.query('COMMIT');
-        return res.status(200).json({
-          ...existing,
-          ...memberTypePayload(existing),
-          reused: true,
-        });
-      }
-    }
-
-    const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
-    const { rows } = await client.query(
-      `INSERT INTO members (${cols.join(', ')}) VALUES (${placeholders}) RETURNING *`,
-      vals
-    );
+    const member = await registerClientMember({ input: memberInput, memberType,
+      editableFields: ACCOUNT_MEMBER_FIELDS, user: req.user, visibleUserIds }, client);
     await client.query('COMMIT');
-    return res.status(201).json({
-      ...rows[0],
-      ...memberTypePayload(rows[0]),
-      reused: false,
-    });
+    res.status(member.reused ? 200 : 201).json(member);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
+    if (error.code === '23505' && error.constraint === 'members_site_phone_registry_uq') {
+      throw clientRegistryError('This mobile number is already registered at this site. Search for the existing client.', 409, 'CLIENT_PHONE_CONFLICT');
+    }
     throw error;
   } finally {
     client.release();
   }
 });
 
+export const previewClientIdentity = asyncHandler(async (req, res) => {
+  await requireClientRegistryPermission(req.user, 'can_write');
+  const result = await clientIdentityIntake.preview({ user: req.user, siteId: req.body?.site_id,
+    type: String(req.body?.type || '').toUpperCase(), file: req.file });
+  res.set('Cache-Control', 'private, no-store');
+  res.json(result);
+});
+
+/** Upload through the existing KYC/OCR pipeline, into a case this user can own. */
+export const uploadClientDocument = asyncHandler(async (req, res, next) => {
+  await requireClientRegistryPermission(req.user, 'can_write');
+  if (!req.file) throw clientRegistryError('Upload a supporting document in the file field');
+  const member = await requireClientMember(req.user, req.params.id);
+  const type = String(req.body?.type || 'OTHER').toUpperCase();
+  if (!['AADHAAR', 'PAN', 'OTHER', 'PHOTO'].includes(type)) throw clientRegistryError('Supporting document type must be AADHAAR, PAN, PHOTO or OTHER');
+  if (type === 'PHOTO' && (!['image/jpeg','image/png','image/webp'].includes(req.file.mimetype) || req.file.size > 5 * 1024 * 1024)) {
+    throw clientRegistryError('Use a JPG, PNG or WebP client photograph up to 5 MB');
+  }
+  req.clientIdentityOcrResult = clientIdentityIntake.cachedResult({ user: req.user, siteId: member.site_id,
+    type, file: req.file, previewKey: req.body.preview_key });
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  const client = await pool.connect();
+  let kyc;
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`client_registry_kyc:${member.id}:${req.user.id}`]);
+    kyc = await kycCaseModel.getOrCreateForMember({ memberId: member.id, siteId: member.site_id,
+      createdBy: req.user.id, visibleUserIds }, client);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
+  req.body = { ...req.body, type, kyc_case_id: kyc.id, booking_id: undefined };
+  uploadDocument(req, res, next);
+});
+
+/** List supporting documents only where the user's existing KYC ownership allows. */
+export const getClientDocuments = asyncHandler(async (req, res) => {
+  const member = await requireClientMember(req.user, req.params.id);
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  const params = [member.id, member.site_id];
+  let scope = '';
+  if (Array.isArray(visibleUserIds)) {
+    params.push(visibleUserIds);
+    scope = `AND (k.created_by = ANY($3::int[]) OR b.created_by = ANY($3::int[]) OR b.agent_user_id = ANY($3::int[])
+      OR EXISTS (SELECT 1 FROM draw_registrations r WHERE (r.kyc_case_id = k.id OR r.client_member_id = k.client_member_id)
+        AND (r.created_by = ANY($3::int[]) OR r.agent_user_id = ANY($3::int[]))))`;
+  }
+  const { rows } = await pool.query(`SELECT d.id, d.kyc_case_id, d.type, d.member_document_field,
+      d.mime_type, d.file_size, d.ocr_status, d.created_at, d.file_path
+    FROM documents d JOIN kyc_cases k ON k.id = d.kyc_case_id
+    LEFT JOIN bookings b ON b.id = k.booking_id
+    WHERE d.client_member_id = $1 AND d.site_id = $2 ${scope}
+    ORDER BY d.id DESC LIMIT 100`, params);
+  res.json(await Promise.all(rows.map(async ({ file_path, ...document }) => ({ ...document, file_url: await getKycDocumentUrl(file_path) }))));
+});
+
 /** PUT /clients/:id — update a shared member; admins may explicitly change its role. */
 export const updateClient = asyncHandler(async (req, res) => {
-  // members.gender has a DB CHECK (MALE/FEMALE/OTHER) — OCR/typed input arrives as
-  // "Male"; coerce or skip instead of failing the whole update.
-  if (req.body.gender !== undefined && req.body.gender !== '' && req.body.gender !== null) {
-    const g = String(req.body.gender).trim().toUpperCase();
-    if (['MALE', 'FEMALE', 'OTHER'].includes(g)) req.body.gender = g; else delete req.body.gender;
+  const member = await requireClientMember(req.user, req.params.id);
+  const input = normalizeClientIdentity(req.body || {});
+  if (input.phone !== undefined) input.phone = normalizeClientPhone(input.phone);
+  if (input.gender) {
+    input.gender = String(input.gender).trim().toUpperCase();
+    if (!['MALE', 'FEMALE', 'OTHER'].includes(input.gender)) throw clientRegistryError('gender must be MALE, FEMALE or OTHER');
+  }
+  if (input.full_name !== undefined) {
+    input.full_name = String(input.full_name || '').trim();
+    if (!input.full_name || input.full_name.length > 255) throw clientRegistryError('Enter a client name of at most 255 characters');
   }
   const sets = [];
   const vals = [];
-  for (const f of ACCOUNT_MEMBER_FIELDS) {
-    if (req.body[f] !== undefined) { vals.push(clean(req.body[f])); sets.push(`${f} = $${vals.length}`); }
+  for (const field of ACCOUNT_MEMBER_FIELDS) {
+    if (input[field] !== undefined) { vals.push(clean(input[field])); sets.push(`${field} = $${vals.length}`); }
   }
-  if (req.body.member_type !== undefined || req.body.registration_role !== undefined || req.body.applicant_role !== undefined) {
-    if (!isAdminRole(req.user?.role)) {
-      return res.status(403).json({ message: 'Only admins can change an existing member role' });
-    }
-    const updatedMemberType = memberTypeFromBody(req.body, null);
-    if (!updatedMemberType) return res.status(400).json({ message: 'member_type cannot be blank' });
-    vals.push(updatedMemberType);
+  if (input.member_type !== undefined || input.registration_role !== undefined || input.applicant_role !== undefined) {
+    if (!isAdminRole(req.user?.role)) throw clientRegistryError('Only admins can change an existing member role', 403);
+    const memberType = memberTypeFromBody(input, null);
+    if (!memberType) throw clientRegistryError('member_type cannot be blank');
+    vals.push(memberType);
     sets.push(`member_type = $${vals.length}`);
   }
-  if (!sets.length) return res.status(400).json({ message: 'No editable fields provided' });
-  sets.push('updated_at = now()');
-  vals.push(req.params.id);
-
-  const { rows } = await pool.query(
-    `UPDATE members SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`,
-    vals
-  );
-  if (!rows[0]) return res.status(404).json({ message: 'Member not found' });
-  res.json({ ...rows[0], ...memberTypePayload(rows[0]) });
+  if (!sets.length) throw clientRegistryError('No editable fields provided');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (input.phone) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`member_quick_add:${member.site_id}:${input.phone.slice(-10)}`]);
+      const duplicates = await client.query(`SELECT id FROM members m WHERE m.site_id = $1 AND m.id <> $2
+        AND ${memberPhoneSql()} = RIGHT($3, 10) LIMIT 1`, [member.site_id, member.id, input.phone]);
+      const currentPhone = String(member.phone || '').replace(/\D/g, '').slice(-10);
+      if (duplicates.rows.length && input.phone.slice(-10) !== currentPhone) throw clientRegistryError('This mobile number is already registered at this site', 409, 'CLIENT_PHONE_CONFLICT');
+    }
+    vals.push(member.id);
+    const { rows } = await client.query(`UPDATE members SET ${sets.join(', ')}, updated_at = now() WHERE id = $${vals.length} RETURNING *`, vals);
+    await client.query('COMMIT');
+    res.json({ ...rows[0], ...memberTypePayload(rows[0]) });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error.code === '23505' && error.constraint === 'members_site_phone_registry_uq') throw clientRegistryError('This mobile number is already registered at this site', 409, 'CLIENT_PHONE_CONFLICT');
+    throw error;
+  } finally { client.release(); }
 });
 
 /**
@@ -754,6 +863,7 @@ export const updateClient = asyncHandler(async (req, res) => {
  * Returns one row per transaction with plot/site labels, newest first.
  */
 export const getClientPayments = asyncHandler(async (req, res) => {
+  await requireClientMember(req.user, req.params.id);
   const { rows } = await pool.query(
     `SELECT pp.id, pp.plot_id, pp.site_id, pp.date, pp.amount,
             pp.payment_type, pp.payment_from, pp.bank_details, pp.bank_name, pp.branch,
@@ -792,11 +902,7 @@ export const uploadClientPhoto = asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
   const { id } = req.params;
-  const { rows: existing } = await pool.query(
-    'SELECT * FROM members WHERE id = $1',
-    [id]
-  );
-  if (!existing[0]) return res.status(404).json({ message: 'Member not found' });
+  await requireClientMember(req.user, id);
 
   const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
   const photoUrl = getPublicKycUrl(storageKey);

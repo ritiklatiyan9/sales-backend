@@ -356,6 +356,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         assert.equal(list.data.total, 1);
         assert.equal(list.data.counts.BOOKED, 1);
         assert.equal(list.data.items[0].stage, 'BOOKED');
+        assert.equal(list.data.items[0].booking_method, 'DIRECT');
         assert.equal(
           (
             await call(controller.listWorkflow, {
@@ -393,6 +394,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
             phone: '9876543210',
             full_name: 'Asha Test',
             request_key: 'registration-test-002',
+            scheme_name: 'Repeat draw B5',
           },
         });
         assert.equal(second.status, 201);
@@ -472,6 +474,9 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
       async () => {
         await fixture.query(`INSERT INTO draw_registrations (site_id, client_member_id, registration_no, required_amount, qr_token, created_by, workflow_version)
         SELECT 1, 1, 'TEST-' || n, 5000, 'pagination-token-' || n, 1, 1 FROM generate_series(1, 27) n`);
+        await fixture.query(`INSERT INTO draw_payments(draw_registration_id, amount)
+          SELECT id, CASE registration_no WHEN 'TEST-1' THEN 100.25 ELSE 200.50 END
+          FROM draw_registrations WHERE registration_no IN ('TEST-1', 'TEST-27')`);
         const page1 = await call(controller.listWorkflow, {
           query: { site_id: 1, stage: 'PAYMENT', page: 1 },
         });
@@ -481,6 +486,10 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         assert.equal(page1.data.total, 27);
         assert.equal(page1.data.items.length, 25);
         assert.equal(page2.data.items.length, 2);
+        assert.deepEqual(page1.data.totals, { total_paid: 300.75, required_amount: 135000 });
+        assert.deepEqual(page2.data.totals, page1.data.totals, 'footer totals must stay constant across pages');
+        const searched = await call(controller.listWorkflow, { query: { site_id: 1, stage: 'PAYMENT', q: 'TEST-27' } });
+        assert.deepEqual(searched.data.totals, { total_paid: 200.5, required_amount: 5000 }, 'search and stage filter apply to footer totals');
         assert.equal(
           new Set(
             [...page1.data.items, ...page2.data.items].map((row) => row.id),

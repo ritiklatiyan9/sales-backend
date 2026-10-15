@@ -14,13 +14,13 @@ import { isAdminRole, logActivity } from '../services/agentNetwork.service.js';
 
 // Booking-app sidebar modules — keep keys in sync with booking-ui Layout.jsx.
 export const BOOKING_MODULES = [
-  'booking_dashboard', 'booking_bookings', 'booking_new_booking', 'booking_members',
+  'booking_dashboard', 'booking_clients', 'booking_bookings', 'booking_new_booking', 'booking_members',
   'booking_kyc_new', 'booking_kyc_all',
   'booking_plot_documents', 'booking_agreements', 'booking_network', 'booking_teams',
   'booking_company_details', 'booking_payment_details',
   'booking_new_entry', 'booking_draws', 'booking_form_studio', 'booking_document_studio', 'booking_draw_attendance',
   'booking_agreement_studio',
-  'booking_website_management',
+  'booking_website_management', 'booking_accountancy_button',
 ];
 
 const requireAdmin = (req, res) => {
@@ -116,6 +116,9 @@ export const setUserPermission = asyncHandler(async (req, res) => {
   if (!BOOKING_MODULES.includes(mod)) {
     return res.status(400).json({ message: `module must be one of: ${BOOKING_MODULES.join(', ')}` });
   }
+  if (mod === 'booking_accountancy_button' && typeof can_read !== 'boolean') {
+    return res.status(400).json({ message: 'Accountancy button visibility must be true or false' });
+  }
   const { rows: target } = await pool.query('SELECT id, role FROM users WHERE id = $1', [id]);
   if (!target[0]) return res.status(404).json({ message: 'User not found' });
   if (!canManageTarget(req.user.role, target[0].role)) {
@@ -128,20 +131,18 @@ export const setUserPermission = asyncHandler(async (req, res) => {
      ON CONFLICT (user_id, module)
      DO UPDATE SET can_read = $3, can_write = $4, can_update = $5, can_delete = $6, updated_at = now()
      RETURNING module, can_read, can_write, can_update, can_delete`,
-    [id, mod, !!can_read, !!can_write, !!can_update, !!can_delete]
+    [id, mod, !!can_read, mod === 'booking_accountancy_button' ? false : !!can_write, mod === 'booking_accountancy_button' ? false : !!can_update, mod === 'booking_accountancy_button' ? false : !!can_delete]
   );
-  logActivity(req.user.id, id, 'MODULE_PERMISSION_UPDATED', { module: mod, can_read: !!can_read, can_write: !!can_write, can_update: !!can_update, can_delete: !!can_delete });
+  logActivity(req.user.id, id, 'MODULE_PERMISSION_UPDATED', rows[0]);
   res.json(rows[0]);
 });
 
 /**
  * GET /admin/my-permissions — the CALLER's booking-module permission map (any
- * authenticated user; used by the sidebar). Admin roles bypass with allow-all.
+ * authenticated user; used by the sidebar and header). Admins bypass module
+ * permissions, but their individually configured header visibility still applies.
  */
 export const getMyPermissions = asyncHandler(async (req, res) => {
-  if (isAdminRole(req.user.role)) {
-    return res.json({ is_admin: true, permissions: {} });
-  }
   const { rows } = await pool.query(
     `SELECT module, can_read, can_write, can_update, can_delete
      FROM user_permissions WHERE user_id = $1 AND module = ANY($2)`,
@@ -153,5 +154,5 @@ export const getMyPermissions = asyncHandler(async (req, res) => {
       can_read: p.can_read, can_write: p.can_write, can_update: p.can_update, can_delete: p.can_delete,
     };
   }
-  res.json({ is_admin: false, permissions });
+  res.json({ is_admin: isAdminRole(req.user.role), permissions });
 });

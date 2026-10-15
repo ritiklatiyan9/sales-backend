@@ -39,7 +39,7 @@ test('agreement formats: first is default, one default per site, revision confli
   }, error => resolve({ status: error.status || 500, data: { message: error.message } })));
   const f = await drawFixture();
   try {
-    await f.db.exec('CREATE TABLE user_sites(user_id INTEGER,site_id INTEGER);CREATE TABLE user_permissions(user_id INTEGER,module TEXT,can_read BOOLEAN,can_write BOOLEAN,can_update BOOLEAN,can_delete BOOLEAN);INSERT INTO user_sites VALUES(2,1);');
+    await f.db.exec('CREATE TABLE user_permissions(user_id INTEGER,module TEXT,can_read BOOLEAN,can_write BOOLEAN,can_update BOOLEAN,can_delete BOOLEAN);');
     await migrateAgreementTemplates(f.pool); await migrateAgreementTemplates(f.pool);
     const body = { site_id: 1, name: 'DLF style', preset: 'dlf', design, body: '<p>Agreement</p>' };
     const a = await call(c.createAgreementTemplate, { body });
@@ -52,11 +52,18 @@ test('agreement formats: first is default, one default per site, revision confli
     const saved = await call(c.updateAgreementTemplate, { params: { id: a.data.id }, body: { body: '<p>Edited word</p>', revision: 1 } });
     assert.equal(saved.data.body, '<p>Edited word</p>'); assert.equal(saved.data.name, 'DLF style'); assert.equal(saved.data.revision, 2);
     assert.equal((await call(c.updateAgreementTemplate, { params: { id: a.data.id }, body: { body: '<p>stale</p>', revision: 1 } })).status, 409);
-    // Agents can read their site's formats (for printing) but cannot edit without Access Control.
+    // Site membership alone cannot expose this opt-in module. A printing View
+    // grant permits reading templates without granting studio modifications.
+    assert.equal((await call(c.getAgreementTemplate, { params: { id: a.data.id }, user: agent })).status, 403);
+    assert.equal((await call(c.listAgreementTemplates, { query: { site_id: 1 }, user: agent })).status, 403);
+    await f.query("INSERT INTO user_permissions VALUES (2,'booking_agreements',true,false,false,false)");
     assert.equal((await call(c.getAgreementTemplate, { params: { id: a.data.id }, user: agent })).status, 200);
+    assert.equal((await call(c.listAgreementTemplates, { query: { site_id: 1 }, user: agent })).status, 200);
     assert.equal((await call(c.createAgreementTemplate, { body, user: agent })).status, 403);
     assert.equal((await call(c.listAgreementTemplates, { query: { site_id: 2 }, user: agent })).status, 403);
     await f.query("INSERT INTO user_permissions VALUES (2,'booking_agreement_studio',true,true,true,false)");
+    await f.query("UPDATE user_permissions SET can_read = false WHERE module = 'booking_agreements'");
+    assert.equal((await call(c.getAgreementTemplate, { params: { id: a.data.id }, user: agent })).status, 200);
     assert.equal((await call(c.deleteAgreementTemplate, { params: { id: a.data.id }, user: agent })).status, 403);
     assert.equal((await call(c.deleteAgreementTemplate, { params: { id: a.data.id } })).status, 204);
   } finally { await f.close(); }

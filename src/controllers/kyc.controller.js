@@ -527,9 +527,13 @@ export const uploadDocument = asyncHandler(async (req, res) => {
     // In-process queue returns instantly with a synthetic job id (no broker). The raw
     // bytes are handed straight to the processor so OCR starts without re-downloading
     // the file from storage.
-    jobId = await enqueueOcr(doc.id, { buffer: req.file.buffer, mimeType: req.file.mimetype });
+    jobId = await enqueueOcr(doc.id, { buffer: req.file.buffer, mimeType: req.file.mimetype,
+      ocrResult: req.clientIdentityOcrResult || null });
     emitOcrUpdate({ bookingId: kycCase.booking_id, caseId: kycCase.id, documentId: doc.id, status: 'PENDING' });
   }
+
+  // Portraits must be immediately available on the shared client and KYC profile.
+  if (type === 'PHOTO') await linkDocToMember(type, storageKey, kycCase.client_member_id, memberDocumentField);
 
   // Respond the moment the file is stored + row created — the UI no longer waits on
   // status roll-ups, job-id persistence, or the accounting mirror.
@@ -539,6 +543,7 @@ export const uploadDocument = asyncHandler(async (req, res) => {
     ocr_status: skipOcr ? 'DONE' : 'PENDING',
     type,
     member_document_field: doc.member_document_field || null,
+    ...(type === 'PHOTO' ? { photo_url: getPublicKycUrl(storageKey) } : {}),
   });
 
   // Fire-and-forget bookkeeping — never blocks the HTTP response.
@@ -552,7 +557,8 @@ export const uploadDocument = asyncHandler(async (req, res) => {
         }
       }
       // Mirror the document onto the accounting client record (shows on /clients/:id).
-      const linked = await linkDocToMember(type, storageKey, kycCase.client_member_id, memberDocumentField);
+      const linked = type === 'PHOTO' ? { col: 'photo' }
+        : await linkDocToMember(type, storageKey, kycCase.client_member_id, memberDocumentField);
       // Legacy/manual callers may omit the field. Persist the slot that the mirror
       // selected so subsequent timeline labels and replacements remain semantic.
       if (linked?.col && !memberDocumentField) {

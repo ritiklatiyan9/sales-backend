@@ -10,7 +10,7 @@ const authMiddleware = async (req, res, next) => {
   try {
     const decoded = verifyToken(token);
     const { rows } = await pool.query(
-      'SELECT id, token_version, is_active FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, email, role, token_version, is_active FROM users WHERE id = $1 LIMIT 1',
       [decoded.id]
     );
     const dbUser = rows[0];
@@ -20,7 +20,8 @@ const authMiddleware = async (req, res, next) => {
     if (decoded.version !== dbUser.token_version) {
       return res.status(401).json({ message: 'Session expired. Please login again.' });
     }
-    req.user = decoded; // { id, email, role, version }
+    // Authorize against current shared account details, including role changes.
+    req.user = { ...decoded, email: dbUser.email, role: dbUser.role };
     next();
   } catch {
     res.status(401).json({ message: 'Invalid or expired token' });

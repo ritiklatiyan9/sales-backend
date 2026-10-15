@@ -13,6 +13,8 @@ import { isAdminRole, getVisibleUserIds } from '../services/agentNetwork.service
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
 import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.model.js';
 import { validateDrawInstallmentPlan } from '../services/drawInstallmentPlan.js';
+import { normalizeDrawScheme } from '../services/drawEnrollment.js';
+import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
 
 /**
  * Draw-based shop allotment module.
@@ -112,6 +114,7 @@ const reconcileEligibility = async (registration, actorId, db) => {
 export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
   const siteId = parseInt(req.query.site_id, 10);
   if (!siteId || siteId <= 0) return res.status(400).json({ message: 'A valid site_id is required' });
+  await requireSiteAccess(req.user, siteId);
   const row = await getDrawSettings(siteId);
   const amount = Number(row?.draw_required_amount || 0);
   res.json({
@@ -119,6 +122,7 @@ export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
     required_amount: amount > 0 ? amount : null,
     scheme_name: row?.draw_scheme_name || null,
     configured: amount > 0,
+    enabled: row?.draw_enabled !== false,
     wait_days: row?.draw_wait_days || 10,
     opening_date: row?.draw_opening_date || '',
     terms: row?.draw_terms || DEFAULT_DRAW_TERMS,
@@ -138,6 +142,8 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
   if (!siteId || siteId <= 0) return res.status(400).json({ message: 'A valid site_id is required' });
   const amount = money(required_amount, 'Required amount');
   const previous = await getDrawSettings(siteId);
+  if (req.body.enabled !== undefined && typeof req.body.enabled !== 'boolean') throw workflowError('Choose whether draw enrollment is enabled');
+  const enabled = req.body.enabled ?? previous?.draw_enabled ?? true;
   const wait_days = Number(req.body.wait_days ?? previous?.draw_wait_days ?? 10);
   const opening_date = req.body.opening_date === undefined ? previous?.draw_opening_date : req.body.opening_date;
   const applyToExisting = req.body.apply_to_existing === true;
@@ -160,7 +166,7 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms }, client);
+      row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms, enabled }, client);
       const { rows: registrations } = await client.query(
         `SELECT id, draw_opening_date FROM draw_registrations
          WHERE site_id = $1 AND status IN ('REGISTERED', 'ELIGIBLE', 'SLIP_ISSUED')
@@ -186,13 +192,14 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
       client.release();
     }
   } else {
-    row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms });
+    row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms, enabled });
   }
   res.json({
     site_id: Number(row.site_id),
     required_amount: Number(row.draw_required_amount),
     scheme_name: row.draw_scheme_name,
     configured: true,
+    enabled: row.draw_enabled !== false,
     wait_days: row.draw_wait_days,
     opening_date: row.draw_opening_date || '',
     updated_registrations: updatedRegistrations,
@@ -216,6 +223,8 @@ export const createDraw = asyncHandler(async (req, res) => {
   } = req.body;
 
   if (!Number.isInteger(Number(site_id)) || Number(site_id) <= 0) throw workflowError('A valid site_id is required');
+  if (client_member_id && (!Number.isInteger(Number(client_member_id)) || Number(client_member_id) <= 0)) throw workflowError('Select a registered client');
+  await requireSiteAccess(req.user, site_id);
   if (!client_member_id && !/^(?:91|0)?[6-9]\d{9}$/.test(String(phone || '').replace(/\D/g, ''))) throw workflowError('Enter a valid Indian mobile number');
   if (!client_member_id && !phone) {
     return res.status(400).json({ message: 'client_member_id or phone is required' });
@@ -234,6 +243,10 @@ export const createDraw = asyncHandler(async (req, res) => {
   }
 
   const setting = await getDrawSettings(site_id);
+  if (setting?.draw_enabled === false) {
+    return res.status(409).json({ message: 'Draw enrollment is disabled for this site. Continue with a direct booking.', code: 'DRAW_DISABLED' });
+  }
+  const drawScheme = normalizeDrawScheme(scheme_name, setting?.draw_scheme_name);
   const required = Number(setting?.draw_required_amount || 0);
   if (!required || required <= 0) {
     return res.status(400).json({ message: 'The draw amount for this site has not been set — an Admin must configure it in Draw Settings first' });
@@ -282,20 +295,32 @@ export const createDraw = asyncHandler(async (req, res) => {
       memberId = member.id;
     }
 
+    // Named draws have separate entries and ledgers for the same client. The lock
+    // serialises independent request keys/users for this client, including two
+    // different draws racing to open their first KYC. The unique index is a final
+    // database guard. The member check also covers referral-code submissions.
+    const { rows: members } = await client.query(`
+      SELECT m.site_id, m.member_type, m.referred_by_user_id, m.created_by, cu.role AS creator_role
+      FROM members m LEFT JOIN users cu ON cu.id = m.created_by WHERE m.id = $1`, [memberId]);
+    const mem = members[0];
+    if (!mem || Number(mem.site_id) !== Number(site_id)) throw workflowError('Customer does not belong to the selected site');
+    if (mem.member_type !== 'CLIENT') throw workflowError('Select a registered client');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`draw_enrollment:${Number(site_id)}:${Number(memberId)}`]);
+    const existing = await drawModel.findActiveEnrollment({ siteId: site_id, clientMemberId: memberId, ...drawScheme }, client);
+    if (existing) {
+      await client.query('ROLLBACK');
+      const visibleIds = await getVisibleUserIds(req.user);
+      const canView = !visibleIds || visibleIds.includes(existing.agent_user_id) || visibleIds.includes(existing.created_by);
+      return res.status(409).json({
+        message: `This client is already enrolled in ${drawScheme.name || 'the current draw'}. Select another draw name to enroll them again.`,
+        code: 'DRAW_ALREADY_ENROLLED',
+        ...(canView ? { existing_registration_id: existing.id } : {}),
+      });
+    }
+
     // Ownership attribution — same signal order as bookings: explicit referral code,
     // else the member's referring agent, else the creator when they are an agent.
     if (!referral_code) {
-      const { rows: memberRows } = await client.query(
-        `SELECT m.referred_by_user_id, m.created_by, cu.role AS creator_role
-           FROM members m LEFT JOIN users cu ON cu.id = m.created_by
-          WHERE m.id = $1`,
-        [memberId]
-      );
-      const mem = memberRows[0];
-      if (!mem) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ message: 'Client not found' });
-      }
       if (mem.referred_by_user_id) ownership = { agent_user_id: mem.referred_by_user_id };
       else if (mem.created_by && !isAdminRole(mem.creator_role)) ownership = { agent_user_id: mem.created_by };
       else if (!isAdminRole(req.user?.role)) ownership = { agent_user_id: req.user.id };
@@ -304,9 +329,6 @@ export const createDraw = asyncHandler(async (req, res) => {
     // Every Booking Payments customer must immediately appear in the KYC register.
     // Create/reuse the member-anchored case inside this transaction so registration
     // can never succeed without its matching KYC queue item.
-    const { rows: members } = await client.query('SELECT site_id FROM members WHERE id = $1', [memberId]);
-    if (!members[0] || Number(members[0].site_id) !== Number(site_id)) throw workflowError('Customer does not belong to the selected site');
-
     const visibleUserIds = await getVisibleUserIds(req.user);
     const kycCase = await kycCaseModel.getOrCreateForMember({
       memberId,
@@ -320,7 +342,8 @@ export const createDraw = asyncHandler(async (req, res) => {
       client_member_id: memberId,
       kyc_case_id: kycCase.id,
       ...ownership,
-      scheme_name: clean(scheme_name) || setting?.draw_scheme_name || null,
+      scheme_name: drawScheme.name,
+      enrollment_key: drawScheme.key,
       required_amount: required,
       status: 'REGISTERED',
       qr_token: crypto.randomBytes(16).toString('hex'),
@@ -333,7 +356,7 @@ export const createDraw = asyncHandler(async (req, res) => {
     createdId = created.id;
 
     const registration_no = await drawModel.generateRegistrationNo(created.id, created.created_at, client);
-    await drawModel.logEvent(created.id, 'REGISTERED', { registration_no, required_amount: required }, req.user?.id, client);
+    await drawModel.logEvent(created.id, 'REGISTERED', { registration_no, required_amount: required, scheme_name: drawScheme.name }, req.user?.id, client);
     await drawModel.logEvent(created.id, 'KYC_OPENED', { kyc_case_id: kycCase.id, automatic: true }, req.user?.id, client);
 
 
@@ -358,6 +381,9 @@ export const createDraw = asyncHandler(async (req, res) => {
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.code === '23505' && err.constraint === 'uq_draw_active_enrollment') {
+      return res.status(409).json({ code: 'DRAW_ALREADY_ENROLLED', message: 'This client is already enrolled in that draw. Open the existing entry or select another draw name.' });
+    }
     throw err;
   } finally {
     client.release();
@@ -919,7 +945,14 @@ export const updateDraw = asyncHandler(async (req, res) => {
     const params = [];
     if (draw_opening_date !== undefined) { params.push(draw_opening_date); sets.push(`draw_opening_date = $${params.length}`); }
     if (hasAmount) { params.push(amount); sets.push(`required_amount = $${params.length}`); }
-    if (scheme_name !== undefined) { params.push(clean(scheme_name)); sets.push(`scheme_name = $${params.length}`); }
+    if (scheme_name !== undefined) {
+      const drawScheme = normalizeDrawScheme(scheme_name);
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`draw_enrollment:${Number(registration.site_id)}:${Number(registration.client_member_id)}`]);
+      const existing = await drawModel.findActiveEnrollment({ siteId: registration.site_id, clientMemberId: registration.client_member_id, ...drawScheme, excludeId: registration.id }, client);
+      if (existing && registration.status !== 'CANCELLED') throw workflowError('This client is already enrolled in that draw', 409);
+      params.push(drawScheme.name); sets.push(`scheme_name = $${params.length}`);
+      params.push(drawScheme.key); sets.push(`enrollment_key = $${params.length}`);
+    }
     if (notes !== undefined) { params.push(clean(notes)); sets.push(`notes = $${params.length}`); }
     params.push(registration.id);
     await client.query(

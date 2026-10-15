@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawFixture } from '../test/drawFixture.mjs';
-import { createBooking, getBookingDrawCredits } from './booking.controller.js';
+import { createBooking, getBookingDrawCredits, getBookingIntake } from './booking.controller.js';
 import { createDraw, setDrawSettings, addDrawPayment } from './draw.controller.js';
 import { listPlotPayments } from './plotPayments.controller.js';
 import { todayIST } from '../services/drawWorkflow.js';
@@ -18,7 +18,7 @@ test('new-booking draw credits preserve receipts, enforce ownership and transfer
   try {
     await migrateWebsiteBookings(f.pool);
     await call(setDrawSettings, { body:{ site_id:1, required_amount:5000, wait_days:10 } });
-    const created = await call(createDraw, { body:{ site_id:1, full_name:'Credit customer', phone:'9888877777' } });
+    const created = await call(createDraw, { body:{ site_id:1, full_name:'Credit customer', phone:'9888877777', scheme_name:'A1' } });
     assert.equal(created.status,201,JSON.stringify(created.data));
     const drawId = created.data.id;
     const memberId = created.data.client_member_id;
@@ -27,6 +27,28 @@ test('new-booking draw credits preserve receipts, enforce ownership and transfer
       assert.equal(result.status,201,JSON.stringify(result.data));
     }
     const lookup = overrides => call(getBookingDrawCredits, { query:{ site_id:1, client_member_id:memberId, ...overrides } });
+    await t.test('one intake fetch returns the complete selected profile and named draw entries within the authorised site', async () => {
+      await f.query("UPDATE members SET father_name='Profile Father',address='Profile address',pan_no='ABCDE1234F',aadhar_no='123456789012',photo='/sample-photo.jpg' WHERE id=$1", [memberId]);
+      const intake = await call(getBookingIntake, { query:{site_id:1,client_member_id:memberId} });
+      assert.equal(intake.status,200,JSON.stringify(intake.data));
+      assert.equal(intake.data.client.id,memberId);
+      assert.equal(intake.data.client.phone,'9888877777');
+      assert.equal(intake.data.client.father_name,'Profile Father');
+      assert.equal(intake.data.client.address,'Profile address');
+      assert.equal(intake.data.client.pan_no,'ABCDE1234F');
+      assert.equal(intake.data.client.aadhar_no,'123456789012');
+      assert.equal(intake.data.client.photo,'/sample-photo.jpg');
+      assert.ok(intake.data.client.kyc_case_id);
+      assert.equal(intake.data.draws[0].scheme_name,'A1');
+      assert.equal(intake.data.draws[0].client_member_id,memberId);
+      assert.equal(intake.data.draws[0].total_paid,5000);
+      assert.equal(intake.data.draws[0].payments.length,2);
+      assert.equal((await call(getBookingIntake,{query:{site_id:2,client_member_id:memberId}})).status,404);
+      assert.equal((await call(getBookingIntake,{query:{site_id:1,client_member_id:99999}})).status,404);
+      assert.equal((await call(getBookingIntake,{query:{site_id:1,client_member_id:'bad'}})).status,400);
+      assert.equal((await call(getBookingIntake,{user:{id:2,role:'agent'},query:{site_id:1,client_member_id:memberId}})).status,403);
+      assert.equal((await call(getBookingIntake,{user:{id:2,role:'sub_admin'},query:{site_id:2,client_member_id:memberId}})).status,403);
+    });
     await t.test('lookup shows pending draw receipts but does not allow premature credit', async () => {
       const r = await lookup();
       assert.equal(r.status,200); assert.equal(r.data[0].total_paid,5000);

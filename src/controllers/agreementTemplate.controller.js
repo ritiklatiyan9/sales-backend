@@ -1,6 +1,6 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
-import { requireSiteAccess, requireWorkspaceAccess } from '../services/bookingWorkspaceAccess.js';
+import { requireAnyWorkspaceReadAccess, requireWorkspaceAccess } from '../services/bookingWorkspaceAccess.js';
 import { validateAgreementTemplate } from '../services/agreementTemplate.js';
 import { workflowError } from '../services/drawWorkflow.js';
 
@@ -15,16 +15,18 @@ async function findTemplate(id) {
   return rows[0];
 }
 
-// Reading needs only site access: anyone who can print a site's agreement can load its format.
+// Both agreement printers and studio readers use these templates. An assigned
+// site alone must not bypass the opt-in View grants managed by Access Control.
+const READ_MODULES = ['booking_agreements', MODULE];
 export const listAgreementTemplates = asyncHandler(async (req, res) => {
-  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const site = await requireAnyWorkspaceReadAccess(req.user, req.query.site_id, READ_MODULES);
   const { rows } = await pool.query(`SELECT ${SUMMARY} FROM agreement_templates WHERE site_id = $1 ORDER BY is_default DESC, updated_at DESC`, [site.id]);
   res.json(rows);
 });
 
 export const getAgreementTemplate = asyncHandler(async (req, res) => {
   const template = await findTemplate(req.params.id);
-  await requireSiteAccess(req.user, template.site_id);
+  await requireAnyWorkspaceReadAccess(req.user, template.site_id, READ_MODULES);
   res.json(template);
 });
 

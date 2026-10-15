@@ -142,7 +142,7 @@ export const processDocument = async (documentId, preload) => {
     stage('FETCH');
 
     // Cache hit → skip the vision call entirely (same bytes, same doc type).
-    const cached = await findCachedResult(doc);
+    const cached = preload?.ocrResult || await findCachedResult(doc);
     let result;
     if (cached) {
       console.log(`[ocrProcessor] cache hit for document_id=${documentId} (hash ${String(doc.file_hash).slice(0, 12)}…)`);

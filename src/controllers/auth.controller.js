@@ -3,15 +3,19 @@ import bcrypt from 'bcrypt';
 import { OAuth2Client } from 'google-auth-library';
 import asyncHandler from '../utils/asyncHandler.js';
 import {
-  signAccessToken, signRefreshToken, verifyToken, comparePassword, hashRefreshToken,
+  signAccessToken, signRefreshToken, verifyToken, hashRefreshToken,
 } from '../config/jwt.js';
 import { firebaseEnabled, verifyFirebaseIdToken } from '../config/firebaseAdmin.js';
 import { mailerEnabled, sendLoginOtpEmail } from '../services/mailer.service.js';
 import { isAdminRole } from '../services/agentNetwork.service.js';
 import userModel from '../models/User.model.js';
 import pool from '../config/db.js';
+import { createStaffIdentityService, matchesStaffPassword, normalizeLoginIdentifier } from '../services/staffIdentity.service.js';
+import { clientPortal } from './clientPortal.controller.js';
+import { clientPortalEnabled } from '../services/clientPortalAvailability.js';
 
 const googleClient = new OAuth2Client();
+const staffIdentity = createStaffIdentityService(pool);
 
 /** Mint the shared-shape token pair for an authenticated user (same as password login). */
 const issueTokens = async (user) => {
@@ -80,9 +84,26 @@ const needsOtp = (user) => LOGIN_OTP_ENABLED && isAdminRole(user.role) && mailer
  * shape — so a token works on both the booking-api and the accounting backend.
  */
 export const login = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
-  const user = await userModel.findByEmail(email);
-  if (!user || !(await comparePassword(password, user.password))) {
+  const { password } = req.body;
+  const identifier = req.body.identifier ?? req.body.email ?? req.body.phone;
+  const parsed = normalizeLoginIdentifier(identifier);
+  const user = parsed ? await userModel.findByLoginIdentifier(identifier) : undefined;
+  const staffMatches = Boolean(user && await matchesStaffPassword(user, password, { phoneLogin: parsed?.type === 'phone' }));
+  if (parsed?.type === 'phone' && clientPortalEnabled()) {
+    // Distinct people can share a phone. Never select a staff/client realm when
+    // the same supplied credential identifies both; no account is provisioned.
+    if (staffMatches && await clientPortal.authenticate(identifier, password, { dryRun: true })) {
+      return res.status(401).json({ message: 'Invalid credentials. Use your email to sign in or contact the office.' });
+    }
+    if (!staffMatches) {
+      const clientSession = await clientPortal.authenticate(identifier, password);
+      if (clientSession) {
+        res.set?.('Cache-Control', 'private, no-store');
+        return res.json(clientSession);
+      }
+    }
+  }
+  if (!staffMatches) {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
   if (!user.is_active) {
@@ -315,4 +336,25 @@ export const getMe = asyncHandler(async (req, res) => {
   }
 
   res.json({ user: userModel.sanitize(user), sites });
+});
+
+/** PATCH /auth/profile — session-scoped self-service, never accepts role/site fields. */
+export const updateProfile = asyncHandler(async (req, res) => {
+  const { user, sessionChanged } = await staffIdentity.updateProfile(req.user, req.body);
+  // Revocation and credential changes commit together. The caller receives the
+  // replacement session so changing a password does not log out this browser.
+  const tokens = sessionChanged ? await issueTokens(user) : {};
+  res.json({ user: userModel.sanitize(user), ...tokens, session_changed: sessionChanged });
+});
+
+/** PATCH /auth/staff/:userId/kyc — audited admin confirmation of a person's login identity. */
+export const linkStaffKyc = asyncHandler(async (req, res) => {
+  const { user, sessionChanged, isSelf } = await staffIdentity.linkKyc(req.user, req.params.userId, req.body);
+  const tokens = isSelf ? await issueTokens(user) : {};
+  res.json({ user: userModel.sanitize(user), ...tokens, session_changed: sessionChanged, is_self: isSelf });
+});
+
+/** GET /auth/kyc-login/:caseId — server-scoped eligible existing login accounts. */
+export const getKycLoginOptions = asyncHandler(async (req, res) => {
+  res.json(await staffIdentity.getKycLoginOptions(req.user, req.params.caseId));
 });
