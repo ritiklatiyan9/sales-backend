@@ -29,7 +29,7 @@
     "migrate:document-member-field": "node src/migrations/019_document_member_field.js",
     "migrate:ocr-optimization": "node src/migrations/020_ocr_optimization.js",
     "test:member-roles": "node --test src/services/memberRoles.service.test.mjs",
-    "test:ocr": "node --test src/services/openRouterOcr.service.test.mjs src/services/ocrSingleFlight.service.test.mjs",
+    "test:ocr": "node --test src/services/openRouterOcr.service.test.mjs src/services/openRouterErrors.test.mjs src/services/ocrSingleFlight.service.test.mjs",
     "migrate:booking-workflow": "node src/migrations/021_booking_workflow.js",
     "migrate:draw-kyc-backfill": "node src/migrations/022_backfill_draw_kyc_cases.js",
     "migrate:document-settings": "node src/migrations/023_document_settings.js",

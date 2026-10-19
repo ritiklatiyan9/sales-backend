@@ -55,7 +55,7 @@ export async function openRouterChat(content, { system, maxTokens = 1600, pdf = 
       headers: {
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': process.env.OPENROUTER_APP_URL || 'https://dgdefence.com',
+        'HTTP-Referer': process.env.OPENROUTER_APP_URL || 'https://dgbooking.com',
         'X-Title': process.env.OPENROUTER_APP_NAME || 'Defence Garden Booking ERP',
       },
       body: JSON.stringify(body),
@@ -66,6 +66,9 @@ export async function openRouterChat(content, { system, maxTokens = 1600, pdf = 
 
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 300);
+    if ([401, 403].includes(response.status)) throw providerError('OpenRouter authentication was rejected', { status: 503, code: 'OCR_PROVIDER_AUTH', publicMessage: 'Document reading is not available because its server credentials were rejected. Ask an administrator to check the OCR configuration.' });
+    if (response.status === 402) throw providerError('OpenRouter credit balance is unavailable', { status: 503, code: 'OCR_PROVIDER_BILLING', publicMessage: 'Document reading is unavailable because the OCR service needs credits. Ask an administrator to check its billing.' });
+    if (response.status === 404) throw providerError('OpenRouter OCR model is unavailable', { status: 503, code: 'OCR_MODEL_UNAVAILABLE', publicMessage: 'The configured document reader is unavailable. Ask an administrator to check the OCR model setting.' });
     if (response.status === 429) {
       const retry = Number(response.headers?.get?.('retry-after'));
       throw providerError(`OpenRouter rate-limited: ${detail}`, { status: 429, code: 'OCR_RATE_LIMITED', publicMessage: 'Document reading is busy. Please retry this document shortly.',

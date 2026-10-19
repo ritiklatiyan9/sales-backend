@@ -481,6 +481,26 @@ const resolveCase = async (body) => {
  * Stores the file, inserts a PENDING document row, enqueues an async OCR job, and
  * returns immediately so the UI never blocks.
  */
+/**
+ * Client onboarding rule: once the KYC case holds Aadhaar front, Aadhaar back and
+ * PAN, it is verified (by the uploader). Returns true when the case is verified now.
+ */
+export async function verifyWhenIdentityComplete(kycCase, userId, db = pool) {
+  const { rows } = await db.query(
+    `SELECT bool_or(type = 'AADHAAR' AND member_document_field = 'aadhar_front_url') AS front,
+            bool_or(type = 'AADHAAR' AND member_document_field = 'aadhar_back_url') AS back,
+            bool_or(type = 'PAN') AS pan
+       FROM documents WHERE kyc_case_id = $1`, [kycCase.id]);
+  if (!(rows[0]?.front && rows[0]?.back && rows[0]?.pan)) return false;
+  const { rowCount } = await db.query(
+    `UPDATE kyc_cases SET status = 'VERIFIED', verified_by = $1, verified_at = now(), updated_at = now()
+      WHERE id = $2 AND status <> 'VERIFIED'`, [userId || null, kycCase.id]);
+  if (rowCount && kycCase.booking_id) {
+    await db.query(`UPDATE bookings SET kyc_status = 'VERIFIED', status = CASE WHEN status = 'KYC_PENDING' THEN 'KYC_DONE' ELSE status END, updated_at = now() WHERE id = $1`, [kycCase.booking_id]);
+  }
+  return rowCount > 0;
+}
+
 export const uploadDocument = asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded (field name: file)' });
 
@@ -566,6 +586,9 @@ export const uploadDocument = asyncHandler(async (req, res) => {
           'UPDATE documents SET member_document_field = $1, updated_at = now() WHERE id = $2',
           [linked.col, doc.id]
         );
+      }
+      if (req.verifyOnIdentityComplete && await verifyWhenIdentityComplete(kycCase, req.user?.id)) {
+        emitOcrUpdate({ bookingId: kycCase.booking_id, caseId: kycCase.id, status: 'VERIFIED' });
       }
     } catch (err) {
       console.error('[kyc upload] post-processing failed:', err.message);

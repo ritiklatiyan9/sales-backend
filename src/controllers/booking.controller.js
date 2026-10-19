@@ -814,6 +814,8 @@ export const uploadClientDocument = asyncHandler(async (req, res, next) => {
     throw error;
   } finally { client.release(); }
   req.body = { ...req.body, type, kyc_case_id: kyc.id, booking_id: undefined };
+  // Onboarding: Aadhaar front + back + PAN uploaded → the client's KYC is verified.
+  req.verifyOnIdentityComplete = true;
   uploadDocument(req, res, next);
 });
 
