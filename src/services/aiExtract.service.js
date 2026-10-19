@@ -1,67 +1,26 @@
 /**
- * Groq AI service for intelligent OCR data extraction.
- * Uses Groq to parse OCR text and extract relevant KYC fields.
- * This keeps only required data and intelligently fills form fields.
+ * KYC field extraction from already-read text (DOCX forms, re-extraction backfill),
+ * via OpenRouter like the vision OCR. Returns only the fields actually found; on any
+ * failure returns {} (never dumps raw OCR text into the form).
  */
-// Node 18+ has a global fetch; fall back to node-fetch only if it's missing.
-const fetchFn = globalThis.fetch
-  ? globalThis.fetch.bind(globalThis)
-  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+import { openRouterChat } from './openRouter.service.js';
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// Qwen 3.6 is Groq's current multimodal replacement for the retired Llama 4 Scout.
-const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.6-27b';
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-
-/**
- * Extract and classify KYC fields from OCR text using AI.
- * Returns only the fields actually found in the document. On any failure returns
- * an empty object (never dumps raw OCR text into the form).
- */
 export async function extractKycFieldsWithAi(ocrText, documentType) {
-  if (!GROQ_API_KEY) {
-    console.warn('[groq] GROQ_API_KEY not set; skipping AI extraction');
-    return {};
-  }
   if (!ocrText || !String(ocrText).trim()) {
-    console.warn('[groq] empty OCR text; skipping AI extraction');
+    console.warn('[ai-extract] empty OCR text; skipping AI extraction');
     return {};
   }
-
-  const prompt = buildExtractionPrompt(ocrText, documentType);
-
   try {
-    const response = await fetchFn(GROQ_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a precise KYC data extraction engine. You always reply with a single valid JSON object and nothing else.' },
-          { role: 'user', content: prompt },
-        ],
-        temperature: 0.1,
-        // The full KYC form returns ~30 fields — give it headroom.
-        max_tokens: documentType === 'KYC_FORM' ? 1400 : 600,
-      }),
+    const { content } = await openRouterChat(buildExtractionPrompt(ocrText, documentType), {
+      system: 'You are a precise KYC data extraction engine. You always reply with a single valid JSON object and nothing else.',
+      // The full KYC form returns ~30 fields — give it headroom.
+      maxTokens: documentType === 'KYC_FORM' ? 1400 : 600,
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      console.error('[groq] API error:', response.status, error);
-      return {};
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
     const parsed = parseAiResponse(content, documentType);
-    console.log(`[groq] extracted ${Object.keys(parsed).join(', ')} for ${documentType}`);
+    console.log(`[ai-extract] extracted ${Object.keys(parsed).join(', ')} for ${documentType}`);
     return parsed;
   } catch (err) {
-    console.error('[groq] extraction failed:', err.message);
+    console.error('[ai-extract] extraction failed:', err.message);
     return {};
   }
 }
@@ -175,7 +134,7 @@ Return only the JSON object:`;
 }
 
 /**
- * Parse Groq's response and normalize field names to booking form schema.
+ * Parse the model's response and normalize field names to booking form schema.
  */
 function parseAiResponse(content, documentType) {
   try {
@@ -186,7 +145,7 @@ function parseAiResponse(content, documentType) {
     const extracted = JSON.parse(jsonMatch[0]);
     return normalizeExtracted(extracted, documentType);
   } catch (err) {
-    console.error('[groq] failed to parse response:', err.message);
+    console.error('[ai-extract] failed to parse response:', err.message);
     return {};
   }
 }
@@ -290,7 +249,7 @@ export function normalizeExtracted(extracted, documentType) {
       Object.entries(normalized).filter(([, v]) => v && String(v).trim())
     );
   } catch (err) {
-    console.error('[groq] failed to normalize fields:', err.message);
+    console.error('[ai-extract] failed to normalize fields:', err.message);
     return {};
   }
 }

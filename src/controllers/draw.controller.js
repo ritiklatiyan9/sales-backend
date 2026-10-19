@@ -1,3 +1,5 @@
+import { resolvePaymentCollector } from '../services/paymentCollector.js';
+import { resolveDrawBroker } from '../services/dealerTeams.js';
 import { ensureBookingCreditFields } from '../services/bookingDrawCredits.js';
 import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import crypto from 'crypto';
@@ -9,7 +11,7 @@ import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
-import { isAdminRole, getVisibleUserIds } from '../services/agentNetwork.service.js';
+import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
 import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.model.js';
 import { validateDrawInstallmentPlan } from '../services/drawInstallmentPlan.js';
@@ -272,6 +274,10 @@ export const createDraw = asyncHandler(async (req, res) => {
     ownership = { agent_user_id: rows[0].id };
   }
 
+  // Every enrollment names the dealer (Members broker code) who brought the client,
+  // which is how Teams/Network trace draws back to dealers.
+  const broker = await resolveDrawBroker(req.body.broker_code, site_id, pool);
+
   // Customer resolution + registration + first payment + events are one atomic unit.
   let createdId;
   const client = await pool.connect();
@@ -307,16 +313,22 @@ export const createDraw = asyncHandler(async (req, res) => {
     if (mem.member_type !== 'CLIENT') throw workflowError('Select a registered client');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`draw_enrollment:${Number(site_id)}:${Number(memberId)}`]);
     const existing = await drawModel.findActiveEnrollment({ siteId: site_id, clientMemberId: memberId, ...drawScheme }, client);
-    if (existing) {
+    // One client may hold several entries in the same draw — each is its own booking
+    // amount, slip and possible shop. Another entry must be confirmed explicitly
+    // (additional_entry: true) so a double submit never adds one by accident.
+    const entryCount = existing ? Number(existing.entry_count) || 1 : 0;
+    if (existing && req.body.additional_entry !== true) {
       await client.query('ROLLBACK');
       const visibleIds = await getVisibleUserIds(req.user);
       const canView = !visibleIds || visibleIds.includes(existing.agent_user_id) || visibleIds.includes(existing.created_by);
       return res.status(409).json({
-        message: `This client is already enrolled in ${drawScheme.name || 'the current draw'}. Select another draw name to enroll them again.`,
+        message: `This client already has ${entryCount} ${entryCount === 1 ? 'entry' : 'entries'} in ${drawScheme.name || 'the current draw'}. Confirm to add another entry — each entry needs its own booking amount and can win a separate shop.`,
         code: 'DRAW_ALREADY_ENROLLED',
+        entry_count: entryCount,
         ...(canView ? { existing_registration_id: existing.id } : {}),
       });
     }
+    if (existing) drawScheme.key = `${drawScheme.key}#ENTRY-${(Number(existing.last_entry_no) || 1) + 1}`;
 
     // Ownership attribution — same signal order as bookings: explicit referral code,
     // else the member's referring agent, else the creator when they are an agent.
@@ -342,6 +354,7 @@ export const createDraw = asyncHandler(async (req, res) => {
       client_member_id: memberId,
       kyc_case_id: kycCase.id,
       ...ownership,
+      ...broker,
       scheme_name: drawScheme.name,
       enrollment_key: drawScheme.key,
       required_amount: required,
@@ -356,7 +369,7 @@ export const createDraw = asyncHandler(async (req, res) => {
     createdId = created.id;
 
     const registration_no = await drawModel.generateRegistrationNo(created.id, created.created_at, client);
-    await drawModel.logEvent(created.id, 'REGISTERED', { registration_no, required_amount: required, scheme_name: drawScheme.name }, req.user?.id, client);
+    await drawModel.logEvent(created.id, 'REGISTERED', { registration_no, required_amount: required, scheme_name: drawScheme.name, broker_code: broker.broker_code }, req.user?.id, client);
     await drawModel.logEvent(created.id, 'KYC_OPENED', { kyc_case_id: kycCase.id, automatic: true }, req.user?.id, client);
 
 
@@ -369,13 +382,15 @@ export const createDraw = asyncHandler(async (req, res) => {
         if (f === 'payment_date' && v === null) continue;
         data[f] = v;
       }
+      const collector = await resolvePaymentCollector(req.body, site_id, client);
+      if (collector) data.received_by = collector.receivedBy;
       const cols = Object.keys(data);
       const { rows } = await client.query(
         `INSERT INTO draw_payments (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
         Object.values(data)
       );
       await drawModel.generateReceiptNo(rows[0].id, client);
-      await drawModel.logEvent(created.id, 'PAYMENT_ADDED', { amount: firstAmount, payment_id: rows[0].id }, req.user?.id, client);
+      await drawModel.logEvent(created.id, 'PAYMENT_ADDED', { amount: firstAmount, payment_id: rows[0].id, ...(collector ? { collector_id: collector.id, ...(collector.memberId ? {collector_member_id:collector.memberId} : {}), collector_code: collector.code } : {}) }, req.user?.id, client);
       await reconcileEligibility({ ...created, status: 'REGISTERED' }, req.user?.id, client);
     }
     await client.query('COMMIT');
@@ -473,6 +488,19 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
       if (f === 'payment_date' && v === null) continue;
       data[f] = v;
     }
+    // A company account picked from GET /banks: keep its id and its master name so the
+    // receipt maps to that bank in Accounting when it is transferred at allotment.
+    if (req.body.bank_account_id != null && req.body.bank_account_id !== '' && data.payment_from && data.payment_from !== 'CASH') {
+      const bankId = Number(req.body.bank_account_id);
+      const { rows: banks } = Number.isInteger(bankId) && bankId > 0
+        ? await client.query('SELECT id, name FROM bank_accounts WHERE id = $1 AND site_id = $2 AND is_active IS NOT FALSE', [bankId, registration.site_id])
+        : { rows: [] };
+      if (!banks[0]) throw workflowError('Choose an active bank account of this site', 409);
+      data.bank_account_id = banks[0].id;
+      data.bank_name = banks[0].name;
+    }
+    const collector = await resolvePaymentCollector(req.body, registration.site_id, client);
+    if (collector) data.received_by = collector.receivedBy;
     const cols = Object.keys(data);
     const { rows } = await client.query(
       `INSERT INTO draw_payments (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
@@ -480,7 +508,7 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
     );
     const payment = rows[0];
     await drawModel.generateReceiptNo(payment.id, client);
-    await drawModel.logEvent(registration.id, 'PAYMENT_ADDED', { amount: paymentAmount, payment_id: payment.id }, req.user?.id, client);
+    await drawModel.logEvent(registration.id, 'PAYMENT_ADDED', { amount: paymentAmount, payment_id: payment.id, ...(collector ? { collector_id: collector.id, ...(collector.memberId ? {collector_member_id:collector.memberId} : {}), collector_code: collector.code } : {}) }, req.user?.id, client);
     await reconcileEligibility(registration, req.user?.id, client);
     await client.query('COMMIT');
   } catch (err) {
@@ -1022,7 +1050,16 @@ export const deleteDraw = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
-    if (registration.slip_no || await drawModel.getTotalPaid(registration.id, client) > 0) throw workflowError('Paid or issued registrations must be retained. Cancel instead of deleting.', 409);
+    // Issued slips are always retained. Paid-but-unissued entries (e.g. test or
+    // mistaken registrations) may go only with an explicit ?with_payments=true and
+    // only while none of their receipts has been transferred to Accounting.
+    if (registration.slip_no) throw workflowError('This entry has an issued draw slip and must be retained. Cancel it instead.', 409);
+    const paid = await drawModel.getTotalPaid(registration.id, client);
+    if (paid > 0) {
+      if (req.query.with_payments !== 'true') throw workflowError('This entry has payments. Confirm deleting its receipts too, or cancel the entry instead.', 409);
+      const { rows: moved } = await client.query('SELECT 1 FROM draw_payments WHERE draw_registration_id = $1 AND plot_payment_id IS NOT NULL LIMIT 1', [registration.id]);
+      if (moved[0]) throw workflowError('Receipts of this entry are already in Accounting. Cancel the entry instead.', 409);
+    }
     if (!['REGISTERED', 'ELIGIBLE', 'CANCELLED'].includes(registration.status)) {
       await client.query('ROLLBACK');
       return res.status(409).json({
@@ -1033,6 +1070,7 @@ export const deleteDraw = asyncHandler(async (req, res) => {
     await client.query('DELETE FROM draw_events WHERE draw_registration_id = $1', [registration.id]);
     await client.query('DELETE FROM draw_registrations WHERE id = $1', [registration.id]);
     await client.query('COMMIT');
+    logActivity(req.user.id, null, 'DRAW_REGISTRATION_DELETED', { draw_registration_id: registration.id, with_payments: paid > 0, amount: paid });
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -1100,7 +1138,37 @@ export const listWorkflow = asyncHandler(async (req, res) => {
   if (stage && !['PAYMENT', 'KYC', 'DOCUMENTS', 'DRAW', 'ALLOTMENT', 'BOOKED', 'CANCELLED'].includes(stage)) throw workflowError('Invalid workflow stage');
   const page = Math.max(1, Math.min(100000, parseInt(req.query.page, 10) || 1));
   const visibleUserIds = await getVisibleUserIds(req.user);
-  res.json(await drawModel.workflow({ siteId, stage, page, q: String(req.query.q || ''), visibleUserIds }, pool));
+  res.json(await drawModel.workflow({ siteId, stage, page, pageSize: req.query.page_size === 'all' ? 'all' : 25,
+    q: String(req.query.q || ''), filters: workflowFilters(req.query), visibleUserIds }, pool));
+});
+
+/** Validated Booking Payments filters (shared by the queue and its statements). */
+function workflowFilters(query) {
+  const date = (key) => {
+    const value = query[key];
+    if (!value) return undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(value))) throw workflowError('Use dates in YYYY-MM-DD format');
+    return value;
+  };
+  const oneOf = (key, allowed) => {
+    const value = query[key] ? String(query[key]).toUpperCase() : undefined;
+    if (value && !allowed.includes(value)) throw workflowError(`Invalid ${key} filter`);
+    return value;
+  };
+  const text = (key) => (query[key] ? String(query[key]).trim().slice(0, 150) || undefined : undefined);
+  return {
+    date_from: date('date_from'), date_to: date('date_to'), broker: text('broker'), scheme: text('scheme'),
+    kyc: oneOf('kyc', ['VERIFIED', 'PENDING']), payment: oneOf('payment', ['PAID', 'PARTIAL', 'UNPAID']),
+    method: oneOf('method', ['DIRECT', 'WEBSITE']), mode: oneOf('mode', ['CASH', 'BANK']),
+  };
+}
+
+/** GET /draws/payments-statement — receipt-level statement (admins: amounts are admin-only). */
+export const paymentStatement = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Only admins can print payment statements' });
+  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  res.json({ site, rows: await drawModel.paymentStatement({ siteId: site.id, q: String(req.query.q || ''), filters: workflowFilters(req.query), visibleUserIds }, pool) });
 });
 
 /** KYC is opened at registration; this remains an idempotent compatibility endpoint. */

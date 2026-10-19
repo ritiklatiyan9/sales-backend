@@ -1,41 +1,22 @@
 /**
- * In-process OCR engine — Mistral Document OCR for full KYC forms and Groq vision
- * for legacy identity-document flows:
+ * In-process OCR engine — one OpenRouter vision request per document
+ * (openRouter.service.js; replaced the direct Mistral + Groq providers):
  *
  *   image → preprocess (sharp: auto-rotate, resize, normalize, recompress)
- *         → Groq vision OCR + field extraction (with per-field confidence)
+ *   PDF   → sent as-is (the model reads every page natively)
+ *   DOCX  → text → field extraction (aiExtract via the same provider)
  *         → strict JSON validation (Aadhaar/PAN/pincode/mobile/date formats)
  *         → { text, fields, confidence, confidenceMap, engine }
- *
- * Preprocessing dramatically cuts payload size (faster upload to Groq, faster
- * inference) and improves OCR accuracy on skewed/large/over-exposed photos.
- * On any preprocessing failure the original buffer is used — never fatal.
  *
  * Callers may pass an `onStage(stage)` callback to surface live pipeline progress
  * (PREPROCESS → OCR → VALIDATE) to the UI via socket events.
  *
- * On failure it throws, letting the processor mark the document FAILED (the UI
- * then offers a Retry, exactly like the old flow).
+ * On failure it throws (with status/code/publicMessage), letting the processor
+ * mark the document FAILED so the UI offers a Retry.
  */
-import { normalizeExtracted, extractKycFieldsWithAi } from './groq.service.js';
+import { normalizeExtracted, extractKycFieldsWithAi } from './aiExtract.service.js';
 import { MEMBER_TYPES } from './memberRoles.service.js';
-import { runMistralDocumentOcr } from './mistralOcr.service.js';
-
-const fetchFn = globalThis.fetch
-  ? globalThis.fetch.bind(globalThis)
-  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// Keep the vision model explicit because Groq retires model IDs independently.
-// groq.service.js uses GROQ_MODEL for text-only extraction; this service requires
-// a model that accepts image_url input.
-const CURRENT_GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
-const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || CURRENT_GROQ_VISION_MODEL;
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS || 45000);
-
-export const ENGINE_NAME = 'groq-vision';
-export const KYC_FORM_ENGINE_NAME = 'mistral-ocr';
+import { engineLabel, openRouterChat } from './openRouter.service.js';
 
 // Field lists per document type — mirrors the text extractor so output shape is identical.
 const FIELDS_BY_TYPE = {
@@ -104,34 +85,6 @@ STRICT RULES — never violate:
 Return only the JSON object.`;
 };
 
-// Mistral OCR already returns the complete document transcription in pages[].markdown.
-// Asking Document Annotation to repeat it as raw_text wastes output tokens, so this
-// prompt requests only the structured form fields and confidence map.
-const buildMistralAnnotationPrompt = (docType) => {
-  const fields = FIELDS_BY_TYPE[docType] || FIELDS_BY_TYPE.OTHER;
-  return `Read the complete Indian KYC form across every page.${docType === 'KYC_FORM' ? KYC_FORM_HINTS : ''}
-Return ONE JSON object with these snake_case fields at the top level: ${fields.join(', ')}.
-Also return "field_confidence", an object mapping every non-empty field to a number from 0 to 1.
-
-Rules:
-- Return valid JSON only. Do not nest the extracted values under "fields".
-- Never guess. Use "" when a value is missing or illegible and omit its confidence.
-- Keep address as one line without city, state, or pincode; return those separately.
-- Use DD/MM/YYYY for dates, exactly 6 digits for pincode, 10 digits for phones,
-  12 digits for Aadhaar, and the printed value for PAN/IFSC/agent code.
-- Preserve handwritten spelling exactly.`;
-};
-
-const mistralFieldDefinitions = (docType) => (
-  (FIELDS_BY_TYPE[docType] || FIELDS_BY_TYPE.OTHER).map((definition) => {
-    const match = String(definition).match(/^([a-z0-9_]+)(?:\s*\((.*)\))?$/i);
-    return {
-      name: match?.[1] || String(definition).trim(),
-      description: match?.[2] || `Exact ${match?.[1] || definition} value from the form`,
-    };
-  })
-);
-
 /* ── Stage: preprocessing (sharp) ─────────────────────────────────────────── */
 
 // Loaded lazily so a broken native install degrades gracefully to "no preprocessing".
@@ -171,49 +124,6 @@ export async function preprocessImage(fileBuffer, mimeType, { maxEdge = 1440, qu
 }
 
 /* ── Stage: PDF → image (scanned forms are often shared as PDFs) ──────────── */
-
-/**
- * Render the printable KYC form's pages to one tall PNG. One-page legacy forms
- * remain supported; all three pages of the current template are stitched vertically so
- * nothing is silently dropped. Throws a friendly error on failure.
- */
-export async function pdfToImage(pdfBuffer) {
-  let pdfToPng;
-  try {
-    ({ pdfToPng } = await import('pdf-to-png-converter'));
-  } catch (e) {
-    throw new Error('PDF support unavailable on this server — upload a photo (JPG/PNG) of the form instead');
-  }
-  const pages = await pdfToPng(pdfBuffer, {
-    viewportScale: 2.0,      // ~150dpi at A4 — enough for handwriting
-    pagesToProcess: [1, 2, 3], // current large-box form is three pages
-    strictPagesToProcess: false,
-    disableFontFace: true,
-  });
-  if (!pages?.length) throw new Error('Could not render the PDF — upload a photo (JPG/PNG) of the form instead');
-  if (pages.length === 1) return pages[0].content;
-
-  // Stitch two pages vertically with sharp (falls back to page 1 alone).
-  const sharp = await getSharp();
-  if (!sharp) return pages[0].content;
-  try {
-    const metas = await Promise.all(pages.map((p) => sharp(p.content).metadata()));
-    const width = Math.max(...metas.map((m) => m.width || 0));
-    const height = metas.reduce((s, m) => s + (m.height || 0), 0);
-    let top = 0;
-    const composite = pages.map((p, i) => {
-      const layer = { input: p.content, left: 0, top };
-      top += metas[i].height || 0;
-      return layer;
-    });
-    return await sharp({ create: { width, height, channels: 3, background: '#ffffff' } })
-      .composite(composite)
-      .png()
-      .toBuffer();
-  } catch {
-    return pages[0].content;
-  }
-}
 
 /* ── Stage: DOCX → text (typed forms sent as Word documents) ─────────────── */
 
@@ -397,55 +307,9 @@ function finalizeOcrResult(raw, fallbackText, docType, engine, providerConfidenc
 async function runOcrPipeline(fileBuffer, mimeType, docType, onStage) {
   if (!fileBuffer?.length) throw new Error('empty file buffer');
 
-  let mistralResult = null;
-  let mistralError = null;
-
-  // Prefer Mistral because it reads the original multi-page PDF. If it errors or
-  // extracts fewer than three meaningful applicant fields, continue through the
-  // Groq vision pipeline below. A sparse Mistral result is retained so it can still
-  // be returned if the fallback provider is unavailable/rate-limited.
-  if (docType === 'KYC_FORM') {
-    onStage?.('PREPROCESS');
-    onStage?.('OCR');
-    try {
-      const result = await runMistralDocumentOcr(
-        fileBuffer,
-        mimeType,
-        buildMistralAnnotationPrompt(docType),
-        mistralFieldDefinitions(docType)
-      );
-      onStage?.('VALIDATE');
-      mistralResult = finalizeOcrResult(
-        result.raw,
-        result.text,
-        docType,
-        `${KYC_FORM_ENGINE_NAME}:${result.model}`,
-        result.confidence
-      );
-      const machineOnly = new Set(['agent_code', 'kyc_no', 'member_type']);
-      const meaningfulFields = Object.keys(mistralResult.fields).filter((key) => !machineOnly.has(key));
-      if (meaningfulFields.length >= 3) return mistralResult;
-      console.warn(`[ocr] Mistral result too sparse (${meaningfulFields.length} applicant fields); falling back to Groq`);
-    } catch (error) {
-      mistralError = error;
-      console.warn(`[ocr] Mistral failed (${error.code || error.message}); falling back to Groq`);
-    }
-  }
-
-  if (!GROQ_API_KEY) {
-    if (mistralResult) return mistralResult;
-    if (mistralError) throw mistralError;
-    throw new Error('GROQ_API_KEY not set — cannot run OCR');
-  }
-
-  let buffer = fileBuffer;
-  let mime = mimeType;
-
-  // DOCX → text-only path (no image to look at): extract text, then run the same
-  // field extraction via the text model. Detected by mime OR the PK zip signature
-  // with a .docx-style content type absent.
-  const isDocx = mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-  if (isDocx) {
+  // DOCX → text-only path (nothing to look at): extract text, then the same field
+  // extraction through the text prompt.
+  if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
     onStage?.('PREPROCESS');
     const text = await docxToText(fileBuffer);
     onStage?.('OCR');
@@ -454,119 +318,38 @@ async function runOcrPipeline(fileBuffer, mimeType, docType, onStage) {
     const { fields, dropped, suspect } = validateFields(rawFields);
     if (dropped.length) console.warn(`[ocr] validation dropped: ${dropped.join(', ')}`);
     // Typed documents carry no per-field visual uncertainty — flat medium-high score;
-    // format-suspect values surface red so the reviewer corrects them. The document
-    // score is the MEAN of the per-field map so an all-suspect doc reads low too.
+    // format-suspect values surface red so the reviewer corrects them.
     const confidenceMap = Object.fromEntries(Object.keys(fields).map((k) => [k, suspect.includes(k) ? 0.35 : 0.85]));
     const confVals = Object.values(confidenceMap);
     const overall = confVals.length ? confVals.reduce((a, b) => a + b, 0) / confVals.length : 0.3;
-    return { text, fields, confidence: overall, confidenceMap, engine: `${ENGINE_NAME}-docx` };
-  }
-
-  // PDF → render to an image first, then continue through the vision pipeline.
-  const isPdf = mime === 'application/pdf' || fileBuffer.subarray(0, 5).toString('latin1') === '%PDF-';
-  if (isPdf) {
-    onStage?.('PREPROCESS');
-    buffer = await pdfToImage(fileBuffer);
-    mime = 'image/png';
+    return { text, fields, confidence: overall, confidenceMap, engine: 'or:docx-text' };
   }
 
   onStage?.('PREPROCESS');
-  // Full-page forms keep more pixels than ID cards — handwriting needs them.
-  const preOpts = docType === 'KYC_FORM' || docType === 'FINAL_APPROVED_BOOKED_FORM'
-    ? { maxEdge: docType === 'KYC_FORM' ? 4200 : 3600, quality: 88 }
-    : {};
-  const pre = await preprocessImage(buffer, mime && mime.startsWith('image/') ? mime : 'image/jpeg', preOpts);
-  const dataUrl = `data:${pre.mimeType};base64,${pre.buffer.toString('base64')}`;
+  const isPdf = mimeType === 'application/pdf' || fileBuffer.subarray(0, 5).toString('latin1') === '%PDF-';
+  let filePart;
+  if (isPdf) {
+    filePart = { type: 'file', file: { filename: 'document.pdf', file_data: `data:application/pdf;base64,${fileBuffer.toString('base64')}` } };
+  } else {
+    // Full-page forms keep more pixels than ID cards — handwriting needs them.
+    const preOpts = docType === 'KYC_FORM' || docType === 'FINAL_APPROVED_BOOKED_FORM'
+      ? { maxEdge: docType === 'KYC_FORM' ? 4200 : 3600, quality: 88 }
+      : {};
+    const pre = await preprocessImage(fileBuffer, mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg', preOpts);
+    filePart = { type: 'image_url', image_url: { url: `data:${pre.mimeType};base64,${pre.buffer.toString('base64')}`, detail: 'high' } };
+  }
 
   onStage?.('OCR');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
-  const requestVision = (model) => {
-    // Ask Groq only for concise structured fields to reduce completion tokens/TPM.
-    const prompt = docType === 'KYC_FORM'
-      ? buildMistralAnnotationPrompt(docType)
-      : buildPrompt(docType);
-    const payload = {
-      model,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: dataUrl } },
-        ],
-      }],
-      temperature: 0.1,
-      max_tokens: docType === 'KYC_FORM' ? 1800 : 1600,
-    };
-    return fetchFn(GROQ_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-  };
-
-  let response;
-  let responseBody = '';
-  const modelUsed = GROQ_VISION_MODEL;
-  try {
-    // Exactly one Groq request per document. The prompt mandates JSON and the parser
-    // tolerates fenced/plain output, avoiding response_format rejection + retry loops.
-    response = await requestVision(modelUsed);
-    if (!response.ok) {
-      responseBody = await response.text();
-    }
-  } catch (error) {
-    if (mistralResult) {
-      console.warn(`[ocr] Groq fallback connection failed; using sparse Mistral result: ${error.message}`);
-      return mistralResult;
-    }
-    const combinedError = new Error('Both Mistral and Groq OCR providers failed', { cause: error });
-    combinedError.status = 502;
-    combinedError.code = 'OCR_PROVIDERS_UNAVAILABLE';
-    combinedError.publicMessage = 'Both OCR providers are temporarily unavailable. Please retry shortly.';
-    throw combinedError;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (!response.ok) {
-    if (mistralResult) {
-      console.warn(`[ocr] Groq fallback failed (${response.status}); using sparse Mistral result`);
-      return mistralResult;
-    }
-    const error = new Error(`Groq fallback could not read the form (HTTP ${response.status})`);
-    error.status = response.status === 429 ? 429 : 502;
-    error.code = response.status === 429
-      ? (docType === 'KYC_FORM' ? 'OCR_PROVIDERS_RATE_LIMITED' : 'GROQ_RATE_LIMITED')
-      : 'GROQ_OCR_FAILED';
-    error.publicMessage = response.status === 429
-      ? (docType === 'KYC_FORM'
-          ? 'Both OCR providers are temporarily rate-limited. Please retry shortly.'
-          : 'OCR is temporarily rate-limited. Please retry this document shortly.')
-      : 'Mistral and Groq could not read this form. Try a clearer scan.';
-    if (response.status === 429) {
-      const retryHeader = Number(response.headers?.get?.('retry-after'));
-      const retryBody = Number(responseBody.match(/try again in\s+([\d.]+)s/i)?.[1]);
-      const retrySeconds = Number.isFinite(retryHeader) && retryHeader > 0
-        ? retryHeader
-        : (Number.isFinite(retryBody) && retryBody > 0 ? retryBody : 30);
-      error.retryAfterMs = Math.min(60_000, Math.max(5_000, Math.ceil(retrySeconds * 1000)));
-    }
-    throw error;
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || '';
-  const raw = extractJsonObject(content);
-
+  const { content, model } = await openRouterChat(
+    [{ type: 'text', text: buildPrompt(docType) }, filePart],
+    { pdf: isPdf, maxTokens: docType === 'KYC_FORM' ? 4000 : 2000 },
+  );
   onStage?.('VALIDATE');
-  const groqResult = finalizeOcrResult(raw, '', docType, `${ENGINE_NAME}:${modelUsed}`);
-  if (mistralResult && Object.keys(mistralResult.fields).length > Object.keys(groqResult.fields).length) {
-    console.warn('[ocr] Groq fallback was sparser than Mistral; keeping the better Mistral extraction');
-    return mistralResult;
+  const result = finalizeOcrResult(extractJsonObject(content), '', docType, engineLabel(model));
+  if (!result.text && !Object.keys(result.fields).length) {
+    throw Object.assign(new Error('OCR returned no readable text'), { status: 422, code: 'OCR_EMPTY', publicMessage: 'No readable text was found. Try a clearer photo or scan, or type the details.' });
   }
-  return groqResult;
+  return result;
 }
 
 // Global provider single-flight for this API process. Queue jobs, synchronous Fresh

@@ -2,6 +2,7 @@ import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } fro
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Upload } from '@aws-sdk/lib-storage';
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
 
 // Same S3-with-local-fallback approach as the accounting backend, but KYC docs
@@ -28,7 +29,7 @@ const usingS3 = () => Boolean(s3Client && process.env.AWS_ACCESS_KEY_ID && BUCKE
 
 /** Upload a KYC document. Returns a storage key: an S3 key, or `local::<name>`. */
 export const uploadKycDocument = async (fileBuffer, originalName, mimetype) => {
-  const safeName = `${Date.now()}-${Math.round(Math.random() * 1e9)}-${originalName.replace(/[^\w.\-]/g, '_')}`;
+  const safeName = `${randomUUID()}-${originalName.replace(/[^\w.\-]/g, '_')}`;
   const key = `kyc_documents/${safeName}`;
 
   if (usingS3()) {
@@ -41,6 +42,7 @@ export const uploadKycDocument = async (fileBuffer, originalName, mimetype) => {
     await upload.done();
     return key;
   }
+  if (process.env.NODE_ENV === 'production') throw Object.assign(new Error('Secure document storage is not configured.'), { status: 503 });
   fs.writeFileSync(path.join(LOCAL_DIR, safeName), fileBuffer);
   return `local::${safeName}`;
 };

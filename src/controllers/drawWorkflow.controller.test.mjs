@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { drawFixture } from '../test/drawFixture.mjs';
+import { drawFixture, TEST_BROKER_CODE } from '../test/drawFixture.mjs';
 import * as controller from './draw.controller.js';
 import { todayIST } from '../services/drawWorkflow.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
@@ -30,7 +30,7 @@ const call = (
   });
 
 test('booking journey on isolated PostgreSQL, including rollback and replay protection', async (t) => {
-  const fixture = await drawFixture();
+  const fixture = await drawFixture({ broker: true });
   let id;
   try {
     await t.test(
@@ -46,6 +46,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         );
         const body = {
           site_id: 1,
+          broker_code: TEST_BROKER_CODE,
           phone: '9876543210',
           full_name: 'Asha Test',
           request_key: 'registration-test-001',
@@ -102,10 +103,19 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
           (await call(controller.startDrawKyc, { params: { id } })).status,
           409,
         );
+        await fixture.query("ALTER TABLE users ADD COLUMN agent_status TEXT DEFAULT 'ACTIVE'");
+        await fixture.query("UPDATE users SET referral_code='AGT-TEST' WHERE id=2");
+        const invalidCollector = await call(controller.addDrawPayment, {
+          params: { id }, body: { amount: 5000, payment_from: 'CASH', received_by_agent_code: 'MISSING' },
+        });
+        assert.equal(invalidCollector.status, 400);
+        assert.equal((await fixture.query('SELECT count(*)::int AS n FROM draw_payments')).rows[0].n, 0);
         const body = {
           amount: 5000,
           payment_from: 'CASH',
           request_key: 'payment-test-001',
+          received_by_agent_code: 'agt-test',
+          received_by: 'Untrusted typed name',
         };
         const first = await call(controller.addDrawPayment, {
           params: { id },
@@ -114,6 +124,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         assert.equal(first.status, 201, JSON.stringify(first.data));
         assert.equal(first.data.payments.length, 1);
         assert.ok(first.data.payments[0].receipt_no);
+        assert.equal(first.data.payments[0].received_by, 'Test Agent (AGT-TEST)');
         const replay = await call(controller.addDrawPayment, {
           params: { id },
           body,
@@ -391,6 +402,7 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         const second = await call(controller.createDraw, {
           body: {
             site_id: 1,
+            broker_code: TEST_BROKER_CODE,
             phone: '9876543210',
             full_name: 'Asha Test',
             request_key: 'registration-test-002',
@@ -406,10 +418,18 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
             .status,
           409,
         );
-        await call(controller.addDrawPayment, {
+        const otherSiteBank = await call(controller.addDrawPayment, {
           params: { id: nextId },
-          body: { amount: 5000, request_key: 'payment-test-002' },
+          body: { amount: 5000, payment_from: 'BANK', bank_details: 'UTR-1', bank_account_id: 2, request_key: 'payment-test-002x' },
         });
+        assert.equal(otherSiteBank.status, 409, 'bank must belong to the draw site');
+        const banked = await call(controller.addDrawPayment, {
+          params: { id: nextId },
+          body: { amount: 5000, payment_from: 'BANK', bank_details: 'UTR-1', bank_account_id: '1', bank_name: 'typed name', request_key: 'payment-test-002' },
+        });
+        assert.equal(banked.status, 201, JSON.stringify(banked.data));
+        const stored = (await fixture.query('SELECT bank_account_id, bank_name FROM draw_payments WHERE draw_registration_id = $1', [nextId])).rows;
+        assert.deepEqual(stored, [{ bank_account_id: 1, bank_name: 'ICICI BANK' }], 'master bank name, not the typed one');
         const started = await call(controller.startDrawKyc, {
           params: { id: nextId },
         });
@@ -467,6 +487,9 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         assert.equal(plot.installments_enabled, false);
         assert.equal(Number(plot.first_installment), 0);
         assert.equal((await fixture.query('SELECT count(*)::int AS n FROM plot_installments WHERE plot_id = 2')).rows[0].n, 0);
+        const mirrored = (await fixture.query(`SELECT pp.bank_name, pp.payment_type, cfe.bank_account_id FROM plot_payments pp
+          JOIN cash_flow_entries cfe ON cfe.source_module = 'plot_payments' AND cfe.source_id = pp.id WHERE pp.plot_id = 2`)).rows;
+        assert.deepEqual(mirrored, [{ bank_name: 'ICICI BANK', payment_type: 'BANK', bank_account_id: 1 }], 'transferred receipt is mapped to the chosen bank in Accounting');
       },
     );
     await t.test(
@@ -488,6 +511,17 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         assert.equal(page2.data.items.length, 2);
         assert.deepEqual(page1.data.totals, { total_paid: 300.75, required_amount: 135000 });
         assert.deepEqual(page2.data.totals, page1.data.totals, 'footer totals must stay constant across pages');
+        // Filters narrow rows, totals and stage counts alike; bad input is rejected.
+        const unpaid = await call(controller.listWorkflow, { query: { site_id: 1, payment: 'UNPAID' } });
+        const partial = await call(controller.listWorkflow, { query: { site_id: 1, payment: 'partial' } });
+        assert.equal(partial.data.total, 2, 'TEST-1 and TEST-27 are part-paid');
+        assert.ok(unpaid.data.items.every((row) => Number(row.total_paid) === 0));
+        const all = (await call(controller.listWorkflow, { query: { site_id: 1 } })).data.total;
+        const paid = (await call(controller.listWorkflow, { query: { site_id: 1, payment: 'PAID' } })).data.total;
+        assert.equal(unpaid.data.total + partial.data.total + paid, all, 'payment filters partition the queue');
+        assert.equal((await call(controller.listWorkflow, { query: { site_id: 1, date_from: '2999-01-01' } })).data.total, 0);
+        assert.equal((await call(controller.listWorkflow, { query: { site_id: 1, date_from: '19-10-2026' } })).status, 400);
+        assert.equal((await call(controller.listWorkflow, { query: { site_id: 1, page_size: 'all' } })).data.items.length, (await call(controller.listWorkflow, { query: { site_id: 1 } })).data.total);
         const searched = await call(controller.listWorkflow, { query: { site_id: 1, stage: 'PAYMENT', q: 'TEST-27' } });
         assert.deepEqual(searched.data.totals, { total_paid: 200.5, required_amount: 5000 }, 'search and stage filter apply to footer totals');
         assert.equal(

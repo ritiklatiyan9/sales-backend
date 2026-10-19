@@ -1,6 +1,8 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
+import { isFullAdmin, canManageStaffAccess } from '../services/subAdminPermissions.js';
 import { isAdminRole, logActivity } from '../services/agentNetwork.service.js';
+import { ITEM_VISIBILITY_SETTINGS, NAVIGATION_SETTINGS, UI_ONLY_SETTINGS } from '../services/navigationSettings.js';
 
 /**
  * Access-control panel for the booking app (admin / super_admin only):
@@ -21,6 +23,8 @@ export const BOOKING_MODULES = [
   'booking_new_entry', 'booking_draws', 'booking_form_studio', 'booking_document_studio', 'booking_draw_attendance',
   'booking_agreement_studio',
   'booking_website_management', 'booking_accountancy_button',
+  ...NAVIGATION_SETTINGS,
+  ...ITEM_VISIBILITY_SETTINGS,
 ];
 
 const requireAdmin = (req, res) => {
@@ -32,10 +36,7 @@ const requireAdmin = (req, res) => {
 };
 
 /** Only a super_admin may manage another admin/super_admin's access. */
-const canManageTarget = (actorRole, targetRole) => {
-  if (actorRole === 'super_admin') return true;
-  return !['super_admin', 'admin'].includes(targetRole);
-};
+const canManageTarget = (actorRole, targetRole) => canManageStaffAccess({ role: actorRole }, { role: targetRole });
 
 /** GET /admin/users — everyone manageable from the panel, with site/team context. */
 export const listUsers = asyncHandler(async (req, res) => {
@@ -83,7 +84,7 @@ export const setUserSites = asyncHandler(async (req, res) => {
   const { rows: target } = await pool.query('SELECT id, role FROM users WHERE id = $1', [id]);
   if (!target[0]) return res.status(404).json({ message: 'User not found' });
   if (!canManageTarget(req.user.role, target[0].role)) {
-    return res.status(403).json({ message: 'Only a super admin can manage another admin' });
+    return res.status(403).json({ message: ['admin', 'super_admin'].includes(target[0].role) ? 'Only a super admin can manage another admin' : 'Only an admin or super admin can change sub-admin access' });
   }
 
   const siteIds = [...new Set((req.body?.site_ids || []).map(Number).filter(Number.isFinite))];
@@ -119,10 +120,14 @@ export const setUserPermission = asyncHandler(async (req, res) => {
   if (mod === 'booking_accountancy_button' && typeof can_read !== 'boolean') {
     return res.status(400).json({ message: 'Accountancy button visibility must be true or false' });
   }
+  if (UI_ONLY_SETTINGS.has(mod) && typeof can_read !== 'boolean') {
+    return res.status(400).json({ message: 'Navigation visibility must be true or false' });
+  }
   const { rows: target } = await pool.query('SELECT id, role FROM users WHERE id = $1', [id]);
   if (!target[0]) return res.status(404).json({ message: 'User not found' });
-  if (!canManageTarget(req.user.role, target[0].role)) {
-    return res.status(403).json({ message: 'Only a super admin can manage another admin' });
+  const ownNavigation = UI_ONLY_SETTINGS.has(mod) && Number(req.user.id) === id;
+  if (!ownNavigation && !canManageTarget(req.user.role, target[0].role)) {
+    return res.status(403).json({ message: ['admin', 'super_admin'].includes(target[0].role) ? 'Only a super admin can manage another admin' : 'Only an admin or super admin can change sub-admin access' });
   }
 
   const { rows } = await pool.query(
@@ -131,7 +136,7 @@ export const setUserPermission = asyncHandler(async (req, res) => {
      ON CONFLICT (user_id, module)
      DO UPDATE SET can_read = $3, can_write = $4, can_update = $5, can_delete = $6, updated_at = now()
      RETURNING module, can_read, can_write, can_update, can_delete`,
-    [id, mod, !!can_read, mod === 'booking_accountancy_button' ? false : !!can_write, mod === 'booking_accountancy_button' ? false : !!can_update, mod === 'booking_accountancy_button' ? false : !!can_delete]
+    [id, mod, !!can_read, UI_ONLY_SETTINGS.has(mod) ? false : !!can_write, UI_ONLY_SETTINGS.has(mod) ? false : !!can_update, UI_ONLY_SETTINGS.has(mod) ? false : !!can_delete]
   );
   logActivity(req.user.id, id, 'MODULE_PERMISSION_UPDATED', rows[0]);
   res.json(rows[0]);
@@ -139,7 +144,7 @@ export const setUserPermission = asyncHandler(async (req, res) => {
 
 /**
  * GET /admin/my-permissions — the CALLER's booking-module permission map (any
- * authenticated user; used by the sidebar and header). Admins bypass module
+ * authenticated user; used by the sidebar and header). Only full admins bypass module
  * permissions, but their individually configured header visibility still applies.
  */
 export const getMyPermissions = asyncHandler(async (req, res) => {
@@ -154,5 +159,5 @@ export const getMyPermissions = asyncHandler(async (req, res) => {
       can_read: p.can_read, can_write: p.can_write, can_update: p.can_update, can_delete: p.can_delete,
     };
   }
-  res.json({ is_admin: isAdminRole(req.user.role), permissions });
+  res.json({ is_admin: isFullAdmin(req.user), permissions });
 });

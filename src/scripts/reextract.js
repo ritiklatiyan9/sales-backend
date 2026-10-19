@@ -1,5 +1,5 @@
 /**
- * One-time / on-demand backfill: re-run Groq extraction over the latest OCR result
+ * One-time / on-demand backfill: re-run AI field extraction (OpenRouter) over the latest OCR result
  * of every DONE document and rewrite ocr_results.extracted_fields with clean data.
  *
  * Usage:
@@ -8,7 +8,7 @@
  */
 import 'dotenv/config';
 import pool from '../config/db.js';
-import { extractKycFieldsWithAi } from '../services/groq.service.js';
+import { extractKycFieldsWithAi } from '../services/aiExtract.service.js';
 
 const bookingId = process.argv[2] ? Number(process.argv[2]) : null;
 

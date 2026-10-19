@@ -1,14 +1,18 @@
 // Stable route keys only. This setting arranges navigation; module/site access
 // remains enforced independently by the existing permission middleware.
+// Keep in sync with NAV_SECTIONS in sales-dg-frontend/src/lib/navigationModules.js.
 export const DEFAULT_SIDEBAR_LAYOUT = [
-  { id:'overview', items:['/home','/dashboard'] },
-  { id:'site-operations', items:['/clients','/bookings','/plot-status','/website-management','/booking-payments','/bookings/new'] },
+  { id:'overview', items:['/home','/dashboard','/clients','/members'] },
+  { id:'lucky-draw', items:['/draws/new','/draws','/draws/attendance'] },
   { id:'kyc', items:['/kyc/new','/kyc'] },
-  { id:'records', items:['/members','/plot-documents','/agreements','/agreement-studio'] },
+  { id:'bookings', items:['/bookings/new','/bookings','/booking-payments'] },
+  { id:'studio', items:['/booking-form-studio','/application-form-studio','/agreement-studio'] },
+  { id:'site-operations', items:['/plot-status','/website-management'] },
+  { id:'draw-setup', items:['/draws/scan','/draws/settings'] },
+  { id:'records', items:['/plot-documents','/agreements'] },
   { id:'network', items:['/network','/teams'] },
-  { id:'lucky-draw', items:['/draws/new','/draws','/draws/scan','/application-form-studio','/draws/attendance','/draws/settings'] },
-  { id:'sites', items:['/booking-form-studio','/project-details','/project-details?section=payments'] },
-  { id:'administration', items:['/profile','/access'] },
+  { id:'sites', items:['/project-details','/project-details?section=payments'] },
+  { id:'administration', items:['/profile','/access','/module-show'] },
 ];
 export const canManageSidebar = user => ['admin','super_admin'].includes(user?.role);
 const fail = message => { throw Object.assign(new Error(message), { status:400 }); };

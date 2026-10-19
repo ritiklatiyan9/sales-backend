@@ -82,7 +82,7 @@ export const syncDrawLedgerToPlot = async (registrationId, db = pool) => {
          ) RETURNING id`,
         [
           reg.allotted_plot_id, reg.plot_site_id, pay.payment_date, paymentFrom, paymentType,
-          up(pay.bank_details), isBankish ? up(pay.bank_name) : null,
+          isBankish ? up(pay.bank_details) : null, isBankish ? up(pay.bank_name) : null,
           isBankish ? up(pay.branch) : null, narration, up(pay.received_by),
           Number(pay.amount), pay.created_by || null,
           paymentFrom === 'CHEQUE' ? (pay.cheque_no ? String(pay.cheque_no).trim() : null) : null,
@@ -91,6 +91,16 @@ export const syncDrawLedgerToPlot = async (registrationId, db = pool) => {
         ]
       );
       const plotPaymentId = ins.rows[0]?.id;
+      // Same link Accounting's "map to bank" writes on the trigger-made ledger mirror,
+      // so the receipt sits under the chosen bank in the Day Book (approval keeps it).
+      if (plotPaymentId && isBankish && pay.bank_account_id) {
+        await db.query(
+          `UPDATE cash_flow_entries SET bank_account_id = $1, updated_at = NOW()
+            WHERE source_module = 'plot_payments' AND source_id = $2 AND site_id = $3
+              AND EXISTS (SELECT 1 FROM bank_accounts WHERE id = $1 AND site_id = $3)`,
+          [pay.bank_account_id, plotPaymentId, reg.plot_site_id]
+        );
+      }
       if (plotPaymentId) {
         await db.query('UPDATE draw_payments SET plot_payment_id = $1 WHERE id = $2', [plotPaymentId, pay.id]);
         created += 1;

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { drawFixture } from '../test/drawFixture.mjs';
+import { drawFixture, TEST_BROKER_CODE } from '../test/drawFixture.mjs';
 import { createBooking, getBookingDrawCredits, getBookingIntake } from './booking.controller.js';
 import { createDraw, setDrawSettings, addDrawPayment } from './draw.controller.js';
 import { listPlotPayments } from './plotPayments.controller.js';
@@ -14,11 +14,11 @@ const call = (handler, { body = {}, params = {}, query = {}, user = admin } = {}
 });
 
 test('new-booking draw credits preserve receipts, enforce ownership and transfer atomically once', async t => {
-  const f = await drawFixture();
+  const f = await drawFixture({ broker: true });
   try {
     await migrateWebsiteBookings(f.pool);
     await call(setDrawSettings, { body:{ site_id:1, required_amount:5000, wait_days:10 } });
-    const created = await call(createDraw, { body:{ site_id:1, full_name:'Credit customer', phone:'9888877777', scheme_name:'A1' } });
+    const created = await call(createDraw, { body:{ site_id:1, broker_code: TEST_BROKER_CODE, full_name:'Credit customer', phone:'9888877777', scheme_name:'A1' } });
     assert.equal(created.status,201,JSON.stringify(created.data));
     const drawId = created.data.id;
     const memberId = created.data.client_member_id;

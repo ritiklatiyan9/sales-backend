@@ -11,7 +11,7 @@ types.setTypeParser(1082, (v) => v);
 
 // Mirrors the accounting backend's db config so booking-api binds to the SAME database.
 const sslOption = process.env.DB_SSL === 'true' || (process.env.DB_HOST && process.env.DB_HOST.includes('neon'))
-  ? { rejectUnauthorized: false }
+  ? { rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false', ...(process.env.DB_SSL_CA ? { ca: process.env.DB_SSL_CA.replace(/\\n/g, '\n') } : {}) }
   : false;
 
 const pool = new Pool({

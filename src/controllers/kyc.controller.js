@@ -408,7 +408,7 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
       mime_type: req.file.mimetype,
       file_size: req.file.size,
       ocr_status: 'DONE',
-      ocr_engine: String(req.body.engine || 'groq-vision').slice(0, 40),
+      ocr_engine: String(req.body.engine || 'openrouter').slice(0, 40),
       ocr_completed_at: new Date(),
     }, client);
 
@@ -422,7 +422,7 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
         JSON.stringify(extractedFields),
         Math.round(confidence * 1000) / 1000,
         JSON.stringify(confidenceMap),
-        String(req.body.engine || 'groq-vision').slice(0, 40),
+        String(req.body.engine || 'openrouter').slice(0, 40),
       ]
     );
     await client.query(

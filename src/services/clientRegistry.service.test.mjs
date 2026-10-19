@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { drawFixture } from '../test/drawFixture.mjs';
 import { migrateClientRegistry } from '../migrations/030_client_registry.js';
 import { normalizeClientIdentity, normalizeClientPhone } from './clientRegistry.service.js';
+import { resolvePaymentCollector } from './paymentCollector.js';
 import * as controller from '../controllers/booking.controller.js';
 
 const admin = { id: 1, role: 'admin' };
@@ -52,6 +53,26 @@ test('reusable client registration and bounded site directory on isolated Postgr
       await fixture.query("INSERT INTO members(site_id,member_type,full_name,phone) VALUES(2,'CLIENT','Separate Site','7777777777')");
     });
 
+    await t.test('member lookup preserves one canonical code ID across formatted mobiles and site copies', async () => {
+      const sameSite = await call(controller.searchClients, { query: { site_id: 1, q: '7777777777' } });
+      assert.equal(sameSite.status, 200);
+      assert.equal(sameSite.data.length, 2);
+      assert.ok(sameSite.data.every(member => member.code_id === 1));
+      const otherSite = await call(controller.searchClients, { query: { site_id: 2, q: '7777777777' } });
+      assert.equal(otherSite.status, 200);
+      assert.equal(otherSite.data[0].code_id, 1);
+    });
+
+    await t.test('registration requires a broker code before creating a client', async () => {
+      for (const agent_referral_code of [undefined, '', '   ']) {
+        const rejected = await call(controller.createClient, { body: { site_id: 1, registration: true,
+          full_name: 'Missing broker', phone: '9876543299', agent_referral_code } });
+        assert.equal(rejected.status, 400, JSON.stringify(rejected.data));
+        assert.equal(rejected.data.code, 'BROKER_CODE_REQUIRED');
+      }
+      assert.equal((await fixture.query("SELECT count(*)::int AS n FROM members WHERE phone='9876543299'")).rows[0].n, 0);
+    });
+
     await t.test('any site-authorized user registers once with normalized identity, explicit referral and reusable KYC', async () => {
       const created = await call(controller.createClient, { user: agent, body: {
         site_id: 1, registration: true, full_name: 'Asha Client', phone: '+91 98765 43210',
@@ -66,7 +87,7 @@ test('reusable client registration and bounded site directory on isolated Postgr
       assert.equal(member.referral_code, 'AGT-SUB');
       assert.equal(member.kyc_status, 'OPEN');
       assert.ok(member.kyc_case_id);
-      const repeat = await call(controller.createClient, { user: agent, body: { site_id: 1, registration: true, full_name: 'Accidental Different Name', phone: '09876543210' } });
+      const repeat = await call(controller.createClient, { user: agent, body: { site_id: 1, registration: true, full_name: 'Accidental Different Name', phone: '09876543210', agent_referral_code: 'AGT-SUB' } });
       assert.equal(repeat.status, 200, JSON.stringify(repeat.data));
       assert.equal(repeat.data.id, member.id);
       assert.equal(repeat.data.kyc_case_id, member.kyc_case_id);
@@ -86,16 +107,16 @@ test('reusable client registration and bounded site directory on isolated Postgr
     });
 
     await t.test('reused registration fills missing KYC identities and rejects conflicting identities atomically', async () => {
-      const first = await call(controller.createClient, { body: { site_id: 1, registration: true, full_name: 'Incomplete Client', phone: '9876543218' } });
+      const first = await call(controller.createClient, { body: { site_id: 1, registration: true, full_name: 'Incomplete Client', phone: '9876543218', agent_referral_code: 'AGT-TEST' } });
       assert.equal(first.status, 201, JSON.stringify(first.data));
-      const completed = await call(controller.createClient, { body: { site_id: 1, registration: true, full_name: 'Retyped Name', phone: '9876543218', pan_no: 'pqrst1234u', aadhar_no: '222233334444' } });
+      const completed = await call(controller.createClient, { body: { site_id: 1, registration: true, full_name: 'Retyped Name', phone: '9876543218', agent_referral_code: 'AGT-TEST', pan_no: 'pqrst1234u', aadhar_no: '222233334444' } });
       assert.equal(completed.status, 200, JSON.stringify(completed.data));
       assert.equal(completed.data.id, first.data.id);
       assert.equal(completed.data.full_name, 'Incomplete Client');
       assert.equal(completed.data.pan_no, 'PQRST1234U');
       assert.equal(completed.data.aadhar_no, '222233334444');
       for (const fields of [{ pan_no: 'ABCDE1234F' }, { aadhar_no: '333344445555' }]) {
-        const conflict = await call(controller.createClient, { body: { site_id: 1, registration: true, full_name: 'Retyped Name', phone: '9876543218', ...fields } });
+        const conflict = await call(controller.createClient, { body: { site_id: 1, registration: true, full_name: 'Retyped Name', phone: '9876543218', agent_referral_code: 'AGT-TEST', ...fields } });
         assert.equal(conflict.status, 409, JSON.stringify(conflict.data));
         assert.equal(conflict.data.code, 'CLIENT_IDENTITY_CONFLICT');
       }
@@ -105,12 +126,12 @@ test('reusable client registration and bounded site directory on isolated Postgr
 
     await t.test('reviewed OCR details complete a sparse KYC profile and retain confirmed values on reuse', async () => {
       const first = await call(controller.createClient, { body: { site_id: 1, registration: true,
-        full_name: 'OCR Reviewed Client', phone: '9876543219', father_name: 'Confirmed Father' } });
+        full_name: 'OCR Reviewed Client', phone: '9876543219', agent_referral_code: 'AGT-TEST', father_name: 'Confirmed Father' } });
       assert.equal(first.status, 201, JSON.stringify(first.data));
       const details = { father_name: 'Replacement Father', date_of_birth: '1995-08-14', gender: 'FEMALE',
         address: '12 Sample Road', city: 'Sample City', state: 'Sample State', pincode: '110001' };
       const completed = await call(controller.createClient, { body: { site_id: 1, registration: true,
-        full_name: 'Retyped Client', phone: '9876543219', ...details } });
+        full_name: 'Retyped Client', phone: '9876543219', agent_referral_code: 'AGT-TEST', ...details } });
       assert.equal(completed.status, 200, JSON.stringify(completed.data));
       const stored = (await fixture.query(`SELECT father_name,date_of_birth::text,gender,address,city,state,pincode
         FROM members WHERE id=$1`, [first.data.id])).rows[0];
@@ -196,7 +217,7 @@ test('reusable client registration and bounded site directory on isolated Postgr
     await t.test('Clients grants protect its directory and intake without blocking shared booking and KYC lookups', async () => {
       await fixture.query("INSERT INTO user_permissions VALUES(2,'booking_clients',false,true,true,true)");
       assert.equal((await call(controller.listClients, { user: agent, query: { site_id: 1 } })).status, 403);
-      const intake = { user: agent, body: { site_id: 1, full_name: 'Permission blocked', phone: '9876543212', registration: true } };
+      const intake = { user: agent, body: { site_id: 1, full_name: 'Permission blocked', phone: '9876543212', registration: true, agent_referral_code: 'AGT-TEST' } };
       assert.equal((await call(controller.createClient, intake)).status, 403);
       assert.equal((await call(controller.previewClientIdentity, { user: agent, body: { site_id: 1 } })).status, 403);
       assert.equal((await call(controller.uploadClientDocument, { user: agent, params: { id: member.id } })).status, 403);
@@ -212,6 +233,53 @@ test('reusable client registration and bounded site directory on isolated Postgr
       assert.equal((await fixture.query('SELECT count(*)::int AS n FROM members WHERE phone=$1', ['9876543212'])).rows[0].n, 0);
       await fixture.query("DELETE FROM user_permissions WHERE user_id=2 AND module='booking_clients'");
       assert.equal((await call(controller.createClient, intake)).status, 201);
+    });
+    await t.test('broker member codes work as referrals without creating staff logins', async () => {
+      const broker = (await fixture.query("INSERT INTO members(site_id,member_type,status,full_name,phone) VALUES(1,'BROKER','ACTIVE','Member Broker','9765432100') RETURNING id")).rows[0];
+      const code = `BRK-${String(broker.id).padStart(5,'0')}`;
+      const lookup = await call(controller.lookupClientReferral,{query:{site_id:1,code}});
+      assert.equal(lookup.status,200,JSON.stringify(lookup.data));
+      assert.equal(lookup.data.name,'Member Broker');
+      assert.equal(lookup.data.member_id,broker.id);
+      const collector = await resolvePaymentCollector({received_by_agent_code:code},1,fixture.pool);
+      assert.equal(collector.memberId,broker.id);
+      assert.equal(collector.receivedBy,`Member Broker (${code})`);
+      const saved = await call(controller.createClient,{body:{site_id:1,registration:true,full_name:'Broker referred Client',phone:'9765432101',agent_referral_code:code}});
+      assert.equal(saved.status,201,JSON.stringify(saved.data));
+      assert.equal(saved.data.referred_by_member_id,broker.id);
+      assert.equal(saved.data.referred_by_code,code);
+      const detail=await call(controller.getClient,{params:{id:saved.data.id}});
+      assert.equal(detail.data.referred_by_code,code);
+      const clientCode=`CLT-${String(saved.data.id).padStart(5,'0')}`;
+      const search=await call(controller.searchClients,{query:{site_id:1,q:clientCode,member_type:'CLIENT'}});
+      assert.equal(search.status,200,JSON.stringify(search.data));
+      assert.deepEqual(search.data.map(r=>r.id),[saved.data.id]);
+      assert.equal(search.data[0].referred_by_code,code);
+      assert.equal((await call(controller.lookupClientReferral,{query:{site_id:2,code}})).status,400);
+      assert.equal((await call(controller.lookupClientReferral,{query:{site_id:1,code:clientCode}})).status,400);
+      await fixture.query("UPDATE members SET status='INACTIVE' WHERE id=$1",[broker.id]);
+      assert.equal((await call(controller.lookupClientReferral,{query:{site_id:1,code}})).status,400);
+    });
+    await t.test('shared broker code resolves an existing active Member at this site without changing roles', async () => {
+      const local = (await fixture.query("INSERT INTO members(site_id,member_type,status,full_name,phone) VALUES(1,'MEMBER','ACTIVE','Shared broker identity','9654321000') RETURNING id")).rows[0];
+      const code = `BRK-${String(local.id).padStart(5,'0')}`;
+      assert.equal((await call(controller.lookupClientReferral,{query:{site_id:1,code}})).status,400);
+      await fixture.query("INSERT INTO members(site_id,member_type,status,full_name,phone) VALUES(2,'BROKER','ACTIVE','Shared broker identity','+91 9654321000')");
+      const lookup = await call(controller.lookupClientReferral,{query:{site_id:1,code}});
+      assert.equal(lookup.status,200,JSON.stringify(lookup.data));
+      assert.equal(lookup.data.member_id,local.id);
+      assert.equal(lookup.data.referral_code,code);
+      const registered=await call(controller.createClient,{body:{site_id:1,registration:true,full_name:'Shared broker customer',phone:'9654321001',agent_referral_code:code}});
+      assert.equal(registered.status,201,JSON.stringify(registered.data));
+      assert.equal(registered.data.referred_by_member_id,local.id);
+      assert.equal(registered.data.referred_by_code,code);
+      const detail=await call(controller.getClient,{params:{id:registered.data.id}});
+      assert.equal(detail.data.referred_by_code,code);
+      const search=await call(controller.searchClients,{query:{site_id:1,q:'9654321001'}});
+      assert.equal(search.data[0].referred_by_code,code);
+      assert.equal((await fixture.query('SELECT member_type FROM members WHERE id=$1',[local.id])).rows[0].member_type,'MEMBER');
+      await fixture.query("UPDATE members SET status='INACTIVE' WHERE id=$1",[local.id]);
+      assert.equal((await call(controller.lookupClientReferral,{query:{site_id:1,code}})).status,400);
     });
   } finally { await fixture.close(); }
 });

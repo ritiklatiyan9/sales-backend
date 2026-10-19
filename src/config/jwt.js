@@ -8,7 +8,7 @@ const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 // Both tokens live 24h from login → user logs in once per day; keep in sync with the accounting backend.
 export const signAccessToken = (payload) => jwt.sign(payload, ACCESS_SECRET, { expiresIn: '24h' });
 export const signRefreshToken = (payload) => jwt.sign(payload, REFRESH_SECRET, { expiresIn: '24h' });
-export const verifyToken = (token, secret = ACCESS_SECRET) => jwt.verify(token, secret);
+export const verifyToken = (token, secret = ACCESS_SECRET) => jwt.verify(token, secret, { algorithms: ['HS256'] });
 export const hashPassword = async (password) => await bcrypt.hash(password, 10);
 export const comparePassword = async (password, hash) => {
   if (!password || !hash || typeof password !== 'string' || typeof hash !== 'string') return false;

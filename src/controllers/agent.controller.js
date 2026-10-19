@@ -1,3 +1,4 @@
+import { canManageStaffAccess } from '../services/subAdminPermissions.js';
 import bcrypt from 'bcrypt';
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
@@ -198,6 +199,7 @@ export const updateAgent = asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const { rows: existing } = await pool.query('SELECT id, role FROM users WHERE id = $1', [id]);
   if (!existing[0]) return res.status(404).json({ message: 'Agent not found' });
+  if (!canManageStaffAccess(req.user, existing[0])) return res.status(403).json({ message: 'Only a higher-level administrator can update this account.' });
 
   const b = req.body || {};
   const sets = [];
@@ -237,7 +239,8 @@ export const updateAgent = asyncHandler(async (req, res) => {
      RETURNING id, name, email, role, designation, referral_code, parent_user_id, team_id, agent_status, can_register_agents, is_active`,
     params
   );
-  logActivity(req.user.id, id, 'AGENT_UPDATED', b);
+  const { new_password: _password, ...audit } = b;
+  logActivity(req.user.id, id, 'AGENT_UPDATED', audit);
   res.json(rows[0]);
 });
 

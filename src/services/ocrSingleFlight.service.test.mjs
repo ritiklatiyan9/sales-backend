@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 
 test('serializes concurrent OCR callers so only one provider request is active', async () => {
   const previousFetch = globalThis.fetch;
-  const previousGroqKey = process.env.GROQ_API_KEY;
-  process.env.GROQ_API_KEY = 'test-groq-key';
+  const previousKey = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
   let activeRequests = 0;
   let maximumActiveRequests = 0;
   let requestCount = 0;
@@ -41,7 +41,7 @@ test('serializes concurrent OCR callers so only one provider request is active',
     assert.equal(second.fields.name, 'Test User');
   } finally {
     globalThis.fetch = previousFetch;
-    if (previousGroqKey === undefined) delete process.env.GROQ_API_KEY;
-    else process.env.GROQ_API_KEY = previousGroqKey;
+    if (previousKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = previousKey;
   }
 });

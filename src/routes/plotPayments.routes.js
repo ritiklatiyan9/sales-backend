@@ -1,3 +1,4 @@
+import { subAdminPermission } from '../middlewares/subAdminPermission.middleware.js';
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import { listPlotPayments, createPlotPayment } from '../controllers/plotPayments.controller.js';
@@ -6,6 +7,7 @@ import { listPlotPayments, createPlotPayment } from '../controllers/plotPayments
 // (enforced in the controller, mirroring the accounting module's role gate).
 const router = express.Router();
 router.use(authMiddleware);
+router.use(subAdminPermission('booking_draws'));
 
 router.get('/', listPlotPayments);
 router.post('/', createPlotPayment);

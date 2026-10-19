@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { drawFixture } from '../test/drawFixture.mjs';
+import { drawFixture, TEST_BROKER_CODE } from '../test/drawFixture.mjs';
 import { migrateDrawEnrollment } from '../migrations/031_draw_enrollment.js';
 import * as controller from './draw.controller.js';
 
@@ -11,14 +11,14 @@ const invoke = (handler, { body = {}, params = {}, user = admin } = {}) => new P
 });
 
 test('registered clients enroll in distinct named draws with retry and database duplicate protection', async t => {
-  const fixture = await drawFixture();
+  const fixture = await drawFixture({ broker: true });
   try {
     await invoke(controller.setDrawSettings, { body: { site_id: 1, required_amount: 5000, scheme_name: 'Default scheme' } });
     const { rows: members } = await fixture.query(`INSERT INTO members (site_id, member_type, full_name, phone, created_by)
       VALUES (1, 'CLIENT', 'Reusable client', '9876543210', 1), (2, 'CLIENT', 'Other site client', '9876543211', 1),
         (1, 'VENDOR', 'Vendor', '9876543212', 1) RETURNING id`);
     const clientId = members[0].id;
-    const base = { site_id: 1, client_member_id: clientId, scheme_name: 'A1', request_key: 'named-draw-test-001' };
+    const base = { site_id: 1, broker_code: TEST_BROKER_CODE, client_member_id: clientId, scheme_name: 'A1', request_key: 'named-draw-test-001' };
     let a1;
 
     await t.test('A1 and B5 share client identity and KYC but retain separate entries and ledgers', async () => {
@@ -87,12 +87,31 @@ test('registered clients enroll in distinct named draws with retry and database 
 
     await t.test('site-authorized agents enroll existing clients in another named draw', async () => {
       const agent = { id: 2, role: 'agent' };
-      const result = await invoke(controller.createDraw, { body: { site_id: 1, client_member_id: clientId, scheme_name: 'C3', request_key: 'agent-client-draw-C3' }, user: agent });
+      const result = await invoke(controller.createDraw, { body: { site_id: 1, broker_code: TEST_BROKER_CODE, client_member_id: clientId, scheme_name: 'C3', request_key: 'agent-client-draw-C3' }, user: agent });
       assert.equal(result.status, 201, JSON.stringify(result.data));
       assert.equal(result.data.client_member_id, clientId);
-      const conflict = await invoke(controller.createDraw, { body: { site_id: 1, client_member_id: clientId, scheme_name: 'B5' }, user: agent });
+      const conflict = await invoke(controller.createDraw, { body: { site_id: 1, broker_code: TEST_BROKER_CODE, client_member_id: clientId, scheme_name: 'B5' }, user: agent });
       assert.equal(conflict.status, 409);
       assert.equal(conflict.data.existing_registration_id, undefined);
+    });
+
+    await t.test('one client can hold several entries in the same draw once each extra entry is confirmed', async () => {
+      const warned = await invoke(controller.createDraw, { body: { ...base, request_key: 'multi-entry-0' } });
+      assert.equal(warned.status, 409, 'an unconfirmed repeat is never created by accident');
+      assert.equal(warned.data.entry_count, 1);
+      const add = (key) => invoke(controller.createDraw, { body: { ...base, request_key: key, additional_entry: true } });
+      const second = await add('multi-entry-2');
+      const third = await add('multi-entry-3');
+      assert.equal(second.status, 201, JSON.stringify(second.data));
+      assert.equal(third.status, 201, JSON.stringify(third.data));
+      assert.notEqual(second.data.registration_no, third.data.registration_no);
+      assert.equal(second.data.kyc_case_id, third.data.kyc_case_id, 'entries share the client’s KYC');
+      assert.equal((await invoke(controller.createDraw, { body: { ...base, request_key: 'multi-entry-4' } })).data.entry_count, 3);
+      // Cancelling a middle entry never makes the next one clash with a live entry.
+      await invoke(controller.cancelDraw, { params: { id: second.data.id } });
+      assert.equal((await add('multi-entry-5')).status, 201);
+      const keys = (await fixture.query(`SELECT enrollment_key FROM draw_registrations WHERE client_member_id = $1 AND scheme_name = 'A1' AND status <> 'CANCELLED' ORDER BY id`, [clientId])).rows.map((r) => r.enrollment_key);
+      assert.deepEqual(keys, ['name:A1', 'name:A1#ENTRY-3', 'name:A1#ENTRY-4']);
     });
   } finally {
     await fixture.close();

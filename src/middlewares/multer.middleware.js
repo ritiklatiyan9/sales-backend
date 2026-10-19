@@ -1,28 +1,21 @@
 import multer from 'multer';
-import path from 'path';
+import { uploadTypeAllowed, validUploadBytes } from '../security/uploadPolicy.js';
+import { documentUploadLimit } from './rateLimit.middleware.js';
 
-// In-memory storage: we hand the buffer straight to the S3 util (so the OCR worker
-// can read it from S3). Validates KYC-friendly file types.
-const storage = multer.memoryStorage();
-
-const fileFilter = (req, file, cb) => {
-  // docx accepted for typed/scanned KYC forms (text extracted via mammoth).
-  const allowed = /jpg|jpeg|png|webp|pdf|docx/;
-  const okExt = allowed.test(path.extname(file.originalname).toLowerCase());
-  // Trust a matching mime, or a generic octet-stream when the extension is valid
-  // (some clients don't set an image/* content-type). docx's real mime is the long
-  // openxml one, which the regex won't match — the extension check covers it.
-  const okMime = allowed.test(file.mimetype)
-    || file.mimetype === 'application/octet-stream'
-    || file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-  if (okExt && okMime) return cb(null, true);
-  cb(new Error('Invalid file type (allowed: jpg, jpeg, png, webp, pdf, docx)'));
-};
-
+const invalid = () => Object.assign(new Error('Invalid file. Upload a matching JPG, PNG, WebP, PDF or DOCX document.'), { status: 400, code: 'INVALID_DOCUMENT_FILE' });
 const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter,
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 40, parts: 41, fieldSize: 256 * 1024 },
+  fileFilter: (req, file, cb) => uploadTypeAllowed(file) ? cb(null, true) : cb(invalid()),
 });
-
+// Validate the actual bytes before controllers store a file or start OCR.
+const single = upload.single.bind(upload);
+upload.single = field => {
+  const receive = single(field);
+  return (req, res, next) => documentUploadLimit(req, res, () => receive(req, res, error => {
+    if (error) return next(error);
+    if (req.file && !validUploadBytes(req.file)) return next(invalid());
+    next();
+  }));
+};
 export default upload;

@@ -1,3 +1,4 @@
+import { parseMemberCode, canonicalMemberIdSql, findBrokerReferral, memberReferral } from './memberCodes.js';
 import { requireSiteAccess } from './bookingWorkspaceAccess.js';
 import { isAdminRole } from './agentNetwork.service.js';
 import { memberTypePayload } from './memberRoles.service.js';
@@ -57,6 +58,11 @@ export function maskClientIdentity(member) {
 export function clientSearchFilter(query, params, alias = 'm') {
   const q = String(query || '').trim().slice(0, 120);
   if (!q) return null;
+  const code = parseMemberCode(q);
+  if (code) {
+    params.push(code.role, code.id);
+    return `(${alias}.member_type=$${params.length - 1} AND ${canonicalMemberIdSql(alias)}=$${params.length})`;
+  }
   if (/^[+\d\s().-]+$/.test(q)) {
     let digits = q.replace(/\D/g, '');
     if (!digits) return 'false';
@@ -72,6 +78,13 @@ export function clientSearchFilter(query, params, alias = 'm') {
 export async function resolveClientReferral(code, siteId, db) {
   const normalized = String(code || '').trim().toUpperCase();
   if (!normalized) return null;
+  const memberCode = parseMemberCode(normalized);
+  if (memberCode) {
+    if (memberCode.role !== 'BROKER') throw clientRegistryError('Use a broker code such as BRK-00002 for the referral',400,'INVALID_AGENT_REFERRAL');
+    const broker = await findBrokerReferral(normalized,siteId,db);
+    if (!broker) throw clientRegistryError('This broker code is invalid, inactive or unavailable for this site',400,'INVALID_AGENT_REFERRAL');
+    return {id:null,member_id:broker.id,name:broker.full_name,referral_code:broker.member_code};
+  }
   if (!/^[A-Z0-9-]{1,40}$/.test(normalized)) throw clientRegistryError('Enter a valid agent referral code');
   const { rows } = await db.query(
     `SELECT u.id, u.name, u.referral_code
@@ -98,7 +111,9 @@ export async function registerClientMember({ input, memberType, editableFields, 
   const values = normalizeClientIdentity({ ...input, full_name: fullName });
   const phone = normalizeClientPhone(input.phone, { required: registration, strict: registration });
   if (phone !== null) values.phone = phone;
-  const referral = await resolveClientReferral(input.agent_referral_code ?? input.referral_code ?? input.agent_code, siteId, db);
+  const referralCode = input.agent_referral_code ?? input.referral_code ?? input.agent_code;
+  if (registration && !String(referralCode || '').trim()) throw clientRegistryError('Broker code is required.', 400, 'BROKER_CODE_REQUIRED');
+  const referral = await resolveClientReferral(referralCode, siteId, db);
   let member;
   let reused = false;
   if (phone) {
@@ -116,7 +131,10 @@ export async function registerClientMember({ input, memberType, editableFields, 
         existing_member_type: member.member_type,
       });
     }
-    if (referral && member.referred_by_user_id && Number(member.referred_by_user_id) !== Number(referral.id)) {
+    if (referral && (
+      (member.referred_by_member_id && Number(member.referred_by_member_id) !== Number(referral.member_id)) ||
+      (!member.referred_by_member_id && member.referred_by_user_id && Number(member.referred_by_user_id) !== Number(referral.id))
+    )) {
       throw clientRegistryError('This client already has a different referring agent. Select the existing client to continue.', 409, 'CLIENT_REFERRAL_CONFLICT');
     }
     const identitySets = [];
@@ -158,6 +176,9 @@ export async function registerClientMember({ input, memberType, editableFields, 
     const { rows } = await db.query(`INSERT INTO members (${columns.join(', ')}) VALUES (${params.map((_, index) => `$${index + 1}`).join(', ')}) RETURNING *`, params);
     member = rows[0];
   }
+  if (referral?.member_id && !member.referred_by_member_id) {
+    member = (await db.query('UPDATE members SET referred_by_member_id=$1, referred_by_member_code=$3, updated_at=now() WHERE id=$2 AND referred_by_member_id IS NULL RETURNING *',[referral.member_id,member.id,referral.referral_code])).rows[0] || member;
+  }
   // Explicit code wins on a new claim. Never replace an existing attribution.
   const referrerId = referral?.id || (!isAdminRole(user.role) ? user.id : null);
   if (referrerId && !member.referred_by_user_id) {
@@ -165,7 +186,7 @@ export async function registerClientMember({ input, memberType, editableFields, 
     member = updated.rows[0] || member;
   }
   const kyc = memberType === 'CLIENT' ? await kycCaseModel.getOrCreateForMember({ memberId: member.id, siteId, createdBy: user.id, visibleUserIds }, db) : null;
-  const agent = member.referred_by_user_id ? (await db.query('SELECT name, referral_code FROM users WHERE id = $1', [member.referred_by_user_id])).rows[0] : null;
+  const agent = await memberReferral(member,db);
   return {
     ...member,
     ...memberTypePayload(member),

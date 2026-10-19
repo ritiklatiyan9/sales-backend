@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { requireSiteAccess } from './bookingWorkspaceAccess.js';
 
 test('site access keeps sub-admins and agents inside their assigned sites', async () => {
-  const db = { query: async (sql, values) => ({ rows: sql.includes('FROM sites') ? [{ id: values[0], name: 'Test site' }] : values[1] === 1 ? [{ '?column?': 1 }] : [] }) };
+  // The user is assigned to site 1 only.
+  const db = { query: async (sql, values) => ({ rows: [{ id: values[0], name: 'Test site', assigned: values[0] === 1 }] }) };
   for (const role of ['sub_admin', 'agent']) {
     assert.equal((await requireSiteAccess({ id: 8, role }, 1, db)).id, 1);
     await assert.rejects(requireSiteAccess({ id: 8, role }, 2, db), error => error.status === 403);

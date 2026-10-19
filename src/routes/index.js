@@ -21,14 +21,16 @@ import { publicVerifyDraw } from '../controllers/draw.controller.js';
 import { publicVerifyKyc } from '../controllers/kyc.controller.js';
 import { publicWebsiteRoutes, websiteManagementRoutes } from './websiteBooking.routes.js';
 
+import { publicVerifyLimit } from '../middlewares/rateLimit.middleware.js';
+
 const router = express.Router();
 
 router.get('/health', (req, res) => res.json({ status: 'ok', service: 'booking-api' }));
 
 // PUBLIC (no auth) — resolves a printed QR against the live row so anyone scanning
 // the form/slip can confirm it is genuine on the website.
-router.get('/public/draws/verify', publicVerifyDraw);
-router.get('/public/kyc/verify', publicVerifyKyc);
+router.get('/public/draws/verify', publicVerifyLimit, publicVerifyDraw);
+router.get('/public/kyc/verify', publicVerifyLimit, publicVerifyKyc);
 router.use('/public/website', publicWebsiteRoutes);
 router.use('/website-management', websiteManagementRoutes);
 

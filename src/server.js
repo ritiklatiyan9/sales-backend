@@ -4,6 +4,9 @@ import app from './app.js';
 import pool, { connectDB } from './config/db.js';
 import { initSocket } from './config/socket.js';
 import { recoverOcrQueue } from './queue/ocrQueue.js';
+import { validateProductionSecurity } from './security/production.js';
+
+validateProductionSecurity();
 
 const PORT = process.env.PORT || 8001;
 const server = http.createServer(app);

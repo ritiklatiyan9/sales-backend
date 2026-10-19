@@ -6,7 +6,7 @@ import {
   signAccessToken, signRefreshToken, verifyToken, hashRefreshToken,
 } from '../config/jwt.js';
 import { firebaseEnabled, verifyFirebaseIdToken } from '../config/firebaseAdmin.js';
-import { mailerEnabled, sendLoginOtpEmail } from '../services/mailer.service.js';
+import { sendLoginOtpEmail } from '../services/mailer.service.js';
 import { isAdminRole } from '../services/agentNetwork.service.js';
 import userModel from '../models/User.model.js';
 import pool from '../config/db.js';
@@ -30,8 +30,7 @@ const issueTokens = async (user) => {
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_RESEND_SECONDS = 30;
-// Keep login available when SMTP is absent or its credentials have expired.
-// Enable the second factor only after the mail transport has been verified.
+// OTP is opt-in, and when enabled delivery failures must never bypass it.
 const LOGIN_OTP_ENABLED = process.env.LOGIN_OTP_ENABLED === 'true';
 
 const maskEmail = (email) => {
@@ -75,8 +74,8 @@ const startOtpChallenge = async (user, res) => {
   });
 };
 
-/** Admin OTP is deliberately opt-in: configured-but-broken SMTP must not lock out admins. */
-const needsOtp = (user) => LOGIN_OTP_ENABLED && isAdminRole(user.role) && mailerEnabled();
+/** An enabled second factor fails closed when its mail transport is unavailable. */
+const needsOtp = (user) => LOGIN_OTP_ENABLED && isAdminRole(user.role);
 
 /**
  * POST /auth/login
@@ -125,7 +124,7 @@ export const login = asyncHandler(async (req, res) => {
  */
 export const verifyLoginOtp = asyncHandler(async (req, res) => {
   const { pending_token, otp } = req.body;
-  if (!pending_token || !otp) {
+  if (typeof pending_token !== 'string' || !/^[a-f0-9]{48}$/.test(pending_token) || !/^\d{6}$/.test(String(otp || '').trim())) {
     return res.status(400).json({ message: 'pending_token and otp are required' });
   }
 
@@ -146,13 +145,17 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
     return res.status(401).json({ message: 'Too many wrong attempts. Please sign in again.' });
   }
 
+  // Reserve one attempt atomically before comparing; parallel guesses cannot
+  // all pass a stale attempts counter.
+  const reserved = await pool.query(
+    `UPDATE login_otps SET attempts=attempts+1
+     WHERE id=$1 AND consumed_at IS NULL AND expires_at>now() AND attempts<$2
+     RETURNING attempts`, [challenge.id, OTP_MAX_ATTEMPTS]
+  );
+  if (!reserved.rows.length) return res.status(401).json({ message: 'This sign-in attempt is no longer valid. Please sign in again.' });
   const ok = await bcrypt.compare(String(otp).trim(), challenge.otp_hash);
   if (!ok) {
-    const { rows: bumped } = await pool.query(
-      'UPDATE login_otps SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts',
-      [challenge.id]
-    );
-    const left = Math.max(0, OTP_MAX_ATTEMPTS - bumped[0].attempts);
+    const left = Math.max(0, OTP_MAX_ATTEMPTS - reserved.rows[0].attempts);
     return res.status(401).json({
       message: left > 0 ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} left.` : 'Too many wrong attempts. Please sign in again.',
     });
@@ -164,7 +167,11 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
 
-  await pool.query('UPDATE login_otps SET consumed_at = now() WHERE id = $1', [challenge.id]);
+  const consumed = await pool.query(
+    'UPDATE login_otps SET consumed_at=now() WHERE id=$1 AND consumed_at IS NULL AND expires_at>now() AND otp_hash=$2 RETURNING id',
+    [challenge.id, challenge.otp_hash]
+  );
+  if (!consumed.rows.length) return res.status(401).json({ message: 'This sign-in attempt is no longer valid. Please sign in again.' });
   const tokens = await issueTokens(user);
   res.json({ user: userModel.sanitize(user), ...tokens });
 });
@@ -172,7 +179,7 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
 /** POST /auth/resend-otp — body { pending_token }. Same challenge, fresh code (30s throttle). */
 export const resendLoginOtp = asyncHandler(async (req, res) => {
   const { pending_token } = req.body;
-  if (!pending_token) return res.status(400).json({ message: 'pending_token is required' });
+  if (typeof pending_token !== 'string' || !/^[a-f0-9]{48}$/.test(pending_token)) return res.status(400).json({ message: 'pending_token is required' });
 
   const { rows } = await pool.query(
     'SELECT * FROM login_otps WHERE pending_token = $1 LIMIT 1',
@@ -194,13 +201,16 @@ export const resendLoginOtp = asyncHandler(async (req, res) => {
 
   const otp = String(crypto.randomInt(100000, 1000000));
   const otpHash = await bcrypt.hash(otp, 10);
-  await pool.query(
+  const resent = await pool.query(
     `UPDATE login_otps
         SET otp_hash = $1, attempts = 0, last_sent_at = now(),
             expires_at = now() + ($2 || ' minutes')::interval
-      WHERE id = $3`,
+      WHERE id = $3 AND consumed_at IS NULL AND expires_at>now()
+        AND last_sent_at <= now() - interval '30 seconds'
+      RETURNING id`,
     [otpHash, OTP_TTL_MINUTES, challenge.id]
   );
+  if (!resent.rows.length) return res.status(429).json({ message: 'Please wait before requesting a new code.' });
   try {
     await sendLoginOtpEmail({ to: user.email, name: user.name, otp, minutes: OTP_TTL_MINUTES });
   } catch (err) {

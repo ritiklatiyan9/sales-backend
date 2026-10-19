@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { drawFixture } from '../test/drawFixture.mjs';
+import { drawFixture, TEST_BROKER_CODE } from '../test/drawFixture.mjs';
 import { migrateSiteDrawEnabled } from '../migrations/035_site_draw_enabled.js';
 import * as controller from './draw.controller.js';
 
@@ -14,7 +14,7 @@ const call = (handler, { body = {}, params = {}, query = {}, user = admin } = {}
 });
 
 test('site draw availability preserves legacy sites, rejects new disabled enrollments and respects access', async t => {
-  const f = await drawFixture();
+  const f = await drawFixture({ broker: true });
   let existing;
   const settings = { site_id: 1, required_amount: 5000, wait_days: 10 };
   try {
@@ -27,7 +27,7 @@ test('site draw availability preserves legacy sites, rejects new disabled enroll
       assert.equal(saved.status, 200, JSON.stringify(saved.data));
       assert.equal(saved.data.enabled, true);
       assert.equal(saved.data.configured, true);
-      existing = await call(controller.createDraw, { body: { site_id: 1, phone: '9876543210', full_name: 'Existing draw client' } });
+      existing = await call(controller.createDraw, { body: { site_id: 1, broker_code: TEST_BROKER_CODE, phone: '9876543210', full_name: 'Existing draw client' } });
       assert.equal(existing.status, 201, JSON.stringify(existing.data));
     });
 
@@ -53,7 +53,7 @@ test('site draw availability preserves legacy sites, rejects new disabled enroll
 
     await t.test('new registrations are blocked before client or KYC writes, while existing records remain accessible', async () => {
       const before = (await f.query('SELECT (SELECT count(*) FROM members)::int AS members, (SELECT count(*) FROM draw_registrations)::int AS draws, (SELECT count(*) FROM kyc_cases)::int AS kycs')).rows[0];
-      const blocked = await call(controller.createDraw, { body: { site_id: 1, phone: '9876543211', full_name: 'Blocked new client' } });
+      const blocked = await call(controller.createDraw, { body: { site_id: 1, broker_code: TEST_BROKER_CODE, phone: '9876543211', full_name: 'Blocked new client' } });
       assert.equal(blocked.status, 409);
       assert.equal(blocked.data.code, 'DRAW_DISABLED');
       assert.deepEqual((await f.query('SELECT (SELECT count(*) FROM members)::int AS members, (SELECT count(*) FROM draw_registrations)::int AS draws, (SELECT count(*) FROM kyc_cases)::int AS kycs')).rows[0], before);
@@ -61,7 +61,7 @@ test('site draw availability preserves legacy sites, rejects new disabled enroll
       assert.equal(readable.status, 200);
       assert.equal(readable.data.id, existing.data.id);
       assert.equal((await call(controller.setDrawSettings, { body: { ...settings, enabled: true } })).data.enabled, true);
-      assert.equal((await call(controller.createDraw, { body: { site_id: 1, phone: '9876543211', full_name: 'Now enabled client' } })).status, 201);
+      assert.equal((await call(controller.createDraw, { body: { site_id: 1, broker_code: TEST_BROKER_CODE, phone: '9876543211', full_name: 'Now enabled client' } })).status, 201);
     });
 
     await t.test('draw rules are only readable for sites the account can access', async () => {

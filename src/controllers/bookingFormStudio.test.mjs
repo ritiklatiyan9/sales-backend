@@ -17,7 +17,7 @@ const template = {
 test('Booking Form Studio publication, isolation and permission boundaries', async t => {
   const f = await drawFixture();
   try {
-    await f.db.exec(`CREATE TABLE user_sites(user_id INTEGER,site_id INTEGER); CREATE TABLE user_permissions(user_id INTEGER,module TEXT,can_read BOOLEAN,can_write BOOLEAN,can_update BOOLEAN,can_delete BOOLEAN); INSERT INTO user_sites VALUES(2,1);`);
+    await f.db.exec(`CREATE TABLE IF NOT EXISTS user_sites(user_id INTEGER,site_id INTEGER); CREATE TABLE user_permissions(user_id INTEGER,module TEXT,can_read BOOLEAN,can_write BOOLEAN,can_update BOOLEAN,can_delete BOOLEAN); INSERT INTO user_sites SELECT 2,1 WHERE NOT EXISTS (SELECT 1 FROM user_sites WHERE user_id=2 AND site_id=1);`);
     await migrateBookingFormStudio(f.pool); await migrateBookingFormStudio(f.pool);
     await f.query(`INSERT INTO project_settings(site_id,company_address,payment_terms,document_config) VALUES(1,'Site office','Existing payment terms',$1) ON CONFLICT(site_id) DO UPDATE SET company_address=EXCLUDED.company_address,payment_terms=EXCLUDED.payment_terms,document_config=EXCLUDED.document_config`,[JSON.stringify({booking_rules:'Existing site terms'})]);
     await t.test('designer imports the same company details and terms as the printed form', async () => {

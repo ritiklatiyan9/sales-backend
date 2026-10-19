@@ -26,7 +26,7 @@ test('one revisioned sidebar is shared across users and sites without changing a
     assert.equal(first.status,200);assert.equal(first.data.scope,'global');assert.equal(first.data.can_edit,false);assert.equal(first.data.revision,0);
     assert.equal(first.headers['Cache-Control'],'private, no-store');
     const moved=structuredClone(DEFAULT_SIDEBAR_LAYOUT);
-    moved[1].items=moved[1].items.filter(path=>path!=='/clients');moved[0].items.unshift('/clients');
+    moved[1].items=moved[1].items.filter(path=>path!=='/draws/new');moved[0].items.unshift('/draws/new');
     await t.test('only current Admin or Super Admin may save a global change',async()=>{
       for(const role of ['agent','sub_admin','staff','client'])assert.equal((await call(saveSidebarLayout,{user:{id:2,role},body:{layout:moved,revision:0}})).status,403);
       assert.equal((await call(saveSidebarLayout,{body:{layout:moved,revision:0,site_id:1}})).status,400);

@@ -8,10 +8,8 @@ import nodemailer from 'nodemailer';
  *   SMTP_SECURE=true for port 465, otherwise STARTTLS on 587
  *   SMTP_FROM   display sender, defaults to SMTP_USER
  *
- * When SMTP is not configured the transporter is null and callers degrade
- * gracefully (admin login skips the OTP step with a server-side warning) —
- * otherwise adding this feature would lock every admin out before the
- * credentials exist.
+ * When SMTP is not configured the transporter is null. If OTP is explicitly
+ * enabled, sign-in must fail closed rather than skipping its second factor.
  */
 const HOST = process.env.SMTP_HOST;
 const PORT = Number(process.env.SMTP_PORT) || 587;
@@ -28,13 +26,15 @@ if (HOST && USER && PASS) {
   });
   console.log(`[booking-api] Mailer ready (${HOST}:${PORT})`);
 } else {
-  console.warn('[booking-api] SMTP not configured — admin login OTP is DISABLED until SMTP_HOST/SMTP_USER/SMTP_PASS are set');
+  console.warn('[booking-api] SMTP not configured — email verification cannot be delivered');
 }
 
 export const mailerEnabled = () => !!transporter;
 
 /** Send the 6-digit login code. Throws on delivery failure (caller surfaces 502). */
 export async function sendLoginOtpEmail({ to, name, otp, minutes }) {
+  if (!transporter) throw new Error('Email verification transport is unavailable');
+  const safeName = String(name || 'Admin').replace(/[&<>"']/g, character => `&#${character.charCodeAt(0)};`);
   const brand = '#4c1d95';
   await transporter.sendMail({
     from: process.env.SMTP_FROM || `"Defence Garden ERP" <${USER}>`,

@@ -4,13 +4,16 @@ import {
 } from '../controllers/auth.controller.js';
 import authMiddleware from '../middlewares/auth.middleware.js';
 
-const router = express.Router();
+import { loginIpLimit, loginAccountLimit, refreshLimit } from '../middlewares/rateLimit.middleware.js';
 
-router.post('/login', login);
-router.post('/google', googleLogin);
-router.post('/verify-otp', verifyLoginOtp);
-router.post('/resend-otp', resendLoginOtp);
-router.post('/refresh', refresh);
+const router = express.Router();
+router.use((req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
+
+router.post('/login', loginIpLimit, loginAccountLimit, login);
+router.post('/google', loginIpLimit, googleLogin);
+router.post('/verify-otp', loginIpLimit, verifyLoginOtp);
+router.post('/resend-otp', loginIpLimit, resendLoginOtp);
+router.post('/refresh', refreshLimit, refresh);
 router.get('/me', authMiddleware, getMe);
 router.patch('/profile', authMiddleware, updateProfile);
 router.patch('/staff/:userId/kyc', authMiddleware, linkStaffKyc);

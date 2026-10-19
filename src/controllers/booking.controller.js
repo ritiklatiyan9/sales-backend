@@ -1,3 +1,4 @@
+import { parseMemberCode, canonicalMemberIdSql, memberCodeSql, memberReferral } from '../services/memberCodes.js';
 import { allotDrawBooking } from './draw.controller.js';
 import { ensureBookingCreditFields, listBookingDrawCredits } from '../services/bookingDrawCredits.js';
 import { money } from '../services/drawWorkflow.js';
@@ -576,14 +577,22 @@ export const deleteBooking = asyncHandler(async (req, res) => {
 // Identity lookups are shared within an authorised site. Case/documents retain
 // their separate network ownership; list/search never expose complete KYC IDs.
 const clientLookupSelect = `
-  SELECT m.id, m.site_id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no,
+  SELECT m.id,
+         COALESCE((SELECT MIN(person.id) FROM members person
+           WHERE LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(m.phone, ''), '[^0-9]', '', 'g'), 10)) = 10
+             AND RIGHT(REGEXP_REPLACE(COALESCE(person.phone, ''), '[^0-9]', '', 'g'), 10)
+               = RIGHT(REGEXP_REPLACE(COALESCE(m.phone, ''), '[^0-9]', '', 'g'), 10)), m.id)::int AS code_id,
+         m.site_id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no,
          m.photo, m.occupation, m.father_name, m.created_at,
          m.member_type, m.member_type AS registration_role, m.member_type AS role,
-         u.name AS referred_by_name, u.referral_code AS referred_by_code,
-         u.name AS referral_agent_name, u.referral_code,
+         COALESCE(broker.full_name,u.name) AS referred_by_name,
+         CASE WHEN broker.id IS NOT NULL THEN COALESCE(m.referred_by_member_code,${memberCodeSql('broker')}) ELSE u.referral_code END AS referred_by_code,
+         COALESCE(broker.full_name,u.name) AS referral_agent_name,
+         CASE WHEN broker.id IS NOT NULL THEN COALESCE(m.referred_by_member_code,${memberCodeSql('broker')}) ELSE u.referral_code END AS referral_code,
          k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
     FROM members m
     LEFT JOIN users u ON u.id = m.referred_by_user_id
+    LEFT JOIN members broker ON broker.id=m.referred_by_member_id AND broker.site_id=m.site_id
     LEFT JOIN LATERAL (
       SELECT kc.id, kc.status, (kc.booking_id IS NULL OR b.status = 'CANCELLED') AS attachable
         FROM kyc_cases kc LEFT JOIN bookings b ON b.id = kc.booking_id
@@ -607,7 +616,9 @@ export const searchClients = asyncHandler(async (req, res) => {
     // picker and /clients directory use indexed prefixes; older general lookups
     // also need partial names, identity numbers and accounting member roles.
     const q = String(req.query.q || '').trim().slice(0, 120);
-    if (q) {
+    if (parseMemberCode(q)) {
+      where.push(clientSearchFilter(q,params));
+    } else if (q) {
       params.push(`%${q.replace(/[\\%_]/g, '\\$&')}%`);
       const parameter = `$${params.length}`;
       const matches = ['full_name', 'phone', 'aadhar_no', 'pan_no', 'member_type']
@@ -681,6 +692,23 @@ export const lookupClientReferral = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /banks?site_id= — the site's active company bank accounts (the shared
+ * Accounting `bank_accounts` master), for the payment "Bank name" dropdown.
+ * Admin roles only: they are the ones who record payments. Account numbers are
+ * reduced to the last 4 digits.
+ */
+export const listSiteBanks = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Admin access required' });
+  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const { rows } = await pool.query(
+    `SELECT id, name, branch, RIGHT(account_no, 4) AS account_last4
+       FROM bank_accounts WHERE site_id = $1 AND is_active IS NOT FALSE ORDER BY name, id`,
+    [site.id]
+  );
+  res.json({ banks: rows });
+});
+
+/**
  * GET /agents/search?site_id=&q= — members who can EARN a commission (the "Booking By"
  * override). Excludes CLIENT/FARMER/VENDOR; returns brokers/members/partners/employees
  * at the site. Used by the booking form's optional "Booking Agent" picker.
@@ -717,10 +745,11 @@ const requireClientMember = async (user, id, db = pool) => {
 
 export const getClient = asyncHandler(async (req, res) => {
   const member = await requireClientMember(req.user, req.params.id);
-  const { rows } = await pool.query(`SELECT u.name, u.referral_code FROM users u WHERE u.id = $1`, [member.referred_by_user_id]);
-  res.json({ ...member, ...memberTypePayload(member), referred_by_name: rows[0]?.name || null,
-    referred_by_code: rows[0]?.referral_code || null, referral_agent_name: rows[0]?.name || null,
-    referral_code: rows[0]?.referral_code || null });
+  const agent = await memberReferral(member,pool);
+  const {rows:[identity]}=await pool.query(`SELECT ${canonicalMemberIdSql()}::int AS code_id FROM members m WHERE m.id=$1`,[member.id]);
+  res.json({ ...member, ...memberTypePayload(member), code_id:identity?.code_id || member.id, referred_by_name: agent?.name || null,
+    referred_by_code: agent?.referral_code || null, referral_agent_name: agent?.name || null,
+    referral_code: agent?.referral_code || null });
 });
 
 /** POST /clients — legacy role-aware create plus the reusable client register. */

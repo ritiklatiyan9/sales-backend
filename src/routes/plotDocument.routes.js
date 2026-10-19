@@ -1,3 +1,4 @@
+import { subAdminPermission } from '../middlewares/subAdminPermission.middleware.js';
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import upload from '../middlewares/multer.middleware.js';
@@ -7,6 +8,7 @@ import {
 
 const router = express.Router();
 router.use(authMiddleware);
+router.use(subAdminPermission('booking_plot_documents'));
 
 router.get('/', listPlotsWithDocs);                                  // ?site_id=X
 router.get('/:plotId', getPlotDocuments);
