@@ -10,7 +10,7 @@ import { deleteKycDocument, getKycDocumentUrl, uploadKycDocument, getPublicKycUr
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
-import { isAdminRole, getVisibleUserIds } from '../services/agentNetwork.service.js';
+import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import {
   memberTypeFilterFromQuery,
   memberTypeFromBody,
@@ -689,6 +689,37 @@ export const lookupClientReferral = asyncHandler(async (req, res) => {
   const code = req.query.code || req.params.code;
   if (!code) throw clientRegistryError('Agent referral code is required');
   res.json(await resolveClientReferral(code, site.id, pool));
+});
+
+/**
+ * DELETE /clients/:id — remove a member from the Members directory (admins; sub-admins
+ * need Members → Delete). The database keeps anyone with bookings, draw entries, a
+ * login or referrals (FK RESTRICT → 409); dealers in a team must be removed from the
+ * team first. Their unattached KYC case and documents go with them; the members row
+ * is archived by Accounting's recycle-bin trigger.
+ */
+export const deleteClientMember = asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Only administrators can delete members' });
+  const id = Number(req.params.id);
+  const { rows } = await pool.query('SELECT id, site_id, full_name FROM members WHERE id = $1', [id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Member not found' });
+  await requireSiteAccess(req.user, rows[0].site_id);
+  const { rows: dealer } = await pool.query('SELECT t.name FROM team_dealers td JOIN teams t ON t.id = td.team_id WHERE td.member_id = $1 LIMIT 1', [id]).catch(() => ({ rows: [] }));
+  if (dealer[0]) return res.status(409).json({ message: `Remove ${rows[0].full_name} from Team ${dealer[0].name} first` });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM documents WHERE kyc_case_id IN (SELECT id FROM kyc_cases WHERE client_member_id = $1 AND booking_id IS NULL)', [id]);
+    await client.query('DELETE FROM kyc_cases WHERE client_member_id = $1 AND booking_id IS NULL', [id]);
+    await client.query('DELETE FROM members WHERE id = $1', [id]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23503' || error.code === '23001') return res.status(409).json({ code: 'MEMBER_HAS_LINKED_RECORDS', message: `${rows[0].full_name} has bookings, draw entries or other linked records and can’t be deleted. Cancel or remove those first.` });
+    throw error;
+  } finally { client.release(); }
+  logActivity(req.user.id, null, 'MEMBER_DELETED', { member_id: id, site_id: rows[0].site_id, name: rows[0].full_name });
+  res.json({ message: 'Member deleted', id });
 });
 
 /**

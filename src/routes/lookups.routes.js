@@ -4,7 +4,7 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import upload from '../middlewares/multer.middleware.js';
 import {
   searchClients, getClient, createClient, updateClient, availablePlots, uploadClientPhoto,
-  getClientPayments, searchAgents, listClients, lookupClientReferral, listSiteBanks,
+  getClientPayments, searchAgents, listClients, lookupClientReferral, listSiteBanks, deleteClientMember,
   uploadClientDocument, getClientDocuments, previewClientIdentity,
 } from '../controllers/booking.controller.js';
 
@@ -24,6 +24,7 @@ router.get('/clients/:id/payments', subAdminPermission(['booking_draws', 'bookin
 router.get('/clients/:id/documents', subAdminPermission(['booking_clients', 'booking_members', 'booking_kyc_all', 'booking_kyc_new'], 'can_read'), getClientDocuments);
 router.post('/clients/:id/documents', upload.single('file'), uploadClientDocument);
 router.put('/clients/:id', subAdminPermission(['booking_members', 'booking_clients'], 'can_update'), updateClient);
+router.delete('/clients/:id', subAdminPermission('booking_members', 'can_delete'), deleteClientMember);
 router.post('/clients/:id/photo', subAdminPermission(['booking_members', 'booking_clients'], 'can_update'), upload.single('photo'), uploadClientPhoto);
 router.get('/plots/available', availablePlots);
 
