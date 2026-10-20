@@ -1,5 +1,5 @@
 import { isAdminRole } from './agentNetwork.service.js';
-import { normalizeMemberType } from './memberRoles.service.js';
+import { normalizeMemberType, addMemberType } from './memberRoles.service.js';
 
 /**
  * Quick-add a person from a bare mobile number into the SHARED Accounting `members`
@@ -42,20 +42,8 @@ export async function findOrCreateMemberByPhone(
   );
   let member = existing[0];
 
-  if (member && member.member_type !== canonicalType) {
-    throw Object.assign(
-      new Error(
-        `Mobile number ${cleanPhone} is already registered as ${member.member_type} for ${member.full_name}. ` +
-        `Select ${member.member_type} or use a different mobile number.`
-      ),
-      {
-        status: 409,
-        code: 'MEMBER_ROLE_CONFLICT',
-        existing_member_id: member.id,
-        existing_member_type: member.member_type,
-      }
-    );
-  }
+  // A person can hold several roles: an existing employee/broker gains this one.
+  if (member) member = await addMemberType(member, canonicalType, client);
 
   if (!member) {
     const roleLabel = canonicalType.charAt(0) + canonicalType.slice(1).toLowerCase();

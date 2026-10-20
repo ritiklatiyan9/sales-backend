@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { verifyCheckoutSignature } from './websiteRazorpay.js';
 import kycCaseModel from '../models/KycCase.model.js';
+import { addMemberType } from './memberRoles.service.js';
 
 export const WEBSITE_MODULE = 'booking_website_management';
 export const WEBSITE_PLOT_NUMBERS = Object.freeze([
@@ -357,7 +358,8 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`member_quick_add:${row.site_id}:${row.buyer_phone}`]);
       const { rows: members } = await client.query("SELECT * FROM members WHERE site_id=$1 AND RIGHT(regexp_replace(COALESCE(phone,''),'\\D','','g'),10)=$2 ORDER BY id LIMIT 1",[row.site_id,row.buyer_phone]);
       let member = members[0];
-      if (member && (String(member.member_type).toUpperCase()!=='CLIENT' || String(member.full_name).trim().toLowerCase()!==row.buyer_name.trim().toLowerCase())) throw websiteError('This mobile number belongs to a different member. Confirm customer identity in Members before approval.',409,'MEMBER_IDENTITY_CONFLICT');
+      if (member && String(member.full_name).trim().toLowerCase()!==row.buyer_name.trim().toLowerCase()) throw websiteError('This mobile number belongs to a different member. Confirm customer identity in Members before approval.',409,'MEMBER_IDENTITY_CONFLICT');
+      if (member) member = await addMemberType(member,'CLIENT',client);
       if (!member) {
         const result = await client.query(`INSERT INTO members(site_id,member_type,status,full_name,phone,email,address,notes,created_by) VALUES($1,'CLIENT','ACTIVE',$2,$3,$4,$5,$6,$7) RETURNING *`,[row.site_id,row.buyer_name,row.buyer_phone,row.buyer_email,row.buyer_address,`Website booking request ${row.id}`,user.id]);
         member = result.rows[0];

@@ -35,7 +35,7 @@ const BOOKING_SQL = `SELECT b.booking_no, m.full_name, m.phone, m.whatsapp, ${me
        COALESCE(NULLIF(btrim(to_jsonb(ps)->'document_config'->>'property_type'), ''),
                 CASE WHEN EXISTS (SELECT 1 FROM draw_registrations r WHERE r.booking_id = b.id) THEN 'Shop' ELSE 'Plot' END) AS unit_label
   FROM bookings b
-  JOIN members m ON m.id = b.client_member_id AND m.member_type = 'CLIENT'
+  JOIN members m ON m.id = b.client_member_id AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))
   JOIN sites s ON s.id = b.site_id
   LEFT JOIN plots p ON p.id = b.plot_id
   LEFT JOIN project_settings ps ON ps.site_id = b.site_id
@@ -95,7 +95,7 @@ export const EVENTS = {
     ),
     sql: `SELECT m.full_name, m.phone, m.whatsapp, s.name AS site_name, ${memberCodeSql('m')} AS member_code
             FROM members m JOIN sites s ON s.id = m.site_id
-           WHERE m.id = $1 AND m.member_type = 'CLIENT'`,
+           WHERE m.id = $1 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`,
   },
   KYC_VERIFIED: {
     label: 'KYC verified',
@@ -111,7 +111,7 @@ export const EVENTS = {
     ),
     sql: `SELECT m.full_name, m.phone, m.whatsapp, s.name AS site_name, ${memberCodeSql('m')} AS member_code
             FROM kyc_cases k
-            JOIN members m ON m.id = k.client_member_id AND m.member_type = 'CLIENT'
+            JOIN members m ON m.id = k.client_member_id AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))
             JOIN sites s ON s.id = COALESCE(k.site_id, m.site_id)
            WHERE k.id = $1`,
   },
@@ -134,7 +134,7 @@ export const EVENTS = {
                  s.name AS site_name, to_jsonb(ps) AS settings
             FROM draw_payments dp
             JOIN draw_registrations r ON r.id = dp.draw_registration_id
-            JOIN members m ON m.id = r.client_member_id AND m.member_type = 'CLIENT'
+            JOIN members m ON m.id = r.client_member_id AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))
             JOIN sites s ON s.id = r.site_id
             LEFT JOIN project_settings ps ON ps.site_id = r.site_id
             LEFT JOIN users u ON u.id = dp.created_by
@@ -174,7 +174,7 @@ export const MARKETING = {
   fields: { customer_name: CUSTOMER.customer_name, project: CUSTOMER.project },
   sql: `SELECT m.full_name, m.phone, m.whatsapp, s.name AS site_name
           FROM members m JOIN sites s ON s.id = m.site_id
-         WHERE m.id = $1 AND m.member_type = 'CLIENT'`,
+         WHERE m.id = $1 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`,
 };
 const specOf = (event) => EVENTS[event] || (event === 'MARKETING' ? MARKETING : null);
 

@@ -1,5 +1,6 @@
 import { canonicalMemberIdSql, findBrokerReferral, parseMemberCode } from './memberCodes.js';
 import { workflowError } from './drawWorkflow.js';
+import { memberHasType } from './memberRoles.service.js';
 
 /**
  * Dealer teams (migration 038). Dealers are Members brokers identified by their
@@ -31,7 +32,7 @@ export async function listDealers(teamIds, siteId, db) {
     const phones = rows.map((r) => r.phone10).filter((p) => p.length === 10);
     const [named, plots, drawn] = await Promise.all([
       db.query(`SELECT x.id, ${PHONE10('x')} AS phone10, UPPER(TRIM(x.full_name)) AS name FROM members x
-        WHERE x.member_type = 'BROKER' AND (x.id = ANY($1::int[]) OR ${PHONE10('x')} = ANY($2::text[]))`, [rows.map((r) => r.member_id), phones]),
+        WHERE 'BROKER' = ANY(COALESCE(x.member_types, ARRAY[x.member_type])) AND (x.id = ANY($1::int[]) OR ${PHONE10('x')} = ANY($2::text[]))`, [rows.map((r) => r.member_id), phones]),
       db.query(`SELECT UPPER(TRIM(booking_by)) AS name, count(*)::int AS n FROM plots
         WHERE site_id = $1 AND booking_by IS NOT NULL AND UPPER(TRIM(COALESCE(status, ''))) NOT IN ('', 'AVAILABLE', 'COMPANY', 'CANCELLED')
         GROUP BY 1`, [Number(siteId)]),
@@ -55,10 +56,10 @@ export async function listDealers(teamIds, siteId, db) {
 /** An active Members broker row → its canonical broker id (the number in BRK-xxxxx). */
 export async function brokerFromMember(memberId, db) {
   const { rows } = await db.query(
-    `SELECT m.id, m.full_name, m.member_type, COALESCE(m.status, 'ACTIVE') AS status, ${canonicalMemberIdSql('m')} AS broker_id
+    `SELECT m.id, m.full_name, m.member_type, m.member_types, COALESCE(m.status, 'ACTIVE') AS status, ${canonicalMemberIdSql('m')} AS broker_id
        FROM members m WHERE m.id = $1`, [Number(memberId)]);
   const row = rows[0];
-  if (!row || row.member_type !== 'BROKER') throw workflowError('Select a broker from Members', 400);
+  if (!row || !memberHasType(row, 'BROKER')) throw workflowError('Select a broker from Members', 400);
   if (row.status !== 'ACTIVE') throw workflowError(`${row.full_name} is not an active broker`, 409);
   return { ...row, broker_id: Number(row.broker_id) };
 }

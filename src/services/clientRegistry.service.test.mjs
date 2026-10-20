@@ -305,5 +305,22 @@ test('reusable client registration and bounded site directory on isolated Postgr
       await fixture.query("UPDATE members SET status='INACTIVE' WHERE id=$1",[local.id]);
       assert.equal((await call(controller.lookupClientReferral,{query:{site_id:1,code}})).status,400);
     });
+
+    await t.test('an employee registers as a client on the same profile and becomes searchable as a client', async () => {
+      const employee = (await fixture.query("INSERT INTO members(site_id,member_type,member_types,status,full_name,phone) VALUES(1,'EMPLOYEE',ARRAY['EMPLOYEE'],'ACTIVE','Staff Buyer','9555500001') RETURNING id")).rows[0];
+      assert.equal((await call(controller.searchClients,{query:{site_id:1,q:'9555500001',member_type:'CLIENT',phone_only:'true'}})).data.length,0);
+      const registered = await call(controller.createClient,{body:{site_id:1,registration:true,full_name:'Staff Buyer',phone:'9555500001',agent_referral_code:'AGT-SUB'}});
+      assert.equal(registered.status,201,JSON.stringify(registered.data));
+      assert.equal(registered.data.id,employee.id);
+      assert.equal(registered.data.reused,false);
+      assert.ok(registered.data.kyc_case_id);
+      const row = (await fixture.query('SELECT member_type,member_types FROM members WHERE id=$1',[employee.id])).rows[0];
+      assert.equal(row.member_type,'EMPLOYEE');
+      assert.deepEqual(row.member_types,['EMPLOYEE','CLIENT']);
+      const found = await call(controller.searchClients,{query:{site_id:1,q:'9555500001',member_type:'CLIENT',phone_only:'true'}});
+      assert.equal(found.data.length,1);
+      assert.deepEqual(found.data[0].member_types,['EMPLOYEE','CLIENT']);
+      assert.equal((await fixture.query("SELECT count(*)::int AS n FROM members WHERE phone='9555500001'")).rows[0].n,1);
+    });
   } finally { await fixture.close(); }
 });

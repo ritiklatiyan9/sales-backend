@@ -77,6 +77,9 @@ const startOtpChallenge = async (user, res) => {
 /** An enabled second factor fails closed when its mail transport is unavailable. */
 const needsOtp = (user) => LOGIN_OTP_ENABLED && isAdminRole(user.role);
 
+// Per-app switch from Accounts' User ID Management (users.can_login_booking).
+const BOOKING_LOGIN_DENIED = 'This ID is not allowed to sign in to Defence Garden Booking. Contact your admin.';
+
 /**
  * POST /auth/login
  * Authenticates against the SHARED accounting `users` table and mints the same JWT
@@ -107,6 +110,9 @@ export const login = asyncHandler(async (req, res) => {
   }
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
+  }
+  if (user.can_login_booking === false) {
+    return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
   }
 
   // Admin-class roles get a second step: a 6-digit code emailed to the account's
@@ -165,6 +171,10 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
   if (!user || !user.is_active) {
     await pool.query('DELETE FROM login_otps WHERE id = $1', [challenge.id]);
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
+  }
+  if (user.can_login_booking === false) {
+    await pool.query('DELETE FROM login_otps WHERE id = $1', [challenge.id]);
+    return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
   }
 
   const consumed = await pool.query(
@@ -280,6 +290,9 @@ export const googleLogin = asyncHandler(async (req, res) => {
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
+  if (user.can_login_booking === false) {
+    return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
+  }
 
   // Same second step as password login: admins confirm a code from their inbox.
   if (needsOtp(user)) return startOtpChallenge(user, res);
@@ -313,7 +326,7 @@ export const refresh = asyncHandler(async (req, res) => {
   }
 
   const user = await userModel.findById(decoded.id);
-  if (!user || user.is_active === false || user.token_version !== decoded.version) {
+  if (!user || user.is_active === false || user.can_login_booking === false || user.token_version !== decoded.version) {
     return res.status(401).json({ message: 'Invalid refresh token' });
   }
 

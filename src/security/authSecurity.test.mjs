@@ -17,7 +17,7 @@ const user={id:2,email:'test@example.test',role:'admin',token_version:1,is_activ
 test('sessions use the current database role, reject revoked/inactive accounts and disallow unexpected signing algorithms', async () => {
   const token=signAccessToken({id:2,version:1,role:'super_admin'});
   assert.equal((await currentStaffSession(token,{query:async()=>({rows:[user]})})).role,'admin');
-  for(const row of [{...user,is_active:false},{...user,token_version:2},{...user,role:'client'}]) await assert.rejects(currentStaffSession(token,{query:async()=>({rows:[row]})}));
+  for(const row of [{...user,is_active:false},{...user,can_login_booking:false},{...user,token_version:2},{...user,role:'client'}]) await assert.rejects(currentStaffSession(token,{query:async()=>({rows:[row]})}));
   const wrongAlgorithm=jwt.sign({id:2,version:1},process.env.JWT_ACCESS_SECRET,{algorithm:'HS384',expiresIn:'5m'});
   await assert.rejects(currentStaffSession(wrongAlgorithm,{query:async()=>({rows:[user]})}));
 });

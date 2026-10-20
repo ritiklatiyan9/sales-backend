@@ -29,7 +29,7 @@ const buttonText = (value) => {
 async function audience(siteId, db) {
   const { rows } = await db.query(
     `SELECT id, phone, whatsapp FROM members
-      WHERE site_id = $1 AND member_type = 'CLIENT' AND COALESCE(status, 'ACTIVE') = 'ACTIVE' ORDER BY id`,
+      WHERE site_id = $1 AND 'CLIENT' = ANY(COALESCE(member_types, ARRAY[member_type])) AND COALESCE(status, 'ACTIVE') = 'ACTIVE' ORDER BY id`,
     [siteId],
   );
   const blocked = new Set((await db.query('SELECT phone FROM whatsapp_opt_outs')).rows.map((r) => r.phone));
@@ -60,7 +60,7 @@ export async function marketingCustomers(user, siteId, db = pool) {
                            ORDER BY (status = 'VERIFIED') DESC, id DESC LIMIT 1) k ON true
        LEFT JOIN (SELECT client_member_id, count(*) AS n FROM bookings WHERE status <> 'CANCELLED' GROUP BY 1) b ON b.client_member_id = m.id
        LEFT JOIN (SELECT client_member_id, count(*) AS n FROM draw_registrations WHERE status <> 'CANCELLED' GROUP BY 1) d ON d.client_member_id = m.id
-      WHERE m.site_id = $1 AND m.member_type = 'CLIENT' AND COALESCE(m.status, 'ACTIVE') = 'ACTIVE'
+      WHERE m.site_id = $1 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type])) AND COALESCE(m.status, 'ACTIVE') = 'ACTIVE'
       ORDER BY m.id`,
     [site.id],
   );

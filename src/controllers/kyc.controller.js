@@ -19,6 +19,7 @@ import {
   memberTypeFromBody,
   memberTypePayload,
   normalizeMemberType,
+  addMemberType,
 } from '../services/memberRoles.service.js';
 
 // Both KYC sidebar modules ('New KYC' / 'All KYCs') manage the same underlying
@@ -165,14 +166,7 @@ export const createCase = asyncHandler(async (req, res) => {
         code: 'MEMBER_SITE_CONFLICT',
       });
     }
-    if (requestedMemberType && member.member_type !== requestedMemberType) {
-      return res.status(409).json({
-        message: `${member.full_name} is registered as ${member.member_type}, not ${requestedMemberType}`,
-        code: 'MEMBER_ROLE_CONFLICT',
-        existing_member_id: member.id,
-        existing_member_type: member.member_type,
-      });
-    }
+    if (requestedMemberType) member = await addMemberType(member, requestedMemberType, pool);
     // Same claim rule as the phone path: the first agent to run this customer's KYC
     // becomes their referrer (never overwrites an existing claim).
     if (!member.referred_by_user_id && !isAdmin) {

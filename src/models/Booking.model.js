@@ -52,7 +52,7 @@ class BookingModel extends MasterModel {
     if (kycStatus) { params.push(kycStatus); where.push(`b.kyc_status = $${params.length}`); }
     if (clientMemberId) { params.push(clientMemberId); where.push(`b.client_member_id = $${params.length}`); }
     if (agentUserId) { params.push(agentUserId); where.push(`b.agent_user_id = $${params.length}`); }
-    if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
+    if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
     if (Array.isArray(visibleUserIds)) {
       params.push(visibleUserIds);
       where.push(`(b.agent_user_id = ANY($${params.length}) OR b.created_by = ANY($${params.length}))`);

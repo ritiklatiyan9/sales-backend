@@ -1,7 +1,7 @@
 import { parseMemberCode, canonicalMemberIdSql, findBrokerReferral, memberReferral } from './memberCodes.js';
 import { requireSiteAccess } from './bookingWorkspaceAccess.js';
 import { isAdminRole } from './agentNetwork.service.js';
-import { memberTypePayload } from './memberRoles.service.js';
+import { memberTypePayload, memberHasType, addMemberType } from './memberRoles.service.js';
 import kycCaseModel from '../models/KycCase.model.js';
 
 export const clientRegistryError = (message, status = 400, code) =>
@@ -125,12 +125,9 @@ export async function registerClientMember({ input, memberType, editableFields, 
     member = existing.rows[0];
   }
   if (member) {
-    if (member.member_type !== memberType) {
-      throw Object.assign(clientRegistryError(`This mobile number is already registered as ${member.member_type} for ${member.full_name}`, 409, 'MEMBER_ROLE_CONFLICT'), {
-        existing_member_id: member.id,
-        existing_member_type: member.member_type,
-      });
-    }
+    // One person, many roles: an employee registering as a client gains CLIENT on the same row.
+    reused = memberHasType(member, memberType);
+    member = await addMemberType(member, memberType, db);
     if (referral && (
       (member.referred_by_member_id && Number(member.referred_by_member_id) !== Number(referral.member_id)) ||
       (!member.referred_by_member_id && member.referred_by_user_id && Number(member.referred_by_user_id) !== Number(referral.id))
@@ -163,7 +160,6 @@ export async function registerClientMember({ input, memberType, editableFields, 
         WHERE id = $${identityParams.length} RETURNING *`, identityParams);
       member = updated.rows[0];
     }
-    reused = true;
   } else {
     const columns = ['site_id', 'member_type', 'status', 'created_by'];
     const params = [siteId, memberType, 'ACTIVE', user.id];

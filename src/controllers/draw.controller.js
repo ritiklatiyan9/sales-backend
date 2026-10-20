@@ -12,6 +12,7 @@ import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
+import { memberHasType } from '../services/memberRoles.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
 import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.model.js';
 import { validateDrawInstallmentPlan } from '../services/drawInstallmentPlan.js';
@@ -307,11 +308,11 @@ export const createDraw = asyncHandler(async (req, res) => {
     // different draws racing to open their first KYC. The unique index is a final
     // database guard. The member check also covers referral-code submissions.
     const { rows: members } = await client.query(`
-      SELECT m.site_id, m.member_type, m.referred_by_user_id, m.created_by, cu.role AS creator_role
+      SELECT m.site_id, m.member_type, m.member_types, m.referred_by_user_id, m.created_by, cu.role AS creator_role
       FROM members m LEFT JOIN users cu ON cu.id = m.created_by WHERE m.id = $1`, [memberId]);
     const mem = members[0];
     if (!mem || Number(mem.site_id) !== Number(site_id)) throw workflowError('Customer does not belong to the selected site');
-    if (mem.member_type !== 'CLIENT') throw workflowError('Select a registered client');
+    if (!memberHasType(mem, 'CLIENT')) throw workflowError('Select a registered client');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`draw_enrollment:${Number(site_id)}:${Number(memberId)}`]);
     const existing = await drawModel.findActiveEnrollment({ siteId: site_id, clientMemberId: memberId, ...drawScheme }, client);
     // One client may hold several entries in the same draw — each is its own booking

@@ -157,6 +157,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
            b.token_amount, b.booked_by, b.buyer_name,
            m.full_name AS client_name, m.photo AS client_photo,
            m.member_type, m.member_type AS registration_role, m.member_type AS role,
+         COALESCE(m.member_types, ARRAY[m.member_type]) AS member_types,
            p.plot_no, p.block AS plot_block
     FROM bookings b
     LEFT JOIN members m ON m.id = b.client_member_id
@@ -303,7 +304,7 @@ export const getBookingIntake = asyncHandler(async (req, res) => {
       ORDER BY (kc.booking_id IS NULL OR b.status = 'CANCELLED') DESC,
                (kc.status = 'VERIFIED') DESC, kc.id DESC LIMIT 1
     ) k ON true
-    WHERE m.id = $1 AND m.site_id = $2 AND m.member_type = 'CLIENT'`, [memberId, site.id]);
+    WHERE m.id = $1 AND m.site_id = $2 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`, [memberId, site.id]);
   if (!rows[0]) return res.status(404).json({ message: 'Client not found at the selected site' });
   const credits = await listBookingDrawCredits(site.id, memberId);
   const draws = ['admin', 'super_admin'].includes(req.user.role) ? credits : credits.map(draw => draw.eligible
@@ -600,6 +601,7 @@ const clientLookupSelect = `
          m.site_id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no,
          m.photo, m.occupation, m.father_name, m.created_at,
          m.member_type, m.member_type AS registration_role, m.member_type AS role,
+         COALESCE(m.member_types, ARRAY[m.member_type]) AS member_types,
          COALESCE(broker.full_name,u.name) AS referred_by_name,
          CASE WHEN broker.id IS NOT NULL THEN COALESCE(m.referred_by_member_code,${memberCodeSql('broker')}) ELSE u.referral_code END AS referred_by_code,
          COALESCE(broker.full_name,u.name) AS referral_agent_name,
@@ -621,7 +623,7 @@ export const searchClients = asyncHandler(async (req, res) => {
   const params = [site.id];
   const where = ['m.site_id = $1'];
   const memberType = memberTypeFilterFromQuery(req.query);
-  if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
+  if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
   const phoneOnly = ['true', '1', 'yes'].includes(String(req.query.phone_only || '').toLowerCase());
   if (phoneOnly) {
     const search = clientSearchFilter(req.query.q, params);
@@ -669,7 +671,7 @@ export const listClients = asyncHandler(async (req, res) => {
   const params = [site.id];
   const where = ['m.site_id = $1'];
   const memberType = memberTypeFilterFromQuery({ member_type: 'CLIENT', ...req.query });
-  if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
+  if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
   const search = clientSearchFilter(req.query.q, params);
   if (search) where.push(search);
   const page = Math.max(1, Math.trunc(Number(req.query.page) || 1));
@@ -814,7 +816,7 @@ export const createClient = asyncHandler(async (req, res) => {
     const member = await registerClientMember({ input: memberInput, memberType,
       editableFields: ACCOUNT_MEMBER_FIELDS, user: req.user, visibleUserIds }, client);
     await client.query('COMMIT');
-    if (!member.reused && member.member_type === 'CLIENT') queueWhatsApp('REGISTERED', member.id);
+    if (!member.reused && memberType === 'CLIENT') queueWhatsApp('REGISTERED', member.id);
     res.status(member.reused ? 200 : 201).json(member);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});

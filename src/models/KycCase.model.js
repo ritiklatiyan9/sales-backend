@@ -143,7 +143,7 @@ class KycCaseModel extends MasterModel {
     // the member's verified case in the current register.
     const statusWhere = currentMembers ? resultWhere : where;
     if (status) { params.push(status); statusWhere.push(`k.status = $${params.length}`); }
-    if (memberType) { params.push(memberType); where.push(`m.member_type = $${params.length}`); }
+    if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
     if (pending) statusWhere.push(`k.status NOT IN ('VERIFIED','REJECTED')`);
     if (q) {
       params.push(`%${q}%`);
