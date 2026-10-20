@@ -17,6 +17,7 @@ import agreementTemplateRoutes from './agreementTemplate.routes.js';
 import bookingFormRoutes from './bookingForm.routes.js';
 import drawAttendanceRoutes from './drawAttendance.routes.js';
 import plotPaymentRoutes from './plotPayments.routes.js';
+import whatsappRoutes from './whatsapp.routes.js';
 import { publicVerifyDraw } from '../controllers/draw.controller.js';
 import { publicVerifyKyc } from '../controllers/kyc.controller.js';
 import { publicWebsiteRoutes, websiteManagementRoutes } from './websiteBooking.routes.js';
@@ -52,5 +53,6 @@ router.use('/agreement-templates', agreementTemplateRoutes); // Agreement Form S
 router.use('/booking-forms', bookingFormRoutes);
 router.use('/draw-attendance', drawAttendanceRoutes);
 router.use('/plot-payments', plotPaymentRoutes); // Shared accounting plot ledger (admin)
+router.use('/whatsapp', whatsappRoutes); // WhatsApp Studio: stages, templates, attachments (admin)
 
 export default router;

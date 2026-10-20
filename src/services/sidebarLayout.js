@@ -6,7 +6,7 @@ export const DEFAULT_SIDEBAR_LAYOUT = [
   { id:'lucky-draw', items:['/draws/new','/draws','/draws/attendance'] },
   { id:'kyc', items:['/kyc/new','/kyc'] },
   { id:'bookings', items:['/bookings/new','/bookings','/booking-payments'] },
-  { id:'studio', items:['/booking-form-studio','/application-form-studio','/agreement-studio'] },
+  { id:'studio', items:['/booking-form-studio','/application-form-studio','/agreement-studio','/whatsapp-studio','/whatsapp-marketing'] },
   { id:'site-operations', items:['/plot-status','/website-management'] },
   { id:'draw-setup', items:['/draws/scan','/draws/settings'] },
   { id:'records', items:['/plot-documents','/agreements'] },

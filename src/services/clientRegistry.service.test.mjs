@@ -63,6 +63,30 @@ test('reusable client registration and bounded site directory on isolated Postgr
       assert.equal(otherSite.data[0].code_id, 1);
     });
 
+    await t.test('directory and detail sign private photos without changing stored URLs', async () => {
+      const names = ['AWS_S3_BUCKET_NAME', 'AWS_REGION', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'];
+      const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+      const photo = 'https://booking-photos.s3.ap-south-1.amazonaws.com/kyc_documents/avatar.jpg';
+      Object.assign(process.env, { AWS_S3_BUCKET_NAME: 'booking-photos', AWS_REGION: 'ap-south-1', AWS_ACCESS_KEY_ID: 'test-key', AWS_SECRET_ACCESS_KEY: 'test-secret' });
+      try {
+        await fixture.query('UPDATE members SET photo=$1 WHERE id=1', [photo]);
+        const search = await call(controller.searchClients, { query: { site_id: 1 } });
+        assert.match(search.data.find(row => row.id === 1).photo, /X-Amz-Signature=/);
+        const directory = await call(controller.listClients, { query: { site_id: 1 } });
+        assert.match(directory.data.items.find(row => row.id === 1).photo, /X-Amz-Signature=/);
+        const detail = await call(controller.getClient, { params: { id: 1 } });
+        assert.match(detail.data.photo, /X-Amz-Signature=/);
+        const otherSite = (await fixture.query('SELECT id FROM members WHERE site_id=2 LIMIT 1')).rows[0];
+        assert.equal((await call(controller.getClient, { user: subAdmin, params: { id: otherSite.id } })).status, 403);
+        assert.equal((await fixture.query('SELECT photo FROM members WHERE id=1')).rows[0].photo, photo);
+      } finally {
+        await fixture.query('UPDATE members SET photo=NULL WHERE id=1');
+        for (const [name, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[name]; else process.env[name] = value;
+        }
+      }
+    });
+
     await t.test('registration requires a broker code before creating a client', async () => {
       for (const agent_referral_code of [undefined, '', '   ']) {
         const rejected = await call(controller.createClient, { body: { site_id: 1, registration: true,

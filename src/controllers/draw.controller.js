@@ -17,6 +17,7 @@ import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.m
 import { validateDrawInstallmentPlan } from '../services/drawInstallmentPlan.js';
 import { normalizeDrawScheme } from '../services/drawEnrollment.js';
 import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
+import { queueWhatsApp } from '../services/whatsapp.service.js';
 
 /**
  * Draw-based shop allotment module.
@@ -452,6 +453,7 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
   }
 
   const client = await pool.connect();
+  let newPaymentId = null; // set only for a genuinely new receipt (request-key retries return early)
   try {
     await client.query('BEGIN');
     const { rows: regRows } = await client.query(
@@ -507,6 +509,7 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
       Object.values(data)
     );
     const payment = rows[0];
+    newPaymentId = payment.id;
     await drawModel.generateReceiptNo(payment.id, client);
     await drawModel.logEvent(registration.id, 'PAYMENT_ADDED', { amount: paymentAmount, payment_id: payment.id, ...(collector ? { collector_id: collector.id, ...(collector.memberId ? {collector_member_id:collector.memberId} : {}), collector_code: collector.code } : {}) }, req.user?.id, client);
     await reconcileEligibility(registration, req.user?.id, client);
@@ -517,6 +520,7 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
   } finally {
     client.release();
   }
+  if (newPaymentId) queueWhatsApp('PAYMENT_RECEIVED', newPaymentId);
 
   const detail = await buildDetail(req.params.id, pool);
   res.status(201).json(detail);
@@ -919,6 +923,8 @@ export async function allotDrawBooking({ registrationId, body, user }) {
   // The unit and receipt ledger are already committed atomically. Complete existing
   // agent attribution/commission enrichment after commit; report its result to the UI.
   const plot_sync = await syncPlotBookingToAccounting(bookingForSync, pool);
+  // Draw winners get this one message (createBooking's draw branch returns before its own).
+  queueWhatsApp('ALLOTTED', bookingForSync.id, `ALLOTTED:${bookingForSync.id}:${bookingForSync.plot_id}`);
 
 
   return { booking: bookingForSync, plot_sync, ledger_sync, token_sync, draw_credit_amount: creditAmount };

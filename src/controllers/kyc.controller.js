@@ -11,6 +11,7 @@ import { runOcr } from '../services/ocr.service.js';
 import { getVisibleUserIds, isAdminRole } from '../services/agentNetwork.service.js';
 import { hasPermission } from '../services/permissions.service.js';
 import { findOrCreateMemberByPhone } from '../services/memberQuickAdd.service.js';
+import { queueWhatsApp } from '../services/whatsapp.service.js';
 import {
   MEMBER_TYPE_OPTIONS,
   compareMemberTypes,
@@ -218,6 +219,7 @@ export const createCase = asyncHandler(async (req, res) => {
     } finally {
       client.release();
     }
+    if (member.is_new && member.member_type === 'CLIENT') queueWhatsApp('REGISTERED', member.id);
   }
 
   res.status(201).json({
@@ -344,6 +346,7 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
   let member;
   let kycCase;
   let doc;
+  let isNewMember = false;
 
   try {
     await client.query('BEGIN');
@@ -351,6 +354,7 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
       { siteId, phone, fullName, memberType, user: req.user },
       client
     );
+    isNewMember = member.is_new === true; // `member` is replaced by the UPDATE below
 
     const cleanMember = {};
     for (const key of FRESH_FORM_MEMBER_FIELDS) {
@@ -437,6 +441,7 @@ export const commitFreshForm = asyncHandler(async (req, res) => {
   } finally {
     client.release();
   }
+  if (isNewMember && member.member_type === 'CLIENT') queueWhatsApp('REGISTERED', member.id);
 
   await linkDocToMember('KYC_FORM', storageKey, member.id).catch((error) => {
     console.error('[fresh KYC] member document link failed:', error.message);
@@ -589,6 +594,7 @@ export const uploadDocument = asyncHandler(async (req, res) => {
       }
       if (req.verifyOnIdentityComplete && await verifyWhenIdentityComplete(kycCase, req.user?.id)) {
         emitOcrUpdate({ bookingId: kycCase.booking_id, caseId: kycCase.id, status: 'VERIFIED' });
+        queueWhatsApp('KYC_VERIFIED', kycCase.id);
       }
     } catch (err) {
       console.error('[kyc upload] post-processing failed:', err.message);
@@ -1017,6 +1023,8 @@ export const verifyCase = asyncHandler(async (req, res) => {
     `UPDATE kyc_cases SET status = 'VERIFIED', verified_by = $1, verified_at = now(), updated_at = now() WHERE id = $2`,
     [req.user?.id || null, kycCase.id]
   );
+  // Before the booking rollup, so a rollup error can't drop it; re-saves of a verified case stay silent.
+  if (kycCase.status !== 'VERIFIED') queueWhatsApp('KYC_VERIFIED', kycCase.id);
   // Member-anchored cases have no booking yet — the rollup happens when an admin
   // creates the booking (the case is adopted and its status carried over).
   if (kycCase.booking_id) {

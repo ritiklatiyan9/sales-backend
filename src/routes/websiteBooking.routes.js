@@ -4,6 +4,7 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import pool from '../config/db.js';
 import { createWebsiteBookingService } from '../services/websiteBookings.js';
 import { createRazorpayGateway, verifyWebhookSignature } from '../services/websiteRazorpay.js';
+import { queueWhatsApp } from '../services/whatsapp.service.js';
 
 export const gateway = createRazorpayGateway();
 export const websiteBookingService = createWebsiteBookingService({
@@ -59,7 +60,12 @@ websiteManagementRoutes.get('/settings',route(async(req,res)=>res.json(await web
 websiteManagementRoutes.put('/settings',route(async(req,res)=>res.json(await websiteBookingService.saveSettings(req.user,req.body))));
 websiteManagementRoutes.get('/requests',route(async(req,res)=>res.json(await websiteBookingService.listRequests(req.user,req.query.site_id,req.query.status))));
 websiteManagementRoutes.post('/requests/:id/reconcile',route(async(req,res)=>res.json(await websiteBookingService.reconcile(req.user,req.params.id,req.body))));
-websiteManagementRoutes.post('/requests/:id/approve',route(async(req,res)=>res.json(await websiteBookingService.approve(req.user,req.params.id,req.body.notes))));
+// Hooked here, not in the service: the service is tested against an injected database.
+websiteManagementRoutes.post('/requests/:id/approve',route(async(req,res)=>{
+  const approved=await websiteBookingService.approve(req.user,req.params.id,req.body.notes);
+  if(approved.booking_id)queueWhatsApp('BOOKING_CREATED',approved.booking_id);
+  res.json(approved);
+}));
 websiteManagementRoutes.post('/requests/:id/reject',route(async(req,res)=>res.json(await websiteBookingService.reject(req.user,req.params.id,req.body.notes))));
 
 // Mounted before express.json(): HMAC must authenticate the exact received bytes.

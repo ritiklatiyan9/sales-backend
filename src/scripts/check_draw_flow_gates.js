@@ -50,6 +50,7 @@ const main = async () => {
 
   // server.js listens on import (PORT env read at module load) — boot on the scratch port.
   process.env.PORT = String(PORT);
+  process.env.WHATSAPP_ENABLED = 'false'; // a self-check must never drain or send the live WhatsApp outbox
   await import('../server.js');
   await new Promise((r) => setTimeout(r, 1200));
 

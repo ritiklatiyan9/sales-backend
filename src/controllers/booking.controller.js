@@ -25,6 +25,11 @@ import {
   normalizeClientIdentity, normalizeClientPhone, registerClientMember, resolveClientReferral,
 } from '../services/clientRegistry.service.js';
 import { uploadDocument } from './kyc.controller.js';
+import { signMemberDocumentUrl } from '../utils/memberDocumentUrls.js';
+import { queueWhatsApp } from '../services/whatsapp.service.js';
+
+// Sign at response time, after site access checks; keep durable URLs in storage.
+const withMemberPhoto = async (member) => ({ ...member, photo: await signMemberDocumentUrl(member.photo) });
 
 // Token-payment capture fields a booking may set (mirror of the accounting plot-payment
 // taking fields). Stored on the booking and propagated to plot_payments by tokenPaymentSync.
@@ -418,6 +423,9 @@ export const createBooking = asyncHandler(async (req, res) => {
   if (created.plot_id) {
     plot_sync = await syncPlotBookingToAccounting(created, pool);
   }
+  // One customer message per booking, naming its unit — never for a unit Accounting has
+  // already committed to another buyer (staff must resolve that first).
+  if (plot_sync?.reason !== 'plot_committed_to_other_buyer') queueWhatsApp('BOOKING_CREATED', created.id);
 
   // Mirror the token amount into the accounting plot_payments ledger (runs AFTER the
   // plot sync so plots.booking_by is populated for the payment's "Booked By").
@@ -490,6 +498,7 @@ export const updateBooking = asyncHandler(async (req, res) => {
   // Empty date string would violate the DATE column — normalise '' → null.
   for (const f of TOKEN_PAYMENT_FIELDS) if (data[f] === '') data[f] = null;
 
+  const { rows: [before] } = await pool.query('SELECT plot_id, status FROM bookings WHERE id = $1', [req.params.id]);
   const updated = await bookingModel.update(req.params.id, data, pool);
   if (!updated) return res.status(404).json({ message: 'Booking not found' });
 
@@ -499,6 +508,12 @@ export const updateBooking = asyncHandler(async (req, res) => {
   const touchesSync = data.plot_id !== undefined || data.booking_agent_id !== undefined || data.booking_date !== undefined;
   if (updated.plot_id && updated.status !== 'CANCELLED' && touchesSync) {
     plot_sync = await syncPlotBookingToAccounting(updated, pool);
+  }
+  // A unit assigned or changed later (or a cancelled booking revived) is an allotment.
+  // The edit dialog re-sends plot_id on every save, so compare with the stored row.
+  if (updated.plot_id && updated.status !== 'CANCELLED' && plot_sync?.reason !== 'plot_committed_to_other_buyer'
+      && (String(updated.plot_id) !== String(before?.plot_id) || before?.status === 'CANCELLED')) {
+    queueWhatsApp('ALLOTTED', updated.id, `ALLOTTED:${updated.id}:${before?.plot_id ?? ''}>${updated.plot_id}`);
   }
 
   // Always reconcile the token payment — token-only edits don't trip touchesSync above,
@@ -638,7 +653,7 @@ export const searchClients = asyncHandler(async (req, res) => {
   params.push(limit);
   const { rows } = await pool.query(`${clientLookupSelect}
     WHERE ${where.join(' AND ')} ORDER BY m.full_name, m.id DESC LIMIT $${params.length}`, params);
-  res.json(rows.map(maskClientIdentity));
+  res.json(await Promise.all(rows.map(async (member) => maskClientIdentity(await withMemberPhoto(member)))));
 });
 
 /** GET /clients?site_id=&q=&page=&limit= — bounded reusable client directory. */
@@ -679,7 +694,7 @@ export const listClients = asyncHandler(async (req, res) => {
   const drawCounts = new Map(counts.rows.map((row) => [Number(row.client_member_id), row.draw_count]));
   const total = count.rows[0].total;
   res.json({
-    items: records.rows.map((member) => maskClientIdentity({ ...member, draw_count: drawCounts.get(Number(member.id)) || 0 })),
+    items: await Promise.all(records.rows.map(async (member) => maskClientIdentity({ ...await withMemberPhoto(member), draw_count: drawCounts.get(Number(member.id)) || 0 }))),
     total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
   });
 });
@@ -778,7 +793,7 @@ export const getClient = asyncHandler(async (req, res) => {
   const member = await requireClientMember(req.user, req.params.id);
   const agent = await memberReferral(member,pool);
   const {rows:[identity]}=await pool.query(`SELECT ${canonicalMemberIdSql()}::int AS code_id FROM members m WHERE m.id=$1`,[member.id]);
-  res.json({ ...member, ...memberTypePayload(member), code_id:identity?.code_id || member.id, referred_by_name: agent?.name || null,
+  res.json({ ...await withMemberPhoto(member), ...memberTypePayload(member), code_id:identity?.code_id || member.id, referred_by_name: agent?.name || null,
     referred_by_code: agent?.referral_code || null, referral_agent_name: agent?.name || null,
     referral_code: agent?.referral_code || null });
 });
@@ -799,6 +814,7 @@ export const createClient = asyncHandler(async (req, res) => {
     const member = await registerClientMember({ input: memberInput, memberType,
       editableFields: ACCOUNT_MEMBER_FIELDS, user: req.user, visibleUserIds }, client);
     await client.query('COMMIT');
+    if (!member.reused && member.member_type === 'CLIENT') queueWhatsApp('REGISTERED', member.id);
     res.status(member.reused ? 200 : 201).json(member);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -910,7 +926,7 @@ export const updateClient = asyncHandler(async (req, res) => {
     vals.push(member.id);
     const { rows } = await client.query(`UPDATE members SET ${sets.join(', ')}, updated_at = now() WHERE id = $${vals.length} RETURNING *`, vals);
     await client.query('COMMIT');
-    res.json({ ...rows[0], ...memberTypePayload(rows[0]) });
+    res.json({ ...await withMemberPhoto(rows[0]), ...memberTypePayload(rows[0]) });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     if (error.code === '23505' && error.constraint === 'members_site_phone_registry_uq') throw clientRegistryError('This mobile number is already registered at this site', 409, 'CLIENT_PHONE_CONFLICT');
@@ -974,5 +990,5 @@ export const uploadClientPhoto = asyncHandler(async (req, res) => {
     [photoUrl, id]
   );
 
-  res.json({ ...rows[0], ...memberTypePayload(rows[0]) });
+  res.json({ ...await withMemberPhoto(rows[0]), ...memberTypePayload(rows[0]) });
 });

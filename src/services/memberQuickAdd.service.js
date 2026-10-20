@@ -66,7 +66,7 @@ export async function findOrCreateMemberByPhone(
        VALUES ($1, $2, 'ACTIVE', $3, $4, $5, $6) RETURNING *`,
       [siteId, canonicalType, name, cleanPhone, user?.id || null, referredBy]
     );
-    member = created[0];
+    member = { ...created[0], is_new: true }; // callers notify genuinely new customers only
   } else if (!member.referred_by_user_id && !isAdmin) {
     // Existing customer without a referrer — the agent adding them now claims it.
     await client.query(

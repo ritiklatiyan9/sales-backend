@@ -2,7 +2,7 @@
 // facts always come from their records, never from document settings.
 export const DOCUMENT_FIELDS = {
   receipt_title: 100, draw_form_title: 100, slip_title: 100, coupon_title: 100, agreement_title: 100,
-  receipt_note: 1400, draw_note: 1000, slip_note: 1000, coupon_note: 400,
+  receipt_terms: 3000, receipt_note: 1400, draw_note: 1000, slip_note: 1000, coupon_note: 400,
   footer_text: 250, applicant_signature: 100, office_signature: 100,
   signatory_name: 120, signatory_designation: 120,
   kyc_declaration: 1600, booking_declarations: 16000, booking_rules: 16000, agreement_terms: 16000,
