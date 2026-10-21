@@ -10,7 +10,7 @@ import crypto from 'crypto';
  * stateless: the page validates the HMAC over the embedded payload (no DB lookup).
  */
 const PUBLIC_VERIFY_URL =
-  process.env.PUBLIC_VERIFY_URL || 'http://localhost:5173/verify-receipt';
+  process.env.PUBLIC_VERIFY_URL || 'https://dgbooking.com/verify-receipt';
 
 /** Receipt-type codes (must match the accounting backend's ReceiptType). */
 export const ReceiptType = {
