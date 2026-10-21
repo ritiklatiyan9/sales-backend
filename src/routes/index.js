@@ -20,6 +20,7 @@ import plotPaymentRoutes from './plotPayments.routes.js';
 import whatsappRoutes from './whatsapp.routes.js';
 import { publicVerifyDraw } from '../controllers/draw.controller.js';
 import { publicVerifyKyc } from '../controllers/kyc.controller.js';
+import { verifyReceiptToken } from '../utils/receiptToken.js';
 import { publicWebsiteRoutes, websiteManagementRoutes } from './websiteBooking.routes.js';
 
 import { publicVerifyLimit } from '../middlewares/rateLimit.middleware.js';
@@ -32,6 +33,11 @@ router.get('/health', (req, res) => res.json({ status: 'ok', service: 'booking-a
 // the form/slip can confirm it is genuine on the website.
 router.get('/public/draws/verify', publicVerifyLimit, publicVerifyDraw);
 router.get('/public/kyc/verify', publicVerifyLimit, publicVerifyKyc);
+// Accounting receipt QRs (signed by either backend with the shared RECEIPT_VERIFY_SECRET).
+router.get('/public/receipts/verify', publicVerifyLimit, (req, res) => {
+  const { valid, payload, reason } = verifyReceiptToken(req.query?.token);
+  res.json(valid ? { valid, receipt: payload } : { valid, reason });
+});
 router.use('/public/website', publicWebsiteRoutes);
 router.use('/website-management', websiteManagementRoutes);
 
