@@ -3,7 +3,7 @@
 // Keep in sync with NAV_SECTIONS in sales-dg-frontend/src/lib/navigationModules.js.
 export const DEFAULT_SIDEBAR_LAYOUT = [
   { id:'overview', items:['/home','/dashboard','/clients','/members'] },
-  { id:'lucky-draw', items:['/draws/new','/draws','/draws/attendance'] },
+  { id:'lucky-draw', items:['/draws/new','/draws','/draw-collections','/draws/attendance'] },
   { id:'kyc', items:['/kyc/new','/kyc'] },
   { id:'bookings', items:['/bookings/new','/bookings','/booking-payments'] },
   { id:'studio', items:['/booking-form-studio','/application-form-studio','/agreement-studio','/whatsapp-studio','/whatsapp-marketing'] },
