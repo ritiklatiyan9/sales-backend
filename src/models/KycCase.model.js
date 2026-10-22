@@ -212,6 +212,22 @@ class KycCaseModel extends MasterModel {
     return rows[0];
   }
 
+  /** Same current-member cases as currentMemberSummary, counted per status (dashboard). */
+  async currentStatusBreakdown({ siteId, visibleUserIds }, pool) {
+    const scoped = Array.isArray(visibleUserIds);
+    const whereSql = `WHERE k.site_id = $1${scoped
+      ? ' AND (k.created_by = ANY($2) OR b.agent_user_id = ANY($2) OR b.created_by = ANY($2))'
+      : ''}`;
+    const { rows } = await pool.query(`
+      ${currentMemberCasesSql(whereSql)}
+      SELECT k.status AS key, count(*)::int AS value
+      FROM current_cases k
+      WHERE k.member_case_rank = 1
+      GROUP BY 1
+    `, scoped ? [siteId, visibleUserIds] : [siteId]);
+    return rows;
+  }
+
   /** Case + member/booking/creator labels (header data for the KYC workspace). */
   async getDetail(id, pool) {
     const { rows } = await pool.query(`

@@ -151,6 +151,8 @@ export const getDashboard = asyncHandler(async (req, res) => {
   // Ownership filter applied to every booking-derived aggregate below. $2 (or $3 where
   // a query already uses $2 for something else) is always the visibleUserIds array.
   const bookingScope = (alias, param) => (scoped ? `AND (${alias}.agent_user_id = ANY($${param}) OR ${alias}.created_by = ANY($${param}))` : '');
+  // KYC cases (alias k, with bookings b LEFT JOINed) — same rule as kycCaseModel.currentMemberSummary.
+  const kycScope = (param) => (scoped ? `AND (k.created_by = ANY($${param}) OR b.agent_user_id = ANY($${param}) OR b.created_by = ANY($${param}))` : '');
 
   const recentSelect = `
     SELECT b.id, b.booking_no, b.status, b.kyc_status, b.booking_date, b.created_at,
@@ -171,7 +173,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
   const listParams = scoped ? [siteId, visibleUserIds] : [siteId];
   const activityParams = scoped ? [siteId, visibleUserIds] : [siteId];
 
-  const [kpi, docs, dist, trend, recent, queue, topExec, activity, myKyc] = await Promise.all([
+  const [kpi, docs, dist, trend, recent, queue, topExec, activity, myKyc, kycTrend, kycStatus] = await Promise.all([
     pool.query(
       `SELECT count(*)::int AS total,
               count(*) FILTER (WHERE status = 'CANCELLED' OR kyc_status = 'REJECTED')::int AS rejected,
@@ -185,9 +187,14 @@ export const getDashboard = asyncHandler(async (req, res) => {
                                AND kyc_status NOT IN ('VERIFIED','REJECTED')
                                AND booking_date < now()::date - 3)::int AS stale,
               COALESCE(SUM(token_amount), 0)::float AS token_total,
-              COALESCE(SUM(token_amount) FILTER (WHERE booking_date >= date_trunc('month', now())), 0)::float AS token_month,
-              COALESCE(SUM(token_amount) FILTER (WHERE booking_date >= date_trunc('month', now()) - interval '1 month'
-                                                 AND booking_date < date_trunc('month', now())), 0)::float AS token_prev_month
+              -- Month tile = Lucky Draw collections (same money as /draw-collections), by payment date in IST.
+              (SELECT COALESCE(SUM(dp.amount) FILTER (WHERE dp.payment_date >= date_trunc('month', (now() AT TIME ZONE 'Asia/Kolkata')::date)), 0)::float
+                 FROM draw_payments dp JOIN draw_registrations r ON r.id = dp.draw_registration_id
+                 WHERE r.site_id = $1 ${scoped ? 'AND (r.agent_user_id = ANY($2) OR r.created_by = ANY($2))' : ''}) AS token_month,
+              (SELECT COALESCE(SUM(dp.amount) FILTER (WHERE dp.payment_date >= date_trunc('month', (now() AT TIME ZONE 'Asia/Kolkata')::date) - interval '1 month'
+                                                    AND dp.payment_date < date_trunc('month', (now() AT TIME ZONE 'Asia/Kolkata')::date)), 0)::float
+                 FROM draw_payments dp JOIN draw_registrations r ON r.id = dp.draw_registration_id
+                 WHERE r.site_id = $1 ${scoped ? 'AND (r.agent_user_id = ANY($2) OR r.created_by = ANY($2))' : ''}) AS token_prev_month
        FROM bookings b WHERE b.site_id = $1 ${bookingScope('b', 2)}`,
       kpiParams
     ),
@@ -199,7 +206,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
        FROM documents d
        LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
        LEFT JOIN bookings  b ON b.id = k.booking_id
-       WHERE d.site_id = $1 ${scoped ? `AND (k.created_by = ANY($2) OR b.agent_user_id = ANY($2) OR b.created_by = ANY($2))` : ''}`,
+       WHERE d.site_id = $1 AND d.kyc_case_id IS NOT NULL ${scoped ? `AND (k.created_by = ANY($2) OR b.agent_user_id = ANY($2) OR b.created_by = ANY($2))` : ''}`,
       docsParams
     ),
     pool.query(
@@ -236,40 +243,61 @@ export const getDashboard = asyncHandler(async (req, res) => {
     pool.query(
       `SELECT * FROM (
          SELECT 'CREATED' AS kind, b.created_at AS at, b.id, b.booking_no,
-                m.full_name AS client_name, NULL AS detail
+                m.full_name AS client_name, NULL AS detail, NULL::bigint AS kyc_id
          FROM bookings b LEFT JOIN members m ON m.id = b.client_member_id
          WHERE b.site_id = $1 ${bookingScope('b', 2)}
          UNION ALL
-         SELECT 'VERIFIED', k.verified_at, b.id, b.booking_no, m.full_name, NULL
+         -- KYC registered without a booking (booking-linked cases surface as CREATED above)
+         SELECT 'KYC_ADDED', k.created_at, NULL, NULL, m.full_name, NULL, k.id
          FROM kyc_cases k
-         JOIN bookings b ON b.id = k.booking_id
-         LEFT JOIN members m ON m.id = b.client_member_id
-         WHERE b.site_id = $1 AND k.verified_at IS NOT NULL ${bookingScope('b', 2)}
+         LEFT JOIN bookings b ON b.id = k.booking_id
+         LEFT JOIN members m ON m.id = k.client_member_id
+         WHERE k.site_id = $1 AND k.booking_id IS NULL ${kycScope(2)}
          UNION ALL
-         SELECT 'OCR_DONE', d.ocr_completed_at, b.id, b.booking_no, m.full_name, d.type
+         SELECT 'VERIFIED', k.verified_at, b.id, b.booking_no, m.full_name, NULL, k.id
+         FROM kyc_cases k
+         LEFT JOIN bookings b ON b.id = k.booking_id
+         LEFT JOIN members m ON m.id = k.client_member_id
+         WHERE k.site_id = $1 AND k.verified_at IS NOT NULL ${kycScope(2)}
+         UNION ALL
+         SELECT 'OCR_DONE', d.ocr_completed_at, b.id, b.booking_no, m.full_name, d.type, k.id
          FROM documents d
          JOIN kyc_cases k ON k.id = d.kyc_case_id
-         JOIN bookings b ON b.id = k.booking_id
-         LEFT JOIN members m ON m.id = b.client_member_id
-         WHERE b.site_id = $1 AND d.ocr_status = 'DONE' AND d.ocr_completed_at IS NOT NULL ${bookingScope('b', 2)}
+         LEFT JOIN bookings b ON b.id = k.booking_id
+         LEFT JOIN members m ON m.id = k.client_member_id
+         WHERE k.site_id = $1 AND d.ocr_status = 'DONE' AND d.ocr_completed_at IS NOT NULL ${kycScope(2)}
        ) ev
        WHERE ev.at IS NOT NULL
        ORDER BY ev.at DESC LIMIT 20`,
       activityParams
     ),
     kycCaseModel.currentMemberSummary({ siteId, visibleUserIds }, pool),
+    // Most sites register KYC long before (or without) a booking — this is where daily volume lives.
+    pool.query(
+      `SELECT to_char(d, 'YYYY-MM-DD') AS key,
+              count(k.id) FILTER (WHERE k.created_at::date = d::date)::int AS kyc_added,
+              count(k.id) FILTER (WHERE k.verified_at::date = d::date)::int AS kyc_verified
+       FROM generate_series(now()::date - ($2::int - 1), now()::date, interval '1 day') AS d
+       LEFT JOIN (kyc_cases k LEFT JOIN bookings b ON b.id = k.booking_id)
+         ON k.site_id = $1 AND (k.created_at::date = d::date OR k.verified_at::date = d::date) ${kycScope(3)}
+       GROUP BY d ORDER BY d`,
+      trendParams
+    ),
+    kycCaseModel.currentStatusBreakdown({ siteId, visibleUserIds }, pool),
   ]);
+  const kycByDay = new Map(kycTrend.rows.map((r) => [r.key, r]));
 
   res.json({
     kpi: kpi.rows[0],
     docs: docs.rows[0],
     distribution: dist.rows,
-    trend: trend.rows,
+    trend: trend.rows.map((t) => ({ ...t, kyc_added: kycByDay.get(t.key)?.kyc_added || 0, kyc_verified: kycByDay.get(t.key)?.kyc_verified || 0 })),
     recent: recent.rows,
     queue: queue.rows,
     top_executive: topExec.rows[0] || null,
     activity: activity.rows,
     my_kyc: myKyc,
+    kyc_status: kycStatus,
     scoped,
     days,
     generated_at: new Date().toISOString(),

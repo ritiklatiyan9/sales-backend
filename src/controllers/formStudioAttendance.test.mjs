@@ -34,13 +34,16 @@ test('site templates and attendance use isolated PostgreSQL',async t=>{
    assert.throws(()=>validateApplicationTemplate({...template,unknown:'field'}));
   });
   await t.test('draft, publication and revision conflicts preserve issued snapshots',async()=>{
-   let saved=await call(studio.saveFormDraft,{params:{siteId:1},body:{template,revision:0}});
+   const withoutOverview={...template,commercial_heading:'',commercial_description:''};
+   let saved=await call(studio.saveFormDraft,{params:{siteId:1},body:{template:withoutOverview,revision:0}});
    assert.equal(saved.status,200,JSON.stringify(saved.data));assert.equal(saved.data.revision,1);
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template,null);
    assert.equal((await call(studio.saveFormDraft,{params:{siteId:1},body:{template,revision:0}})).status,409);
    assert.equal((await call(studio.publishForm,{params:{siteId:1},body:{revision:99}})).status,409);
    assert.equal((await call(studio.publishForm,{params:{siteId:1},body:{revision:1}})).status,200);
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_title,'Naya Baazar');
+   assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_heading,'');
+   assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_description,'');
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:2}})).data.template,null);
    assert.equal((await f.query('SELECT terms_snapshot FROM draw_registrations WHERE id=$1',[drawId])).rows[0].terms_snapshot,'Original issued terms');
    assert.equal((await f.query('SELECT draw_terms FROM project_settings WHERE site_id=1')).rows[0].draw_terms,template.terms);

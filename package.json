@@ -39,7 +39,7 @@
     "test:booking-draw-credits": "node --test src/controllers/bookingDrawCredits.test.mjs",
     "migrate:form-studio-attendance": "node src/migrations/025_form_studio_attendance.js",
     "seed:mount-valley-form": "node src/scripts/seed_mount_valley_form.js",
-    "test:form-studio-attendance": "node --test src/controllers/formStudioAttendance.test.mjs src/services/mountValleyApplicationTerms.test.mjs",
+    "test:form-studio-attendance": "node --test src/controllers/formStudioAttendance.test.mjs src/services/applicationFormTemplate.test.mjs src/services/mountValleyApplicationTerms.test.mjs",
     "migrate:agreement-templates": "node src/migrations/026_agreement_templates.js",
     "test:agreement-templates": "node --test src/services/agreementTemplate.test.mjs",
     "migrate:booking-form-studio": "node src/migrations/027_booking_form_studio.js",
