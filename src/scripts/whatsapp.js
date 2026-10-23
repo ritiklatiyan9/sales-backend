@@ -4,7 +4,7 @@ import { EVENTS, refreshTemplates, sendTestMessage, submitTemplate } from '../se
 
 /**
  * WhatsApp helper (the same actions as WhatsApp Studio). Needs WHATSAPP_PHONE_NUMBER_ID
- * and migrations 039 + 040.
+ * and migrations 039–042. Approval does not apply a version; choose it in Studio.
  *   npm run whatsapp -- templates                 submit the default template for every stage
  *                                                 that has none yet, then print review status
  *   npm run whatsapp -- test 98XXXXXXXX [STAGE]   send a stage's approved template (default

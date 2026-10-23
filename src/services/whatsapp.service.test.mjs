@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { PGlite } from '@electric-sql/pglite';
 import { drawFixture } from '../test/drawFixture.mjs';
 import { migrateWhatsAppMessages } from '../migrations/039_whatsapp_messages.js';
 import { migrateWhatsAppStudio } from '../migrations/040_whatsapp_studio.js';
 import { migrateWhatsAppMarketing } from '../migrations/041_whatsapp_marketing.js';
-import { EVENTS, compileBody, drainWhatsApp, queueWhatsApp, saveStage, studioState, toE164 } from './whatsapp.service.js';
+import { migrateWhatsAppTemplateManagement } from '../migrations/042_whatsapp_template_management.js';
+import { EVENTS, compileBody, deleteTemplate, drainWhatsApp, queueWhatsApp, saveStage, studioState, toE164, updateTemplate } from './whatsapp.service.js';
 import { SAMPLE_RECEIPT, amountInWords, money, receiptTerms, renderDrawReceipt } from './whatsappDocuments.js';
 
 test('toE164 accepts valid Indian mobiles only', () => {
@@ -27,6 +29,12 @@ test('Studio text compiles to Meta positional templates and enforces Meta rules'
     ['Hello {customer_name}', /Start and end/],
     ['Hi {customer_name} {member_id} ok', /between two/],
     ['x'.repeat(1025), /1024/],
+    ['Hello,\n\n\nWe received your payment.', /blank line/],
+    ['Hello,\r\n \r\n \r\nThank you.', /blank line/],
+    ['Hello '+ '🌿'.repeat(11), /11 emojis/],
+    ['Hi {{1}}, welcome aboard.', /supported \{field\}/],
+    ['Hi {customer_name, welcome aboard.', /supported \{field\}/],
+    ['Hi {Customer_name}, welcome aboard.', /supported \{field\}/],
     ['   ', /Write the message/],
   ]) assert.throws(() => compileBody('REGISTERED', body), message);
 });
@@ -45,6 +53,36 @@ test('payment receipt PDF renders one page with the site terms, ₹ amounts and 
   assert.equal(receiptTerms({})[0], '*₹1,00,000 (Rupees One Lakh only) of the booking amount is non-refundable.*');
   assert.deepEqual(receiptTerms({ receipt_terms: ' A \n\n B ' }), ['A', 'B']);
   assert.equal(amountInWords(1234567.5), 'Rupees Twelve Lakh Thirty Four Thousand Five Hundred Sixty Seven and Fifty Paise Only');
+});
+
+test('template management migration pins latest approved once and retains existing stage settings', async () => {
+  const db = new PGlite();
+  try {
+    await migrateWhatsAppStudio(db);
+    await db.exec(`
+      UPDATE whatsapp_templates SET status = 'APPROVED' WHERE event = 'REGISTERED';
+      INSERT INTO whatsapp_templates (event, version, name, body, status) VALUES
+        ('REGISTERED', 2, 'registered_v2', 'New approved version', 'APPROVED'),
+        ('REGISTERED', 3, 'registered_v3', 'Pending version', 'PENDING');
+      INSERT INTO whatsapp_stage_settings (event, enabled, attachment, updated_by) VALUES ('KYC_VERIFIED', FALSE, NULL, 17);
+    `);
+    await migrateWhatsAppTemplateManagement(db);
+    const rows = (await db.query('SELECT event, enabled, attachment, template_name, updated_by FROM whatsapp_stage_settings')).rows;
+    assert.equal(rows.length, Object.keys(EVENTS).length);
+    assert.equal(rows.find((s) => s.event === 'REGISTERED').template_name, 'registered_v2');
+    assert.deepEqual(rows.find((s) => s.event === 'KYC_VERIFIED'),
+      { event: 'KYC_VERIFIED', enabled: false, attachment: null, template_name: null, updated_by: 17 });
+    assert.equal(rows.find((s) => s.event === 'PAYMENT_RECEIVED').attachment, 'DRAW_RECEIPT');
+    await db.exec(`
+      UPDATE whatsapp_stage_settings SET template_name = NULL WHERE event = 'REGISTERED';
+      UPDATE whatsapp_templates SET status = 'APPROVED' WHERE name = 'registered_v3';
+    `);
+    await migrateWhatsAppTemplateManagement(db);
+    assert.equal((await db.query(`SELECT template_name FROM whatsapp_stage_settings WHERE event = 'REGISTERED'`)).rows[0].template_name, null);
+    assert.equal((await db.query(`SELECT title FROM whatsapp_templates WHERE name = 'registered_v2'`)).rows[0].title, 'Client registered · v2');
+  } finally {
+    await db.close();
+  }
 });
 
 test('WhatsApp outbox on isolated PostgreSQL: stages, approved versions, attachments, skips, failures, expiry', async () => {
@@ -67,6 +105,8 @@ test('WhatsApp outbox on isolated PostgreSQL: stages, approved versions, attachm
     const payment = compileBody('PAYMENT_RECEIVED', EVENTS.PAYMENT_RECEIVED.body);
     await f.query(`INSERT INTO whatsapp_templates (event, version, name, body, fields, has_document, status)
       VALUES ('PAYMENT_RECEIVED', 1, 'dgg_payment_received_v1', $1, $2, true, 'APPROVED')`, [EVENTS.PAYMENT_RECEIVED.body, payment.fields]);
+    await migrateWhatsAppTemplateManagement(f.pool);
+    await migrateWhatsAppTemplateManagement(f.pool);
     await f.db.exec(`
       INSERT INTO members (id, site_id, member_type, status, full_name, phone, whatsapp) VALUES
         (11, 1, 'CLIENT', 'ACTIVE', 'Rahul Sharma', '9876543210', NULL),
@@ -133,17 +173,66 @@ test('WhatsApp outbox on isolated PostgreSQL: stages, approved versions, attachm
     await drainWhatsApp({ send: fake, upload });
     assert.deepEqual(sent.at(-1).params, ['Rahul Sharma', 'Commercial Shop A-01', 'Defence Garden', 'BK-2026-000021']);
 
-    // A newer approved version takes over; a pending one never sends.
+    // New approval never silently changes the applied version; applying is explicit.
     await f.query(`INSERT INTO whatsapp_templates (event, version, name, body, fields, status) VALUES
       ('BOOKING_CREATED', 2, 'dgg_booking_created_v2', 'Hi {customer_name}.', '{customer_name}', 'APPROVED'),
       ('BOOKING_CREATED', 3, 'dgg_booking_created_v3', 'Hello {customer_name}.', '{customer_name}', 'PENDING')`);
     await queueWhatsApp('BOOKING_CREATED', 21, 'BOOKING_CREATED:21:v2');
     await drainWhatsApp({ send: fake, upload });
+    assert.equal(sent.at(-1).template, 'dgg_booking_confirmed');
+    await assert.rejects(saveStage('BOOKING_CREATED', { template_name: 'dgg_booking_created_v3' }), /Only Meta-approved/);
+    await assert.rejects(saveStage('BOOKING_CREATED', { template_name: 'dgg_kyc_verified' }), /created for this module/);
+    await saveStage('BOOKING_CREATED', { template_name: 'dgg_booking_created_v2' }, 1);
+    await queueWhatsApp('BOOKING_CREATED', 21, 'BOOKING_CREATED:21:applied');
+    await drainWhatsApp({ send: fake, upload });
     assert.deepEqual(sent.at(-1), { to: '+919876543210', template: 'dgg_booking_created_v2', params: ['Rahul Sharma'] });
+    await f.query(`UPDATE whatsapp_templates SET status = 'APPROVED' WHERE name = 'dgg_booking_created_v3'`);
+    await queueWhatsApp('BOOKING_CREATED', 21, 'BOOKING_CREATED:21:new-approval');
+    await drainWhatsApp({ send: fake, upload });
+    assert.equal(sent.at(-1).template, 'dgg_booking_created_v2');
+
+    // Applied templates are protected, even on a paused module. Archive is reversible,
+    // and an explicit unapply remains unassigned across migration reruns and approvals.
+    await saveStage('BOOKING_CREATED', { enabled: false });
+    await assert.rejects(updateTemplate('dgg_booking_created_v2', { archived: true }), /Unapply it/);
+    await assert.rejects(deleteTemplate('dgg_booking_created_v2'), /Unapply it/);
+    await saveStage('BOOKING_CREATED', { enabled: true, template_name: null });
+    await f.query(`INSERT INTO whatsapp_messages (dedupe_key, event, ref_id, status)
+      VALUES ('BOOKING_CREATED:21:inflight-template', 'BOOKING_CREATED', 21, 'SENDING')`);
+    await assert.rejects(deleteTemplate('dgg_booking_created_v2'), /module is still sending/);
+    await assert.rejects(updateTemplate('dgg_booking_created_v2', { archived: true }), /module is still sending/);
+    await f.query(`UPDATE whatsapp_messages SET status = 'SKIPPED' WHERE dedupe_key = 'BOOKING_CREATED:21:inflight-template'`);
+    await migrateWhatsAppTemplateManagement(f.pool);
+    const archived = await updateTemplate('dgg_booking_created_v2', { archived: true, title: 'Booking confirmation — current' });
+    assert.ok(archived.archived_at);
+    assert.equal(archived.title, 'Booking confirmation — current');
+    await assert.rejects(saveStage('BOOKING_CREATED', { template_name: archived.name }), /Restore the archived/);
+    await queueWhatsApp('BOOKING_CREATED', 21, 'BOOKING_CREATED:21:unassigned');
+    const beforeUnassigned = sent.length;
+    await drainWhatsApp({ send: fake, upload });
+    assert.equal(sent.length, beforeUnassigned);
+    assert.match((await row('BOOKING_CREATED:21:unassigned')).error, /No approved template applied/);
+    const restored = await updateTemplate(archived.name, { archived: false });
+    assert.equal(restored.archived_at, null);
+    delete process.env.WHATSAPP_PHONE_NUMBER_ID;
+    assert.equal((await studioState()).stages.find((s) => s.key === 'BOOKING_CREATED').active_template, null);
+    await assert.rejects(updateTemplate(archived.name, { title: ' ' }), /title/);
+    await assert.rejects(updateTemplate(archived.name, { title: 'x'.repeat(81) }), /80/);
+    await assert.rejects(updateTemplate(archived.name, { archived: 'true' }), /true or false/);
+    await assert.rejects(updateTemplate('missing', { archived: true }), /not found/);
+    await saveStage('BOOKING_CREATED', { template_name: restored.name });
+
+    // Defensive delivery check: an externally archived assignment never falls back.
+    await f.query('UPDATE whatsapp_templates SET archived_at = now() WHERE name = $1', [restored.name]);
+    await queueWhatsApp('BOOKING_CREATED', 21, 'BOOKING_CREATED:21:externally-archived');
+    await drainWhatsApp({ send: fake, upload });
+    assert.match((await row('BOOKING_CREATED:21:externally-archived')).error, /No approved template applied/);
+    await f.query('UPDATE whatsapp_templates SET archived_at = NULL WHERE name = $1', [restored.name]);
 
     // Studio switches: a stage turned off, a document template without an attachment, no approved version.
-    assert.deepEqual(await saveStage('KYC_VERIFIED', { enabled: false }, 1), { event: 'KYC_VERIFIED', enabled: false, attachment: null });
-    await saveStage('PAYMENT_RECEIVED', { enabled: true, attachment: null }, 1);
+    assert.deepEqual(await saveStage('KYC_VERIFIED', { enabled: false }, 1), { event: 'KYC_VERIFIED', enabled: false, attachment: null, template_name: 'dgg_kyc_verified' });
+    await assert.rejects(saveStage('PAYMENT_RECEIVED', { enabled: true, attachment: null }, 1), /Choose an attachment/);
+    await f.query(`UPDATE whatsapp_stage_settings SET attachment = NULL WHERE event = 'PAYMENT_RECEIVED'`);
     await f.query(`UPDATE whatsapp_templates SET status = 'REJECTED' WHERE event = 'ALLOTTED'`);
     for (const [event, id] of [['KYC_VERIFIED', 31], ['PAYMENT_RECEIVED', 52], ['ALLOTTED', 24]]) await queueWhatsApp(event, id, `${event}:${id}:switch`);
     const sentBefore = sent.length;
@@ -163,7 +252,12 @@ test('WhatsApp outbox on isolated PostgreSQL: stages, approved versions, attachm
     assert.deepEqual(studio.stages.map((s) => s.key), Object.keys(EVENTS));
     const paymentStage = studio.stages.find((s) => s.key === 'PAYMENT_RECEIVED');
     assert.deepEqual(paymentStage.documents, [{ key: 'DRAW_RECEIPT', label: 'Payment receipt (PDF)' }]);
-    assert.deepEqual(paymentStage.settings, { enabled: true, attachment: null });
+    assert.deepEqual(paymentStage.settings, { enabled: true, attachment: null, template_name: 'dgg_payment_received_v1' });
+    assert.equal(paymentStage.module, 'Lucky draw');
+    assert.equal(paymentStage.submodule, 'Payment receipts');
+    assert.equal(paymentStage.trigger, 'New draw ledger payment recorded');
+    assert.equal(studio.stages.find((s) => s.key === 'BOOKING_CREATED').active_template.name, 'dgg_booking_created_v2');
+    assert.equal(studio.stages.find((s) => s.key === 'BOOKING_CREATED').active_template.title, 'Booking confirmation — current');
     assert.deepEqual(studio.stages.find((s) => s.key === 'BOOKING_CREATED').templates.map((t) => t.name),
       ['dgg_booking_created_v3', 'dgg_booking_created_v2', 'dgg_booking_confirmed']);
 

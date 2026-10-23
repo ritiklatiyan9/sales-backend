@@ -3,9 +3,9 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import upload from '../middlewares/multer.middleware.js';
 import { DOCUMENTS } from '../services/whatsappDocuments.js';
-import { deleteTemplate, saveStage, sendTestMessage, studioState, submitTemplate } from '../services/whatsapp.service.js';
+import { deleteTemplate, saveStage, sendTestMessage, studioState, submitTemplate, updateTemplate } from '../services/whatsapp.service.js';
 import {
-  addOptOut, cancelCampaign, marketingCustomers, marketingState, removeOptOut, sendMarketingTest, startCampaign, submitMarketingTemplate,
+  addOptOut, cancelCampaign, deleteMarketingTemplate, updateMarketingTemplate, marketingCustomers, marketingState, removeOptOut, sendMarketingTest, startCampaign, submitMarketingTemplate,
 } from '../services/whatsappMarketing.js';
 
 // WhatsApp Studio: admin and super_admin only, like Draw Settings (the sidebar hides it for others).
@@ -17,8 +17,9 @@ router.use((req, res, next) => (['admin', 'super_admin'].includes(req.user?.role
 router.get('/studio', asyncHandler(async (req, res) => res.json(await studioState())));
 router.put('/stages/:event', asyncHandler(async (req, res) => res.json(await saveStage(req.params.event, req.body || {}, req.user.id))));
 router.post('/templates', asyncHandler(async (req, res) => res.status(201).json(await submitTemplate({
-  event: req.body?.event, body: req.body?.body, hasDocument: req.body?.has_document === true, userId: req.user.id,
+  event: req.body?.event, title: req.body?.title, body: req.body?.body, hasDocument: req.body?.has_document === true, userId: req.user.id,
 }))));
+router.patch('/templates/:name', asyncHandler(async (req, res) => res.json(await updateTemplate(req.params.name, req.body || {}))));
 router.delete('/templates/:name', asyncHandler(async (req, res) => {
   await deleteTemplate(req.params.name);
   res.json({ deleted: req.params.name });
@@ -31,13 +32,20 @@ router.get('/documents/:key/sample', asyncHandler(async (req, res) => {
   res.type('application/pdf').set('Content-Disposition', `inline; filename="${doc.filename(doc.sample)}"`).send(await doc.render(doc.sample));
 }));
 
-// WhatsApp Marketing (site-based). Templates are deleted through DELETE /templates/:name above.
+// WhatsApp Marketing: template changes and campaigns are scoped to an accessible site.
 router.get('/marketing', asyncHandler(async (req, res) => res.json(await marketingState(req.user, req.query.site_id))));
 router.get('/marketing/customers', asyncHandler(async (req, res) => res.json(await marketingCustomers(req.user, req.query.site_id))));
 router.post('/marketing/templates', upload.single('image'), asyncHandler(async (req, res) => res.status(201).json(await submitMarketingTemplate({
-  user: req.user, siteId: req.body.site_id, title: req.body.title, body: req.body.body, image: req.file || null,
+  user: req.user, siteId: req.body.site_id, title: req.body.title, body: req.body.body, image: req.file || null, sourceTemplateName: req.body.source_template, reuseImage: req.body.reuse_image === 'true',
   website: { text: req.body.website_text, url: req.body.website_url }, call: { text: req.body.call_text, phone: req.body.call_phone },
 }))));
+router.patch('/marketing/templates/:name', asyncHandler(async (req, res) => res.json(await updateMarketingTemplate({
+  user: req.user, siteId: req.body?.site_id, name: req.params.name, input: { title: req.body?.title, archived: req.body?.archived },
+}))));
+router.delete('/marketing/templates/:name', asyncHandler(async (req, res) => {
+  await deleteMarketingTemplate({ user: req.user, siteId: req.query.site_id, name: req.params.name });
+  res.json({ deleted: req.params.name });
+}));
 router.post('/marketing/test', asyncHandler(async (req, res) => res.json(await sendMarketingTest({
   user: req.user, siteId: req.body?.site_id, templateName: req.body?.template, phone: req.body?.phone,
 }))));

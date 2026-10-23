@@ -2,7 +2,7 @@ import { CreateWhatsAppMessageTemplateCommand, CreateWhatsAppMessageTemplateMedi
 import pool from '../config/db.js';
 import { requireSiteAccess } from './bookingWorkspaceAccess.js';
 import {
-  MARKETING, aws, clean, compileBody, lang, marketingDailyLimit, mediaIdFor, putMedia, refreshTemplates,
+  MARKETING, aws, clean, compileBody, deleteTemplate, updateTemplate, lang, marketingDailyLimit, mediaIdFor, putMedia, refreshTemplates,
   sendWhatsAppTemplate, sender, studioError, toE164, viaAws,
 } from './whatsapp.service.js';
 
@@ -75,13 +75,14 @@ export async function marketingCustomers(user, siteId, db = pool) {
   return { site, customers: customers.sort((a, b) => String(a.name).localeCompare(String(b.name))) };
 }
 
-async function siteTemplate(siteId, name, db) {
+async function siteTemplate(siteId, name, db, lock = false) {
   const { rows: [template] } = await db.query(
-    `SELECT name, fields, status, options FROM whatsapp_templates
-      WHERE name = $1 AND event = 'MARKETING' AND site_id = $2 AND status <> 'DELETED'`,
+    `SELECT name, title, fields, status, archived_at, options FROM whatsapp_templates
+      WHERE name = $1 AND event = 'MARKETING' AND site_id = $2 AND status <> 'DELETED'${lock ? ' FOR UPDATE' : ''}`,
     [name, siteId],
   );
   if (!template) throw studioError('Choose a marketing template of this site', 404);
+  if (template.archived_at) throw studioError('Restore this archived template before using it in a campaign', 409);
   if (template.status !== 'APPROVED') throw studioError('Meta has not approved this template yet', 409);
   return template;
 }
@@ -99,18 +100,18 @@ export async function marketingState(user, siteId, db = pool) {
     try { await refreshTemplates(db); } catch (e) { error = `${e.name}: ${e.message}`; }
   }
   const { rows: templates } = await db.query(
-    `SELECT version, name, body, fields, status, category, rejected_reason, options, created_at FROM whatsapp_templates
+    `SELECT version, name, COALESCE(title, options->>'title', name) AS title, body, fields, status, category, rejected_reason, archived_at, options, created_at FROM whatsapp_templates
       WHERE event = 'MARKETING' AND site_id = $1 AND status <> 'DELETED' ORDER BY version DESC`,
     [site.id],
   );
   const { rows: campaigns } = await db.query(
-    `SELECT c.id, c.template_name, c.status, c.recipients, c.created_at,
+    `SELECT c.id, c.template_name, COALESCE(t.title, t.options->>'title', t.name, c.template_name) AS template_title, c.status, c.recipients, c.created_at,
             count(*) FILTER (WHERE m.status = 'SENT')::int AS sent,
             count(*) FILTER (WHERE m.status IN ('QUEUED', 'SENDING'))::int AS waiting,
             count(*) FILTER (WHERE m.status = 'SKIPPED')::int AS skipped,
             count(*) FILTER (WHERE m.status IN ('FAILED', 'EXPIRED'))::int AS failed
-       FROM whatsapp_campaigns c LEFT JOIN whatsapp_messages m ON m.campaign_id = c.id
-      WHERE c.site_id = $1 GROUP BY c.id ORDER BY c.id DESC LIMIT 20`,
+       FROM whatsapp_campaigns c LEFT JOIN whatsapp_templates t ON t.name = c.template_name LEFT JOIN whatsapp_messages m ON m.campaign_id = c.id
+      WHERE c.site_id = $1 GROUP BY c.id, t.title, t.options, t.name ORDER BY c.id DESC LIMIT 20`,
     [site.id],
   );
   const { rows: optOuts } = await db.query('SELECT phone, reason, created_at FROM whatsapp_opt_outs ORDER BY created_at DESC LIMIT 500');
@@ -134,10 +135,10 @@ export async function marketingState(user, siteId, db = pool) {
 }
 
 /** Submit a MARKETING template for this site: body with {fields}, optional image header and buttons. */
-export async function submitMarketingTemplate({ user, siteId, title, body, image = null, website = {}, call = {} }, db = pool) {
+export async function submitMarketingTemplate({ user, siteId, title, body, image = null, sourceTemplateName = null, reuseImage = false, website = {}, call = {} }, db = pool) {
   const site = await requireSiteAccess(user, siteId, db);
   const label = String(title || '').trim();
-  if (!label || label.length > 60) throw studioError('Give the template a title (up to 60 characters)');
+  if (!label || label.length > 80) throw studioError('Give the template a title (up to 80 characters)');
   const { text, fields } = compileBody('MARKETING', body);
   const buttons = [];
   if (website.url || website.text) {
@@ -152,11 +153,18 @@ export async function submitMarketingTemplate({ user, siteId, title, body, image
   if (image && !IMAGE_TYPES[image.mimetype]) throw studioError('The image must be a JPG or PNG');
   if (image && image.size > 5 * 1024 * 1024) throw studioError('The image must be 5 MB or smaller (WhatsApp limit)');
 
+  let reusedImageKey = null;
+  if (reuseImage && !image) {
+    const { rows: [source] } = await db.query(`SELECT options FROM whatsapp_templates WHERE name = $1 AND event = 'MARKETING' AND site_id = $2 AND status <> 'DELETED'`, [sourceTemplateName, site.id]);
+    if (!source?.options?.image_key) throw studioError('The original image is unavailable. Upload a replacement image.');
+    reusedImageKey = source.options.image_key;
+    if (!process.env.WHATSAPP_MEDIA_BUCKET) throw studioError('Image storage is not configured', 409);
+  }
   const { wabaId } = await viaAws(sender());
   const components = [];
   let imageKey = null;
-  if (image) {
-    const stored = await putMedia(image.buffer, `header.${IMAGE_TYPES[image.mimetype]}`, { contentType: image.mimetype, prefix: 'marketing' });
+  if (image || reusedImageKey) {
+    const stored = image ? await putMedia(image.buffer, `header.${IMAGE_TYPES[image.mimetype]}`, { contentType: image.mimetype, prefix: 'marketing' }) : { bucketName: process.env.WHATSAPP_MEDIA_BUCKET, key: reusedImageKey };
     imageKey = stored.key;
     const { metaHeaderHandle } = await viaAws(aws().send(new CreateWhatsAppMessageTemplateMediaCommand({ id: wabaId, sourceS3File: stored })));
     components.push({ type: 'HEADER', format: 'IMAGE', example: { header_handle: [metaHeaderHandle] } });
@@ -172,11 +180,11 @@ export async function submitMarketingTemplate({ user, siteId, title, body, image
   })));
   const options = { title: label, image_key: imageKey, buttons };
   const { rows: [row] } = await db.query(
-    `INSERT INTO whatsapp_templates (event, version, name, body, fields, status, category, meta_template_id, created_by, site_id, options)
-     VALUES ('MARKETING', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-     RETURNING version, name, body, fields, status, category, rejected_reason, options, created_at`,
+    `INSERT INTO whatsapp_templates (event, version, name, body, fields, status, category, meta_template_id, created_by, site_id, options, title)
+     VALUES ('MARKETING', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     RETURNING version, name, title, body, fields, status, category, rejected_reason, archived_at, options, created_at`,
     [version, name, String(body).trim(), fields, created.templateStatus || 'PENDING', created.category || 'MARKETING',
-      created.metaTemplateId, user?.id || null, site.id, JSON.stringify(options)],
+      created.metaTemplateId, user?.id || null, site.id, JSON.stringify(options), label],
   );
   return row;
 }
@@ -199,18 +207,19 @@ export async function sendMarketingTest({ user, siteId, templateName, phone }, d
 export async function startCampaign({ user, siteId, templateName, memberIds = null }, db = pool) {
   const site = await requireSiteAccess(user, siteId, db);
   if (process.env.WHATSAPP_ENABLED !== 'true') throw studioError('Customer messages are turned off on this server (WHATSAPP_ENABLED)', 409);
-  const template = await siteTemplate(site.id, templateName, db);
-  let { members } = await audience(site.id, db);
-  if (memberIds) {
-    const chosen = new Set(memberIds.map(Number));
-    members = members.filter((id) => chosen.has(id));
-    if (!members.length) throw studioError('None of the selected customers can be messaged', 409);
-  }
-  if (!members.length) throw studioError('No customer of this site has a valid mobile number', 409);
-  const media = await headerImage(template); // one upload, reused for every recipient (valid 30 days)
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+    // Serialize campaign creation with archive/delete, which lock this same template.
+    const template = await siteTemplate(site.id, templateName, client, true);
+    let { members } = await audience(site.id, client);
+    if (memberIds) {
+      const chosen = new Set(memberIds.map(Number));
+      members = members.filter((id) => chosen.has(id));
+      if (!members.length) throw studioError('None of the selected customers can be messaged', 409);
+    }
+    if (!members.length) throw studioError('No customer of this site has a valid mobile number', 409);
+    const media = await headerImage(template);
     const { rows: [campaign] } = await client.query(
       `INSERT INTO whatsapp_campaigns (site_id, template_name, media_id, recipients, created_by)
        VALUES ($1, $2, $3, $4, $5) RETURNING id, template_name, status, recipients, created_at`,
@@ -262,4 +271,14 @@ export async function removeOptOut(phone, db = pool) {
   if (!e164) throw studioError('Enter a valid 10-digit Indian mobile number');
   await db.query('DELETE FROM whatsapp_opt_outs WHERE phone = $1', [e164]);
   return { phone: e164 };
+}
+
+/** Marketing templates retain site scope when renamed, archived, restored or deleted. */
+export async function updateMarketingTemplate({ user, siteId, name, input }, db = pool) {
+  const site = await requireSiteAccess(user, siteId, db);
+  return updateTemplate(name, input, db, { marketingSiteId: site.id });
+}
+export async function deleteMarketingTemplate({ user, siteId, name }, db = pool) {
+  const site = await requireSiteAccess(user, siteId, db);
+  return deleteTemplate(name, db, { marketingSiteId: site.id });
 }

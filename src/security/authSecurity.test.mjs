@@ -46,3 +46,30 @@ test('OTP parallel guesses are capped and a correct code can only mint one sessi
     assert.equal((await call({pending_token:pending,otp:'123456'})).status,401);
   } finally {pool.query=original.query;userModel.findById=original.find;userModel.setRefreshToken=original.save;await db.close();}
 });
+
+test('session middleware distinguishes database outages from rejected credentials and denies both requests', async () => {
+  const { default: authMiddleware } = await import('../middlewares/auth.middleware.js');
+  const savedQuery = pool.query;
+  const token = signAccessToken({ id: 2, version: 1, role: 'admin' });
+  async function request(bearer = token) {
+    const output = { status: 200, headers: {}, next: false };
+    const res = { set(name,value){ output.headers[name]=value;return this; },status(value){output.status=value;return this;},json(body){output.body=body;return this;} };
+    await authMiddleware({ header: () => `Bearer ${bearer}` }, res, () => { output.next=true; });
+    return output;
+  }
+  try {
+    for (const code of ['ECONNRESET', '57P01', '53300']) {
+      pool.query = async () => { throw Object.assign(new Error('Private database detail'), { code }); };
+      const unavailable = await request();
+      assert.equal(unavailable.status,503); assert.equal(unavailable.next,false);
+      assert.equal(unavailable.body.code,'AUTH_SERVICE_UNAVAILABLE'); assert.equal(unavailable.headers['Retry-After'],'3');
+      assert.doesNotMatch(JSON.stringify(unavailable.body),/Private database detail/);
+    }
+    pool.query=async()=>{assert.fail('Invalid signatures must be rejected before looking up users');};
+    assert.equal((await request('invalid-token')).status,401);
+    pool.query=async()=>({rows:[{...user,token_version:2}]});
+    assert.equal((await request()).status,401);
+    pool.query=async()=>({rows:[user]});
+    assert.equal((await request()).next,true);
+  } finally { pool.query=savedQuery; }
+});

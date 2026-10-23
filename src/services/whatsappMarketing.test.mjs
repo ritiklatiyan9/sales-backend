@@ -4,8 +4,9 @@ import { drawFixture } from '../test/drawFixture.mjs';
 import { migrateWhatsAppMessages } from '../migrations/039_whatsapp_messages.js';
 import { migrateWhatsAppStudio } from '../migrations/040_whatsapp_studio.js';
 import { migrateWhatsAppMarketing } from '../migrations/041_whatsapp_marketing.js';
-import { compileBody, deleteTemplate, drainWhatsApp } from './whatsapp.service.js';
-import { addOptOut, cancelCampaign, marketingCustomers, marketingState, removeOptOut, startCampaign } from './whatsappMarketing.js';
+import { migrateWhatsAppTemplateManagement } from '../migrations/042_whatsapp_template_management.js';
+import { aws, compileBody, deleteTemplate, drainWhatsApp, updateTemplate } from './whatsapp.service.js';
+import { addOptOut, cancelCampaign, deleteMarketingTemplate, updateMarketingTemplate, submitMarketingTemplate, marketingCustomers, marketingState, removeOptOut, startCampaign } from './whatsappMarketing.js';
 
 const admin = { id: 1, role: 'admin' };
 
@@ -34,6 +35,7 @@ test('WhatsApp marketing on isolated PostgreSQL: site audience, approval gate, q
         (69, 1, 'CLIENT', 'INACTIVE', 'Inactive', '9888888888', NULL);
       UPDATE whatsapp_templates SET status = 'APPROVED' WHERE event = 'REGISTERED';
     `);
+    await migrateWhatsAppTemplateManagement(f.pool);
     const offer = compileBody('MARKETING', 'Hello {customer_name}, Diwali offers are live at {project}. Visit us');
     await f.query(`INSERT INTO whatsapp_templates (event, version, name, body, fields, status, category, site_id, options) VALUES
       ('MARKETING', 1, 'dgg_marketing_1', 'Hello {customer_name}, Diwali offers are live at {project}. Visit us', $1, 'APPROVED', 'MARKETING', 1, '{"title":"Diwali"}'),
@@ -56,7 +58,8 @@ test('WhatsApp marketing on isolated PostgreSQL: site audience, approval gate, q
     await assert.rejects(startCampaign({ user: admin, siteId: 1, templateName: 'dgg_marketing_3' }), /of this site/);
     const campaign = await startCampaign({ user: admin, siteId: 1, templateName: 'dgg_marketing_1' });
     assert.equal(campaign.recipients, 3);
-    await assert.rejects(deleteTemplate('dgg_marketing_1'), /still sending/);
+    await assert.rejects(deleteMarketingTemplate({ user: admin, siteId: 1, name: 'dgg_marketing_1' }), /still sending/);
+    await assert.rejects(updateMarketingTemplate({ user: admin, siteId: 1, name: 'dgg_marketing_1', input: { archived: true } }), /still sending/);
 
     // A booking/KYC message queued after the campaign still goes first; then 1 campaign message (daily limit).
     await f.query(`INSERT INTO whatsapp_messages (dedupe_key, event, ref_id) VALUES ('REGISTERED:66', 'REGISTERED', 66)`);
@@ -98,6 +101,51 @@ test('WhatsApp marketing on isolated PostgreSQL: site audience, approval gate, q
     const chosen = await startCampaign({ user: admin, siteId: 1, templateName: 'dgg_marketing_1', memberIds: [66, 63, 61] });
     assert.equal(chosen.recipients, 2);
     assert.deepEqual((await statusOf(chosen.id)).map((r) => r.ref_id), [61, 66]);
+    await cancelCampaign({ user: admin, id: chosen.id });
+    // An archive is reversible, scoped to its project, and never available for new sends.
+    await assert.rejects(updateTemplate('dgg_marketing_1', { archived: true }), /not found/);
+    await assert.rejects(deleteTemplate('dgg_marketing_1'), /not found/);
+    await assert.rejects(updateMarketingTemplate({ user: admin, siteId: 2, name: 'dgg_marketing_1', input: { archived: true } }), /not found/);
+    await assert.rejects(updateMarketingTemplate({ user: admin, siteId: 1, name: 'dgg_member_id_issued', input: { archived: true } }), /not found/);
+    await assert.rejects(deleteMarketingTemplate({ user: admin, siteId: 2, name: 'dgg_marketing_1' }), /not found/);
+    const archived = await updateMarketingTemplate({ user: admin, siteId: 1, name: 'dgg_marketing_1', input: { title: 'Diwali invitation', archived: true } });
+    assert.ok(archived.archived_at);
+    assert.equal(archived.title, 'Diwali invitation');
+    const archivedState = await marketingState(admin, 1);
+    assert.ok(archivedState.templates.find(t => t.name === archived.name).archived_at);
+    assert.equal(archivedState.campaigns.find(c => c.id === campaign.id).template_title, 'Diwali invitation');
+    await assert.rejects(startCampaign({ user: admin, siteId: 1, templateName: archived.name }), /archived/);
+    const restored = await updateMarketingTemplate({ user: admin, siteId: 1, name: archived.name, input: { archived: false } });
+    assert.equal(restored.archived_at, null);
+    assert.equal(restored.title, 'Diwali invitation');
+
+    // Edited versions can retain the original image without crossing project boundaries.
+    const sdk = aws(), originalSend = sdk.send;
+    const requests = [];
+    sdk.send = async (command) => {
+      requests.push(command);
+      const type = command.constructor.name;
+      if (type === 'GetLinkedWhatsAppBusinessAccountPhoneNumberCommand') return { linkedWhatsAppBusinessAccountId: 'test-waba', phoneNumber: {} };
+      if (type === 'CreateWhatsAppMessageTemplateMediaCommand') return { metaHeaderHandle: 'test-header' };
+      if (type === 'CreateWhatsAppMessageTemplateCommand') return { metaTemplateId: 'test-id', templateStatus: 'PENDING', category: 'MARKETING' };
+      throw new Error('Unexpected SDK call: '+type);
+    };
+    try {
+      process.env.WHATSAPP_PHONE_NUMBER_ID = 'test-number';
+      process.env.WHATSAPP_MEDIA_BUCKET = 'test-media';
+      await f.query(`UPDATE whatsapp_templates SET options = options || '{"image_key":"marketing/original.jpg"}'::jsonb WHERE name = 'dgg_marketing_1'`);
+      await assert.rejects(submitMarketingTemplate({ user: admin, siteId: 2, title: 'Copy', body: 'Hello, a new offer is available.', sourceTemplateName: 'dgg_marketing_1', reuseImage: true }), /original image is unavailable/);
+      await assert.rejects(submitMarketingTemplate({ user: admin, siteId: 1, title: 'Copy', body: 'Hello,\n\n\ninvalid spacing.', sourceTemplateName: 'dgg_marketing_1', reuseImage: true }), /blank line/);
+      assert.equal(requests.length, 0, 'invalid copies are rejected before AWS');
+      const copy = await submitMarketingTemplate({ user: admin, siteId: 1, title: 'Image copy', body: 'Hello {customer_name}, explore {project}. Visit us.', sourceTemplateName: 'dgg_marketing_1', reuseImage: true });
+      assert.equal(copy.title, 'Image copy');
+      assert.equal(copy.options.image_key, 'marketing/original.jpg');
+      const upload = requests.find(c => c.constructor.name === 'CreateWhatsAppMessageTemplateMediaCommand');
+      assert.deepEqual(upload.input.sourceS3File, { bucketName: 'test-media', key: 'marketing/original.jpg' });
+      const definition = JSON.parse(Buffer.from(requests.find(c => c.constructor.name === 'CreateWhatsAppMessageTemplateCommand').input.templateDefinition).toString());
+      assert.equal(definition.components[0].format, 'IMAGE');
+    } finally { sdk.send = originalSend; }
+
   } finally {
     for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
     await f.close();

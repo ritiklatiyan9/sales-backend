@@ -1,3 +1,4 @@
+import { normalizeLineEndings, templateFormattingIssues } from './whatsappTemplateText.js';
 import { randomUUID } from 'node:crypto';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import {
@@ -17,8 +18,8 @@ import { DOCUMENTS, formatDate, money } from './whatsappDocuments.js';
  * Hooks call queueWhatsApp(event, id) AFTER their transaction commits; that only
  * inserts a QUEUED row into whatsapp_messages (migration 039). Accounting's KYC verify
  * inserts the same rows directly. startWhatsAppWorker() drains the queue: it checks the
- * stage's WhatsApp Studio settings (migration 040), picks the newest APPROVED template
- * version, looks the customer up, attaches the stage's PDF when the template has a
+ * stage's WhatsApp Studio settings, uses its explicitly applied APPROVED template,
+ * looks the customer up, attaches the stage's PDF when the template has a
  * document header, sends, and records SENT / FAILED / SKIPPED. WhatsApp can never fail
  * or slow down a booking request.
  *
@@ -84,6 +85,7 @@ const PAYMENT = {
 export const EVENTS = {
   REGISTERED: {
     label: 'Client registered',
+    module: 'Clients', submodule: 'Registration', trigger: 'Client record created',
     description: 'A new client is added from New Clients, quick KYC or the paper KYC form.',
     fields: CUSTOMER,
     body: branded(
@@ -99,6 +101,7 @@ export const EVENTS = {
   },
   KYC_VERIFIED: {
     label: 'KYC verified',
+    module: 'Clients', submodule: 'KYC verification', trigger: 'KYC marked verified in Bookings or Accountancy',
     description: 'A client’s KYC is verified, in the booking app or in Accountancy.',
     fields: CUSTOMER,
     body: branded(
@@ -117,6 +120,7 @@ export const EVENTS = {
   },
   PAYMENT_RECEIVED: {
     label: 'Draw payment received',
+    module: 'Lucky draw', submodule: 'Payment receipts', trigger: 'New draw ledger payment recorded',
     description: 'A payment is added to a lucky-draw ledger. Can attach the payment receipt PDF.',
     fields: { ...CUSTOMER, ...PAYMENT },
     attachment: 'DRAW_RECEIPT',
@@ -142,6 +146,7 @@ export const EVENTS = {
   },
   BOOKING_CREATED: {
     label: 'Booking made',
+    module: 'Bookings', submodule: 'Booking confirmation', trigger: 'Booking created or website request approved',
     description: 'A booking is created, or a website booking request is approved.',
     fields: { ...CUSTOMER, ...BOOKING },
     body: branded(
@@ -155,6 +160,7 @@ export const EVENTS = {
   },
   ALLOTTED: {
     label: 'Plot / shop allotted',
+    module: 'Bookings', submodule: 'Unit allotment', trigger: 'Draw winner allotted or booking unit assigned or changed',
     description: 'A draw winner is allotted a unit, or a unit is assigned or changed on a booking.',
     fields: { ...CUSTOMER, ...BOOKING },
     body: branded(
@@ -187,8 +193,13 @@ export const studioError = (message, status = 400) => Object.assign(new Error(me
 export function compileBody(event, body) {
   const spec = specOf(event);
   if (!spec) throw studioError('Unknown stage', 404);
+  if (/[{}]/.test(String(body ?? '').replace(/\{[a-z_]+\}/g, ''))) {
+    throw studioError('Use supported {field} variables; remove incomplete or double braces');
+  }
+  const formatting = templateFormattingIssues(body);
+  if (formatting.length) throw studioError(formatting.join(' '));
   const fields = [];
-  const text = String(body ?? '').trim().replace(/\{([a-z_]+)\}/g, (token, name) => {
+  const text = normalizeLineEndings(body).trim().replace(/\{([a-z_]+)\}/g, (token, name) => {
     if (!spec.fields[name]) throw studioError(`{${name}} is not available for "${spec.label}"`);
     fields.push(name);
     return `{{${fields.length}}}`;
@@ -314,14 +325,16 @@ export async function sendWhatsAppTemplate(to, template, params = [], { lang: la
 }
 
 async function stageSettings(event, db = pool) {
-  const { rows: [row] } = await db.query('SELECT enabled, attachment FROM whatsapp_stage_settings WHERE event = $1', [event]);
-  return row || { enabled: true, attachment: EVENTS[event]?.attachment || null };
+  const { rows: [row] } = await db.query('SELECT enabled, attachment, template_name FROM whatsapp_stage_settings WHERE event = $1', [event]);
+  return row || { enabled: true, attachment: EVENTS[event]?.attachment || null, template_name: null };
 }
 
-/** The newest APPROVED version of a stage's template; older approved versions keep working until then. */
+/** Only the applied, approved and non-archived version can send; there is no fallback. */
 async function activeTemplate(event, db = pool) {
   const { rows: [row] } = await db.query(
-    `SELECT name, fields, has_document FROM whatsapp_templates WHERE event = $1 AND status = 'APPROVED' ORDER BY version DESC LIMIT 1`,
+    `SELECT t.name, t.fields, t.has_document FROM whatsapp_templates t
+      JOIN whatsapp_stage_settings s ON s.event = t.event AND s.template_name = t.name
+      WHERE t.event = $1 AND t.status = 'APPROVED' AND t.archived_at IS NULL`,
     [event],
   );
   return row || null;
@@ -373,7 +386,7 @@ async function deliver(row, { db, send, upload }) {
       if (!spec) return await finish('SKIPPED', `Unknown event ${row.event}`);
       if (!(await stageSettings(row.event, db)).enabled) return await finish('SKIPPED', 'Stage is turned off in WhatsApp Studio');
       template = await activeTemplate(row.event, db);
-      if (!template) return await finish('SKIPPED', 'No approved template for this stage yet');
+      if (!template) return await finish('SKIPPED', 'No approved template applied to this stage');
       data = await lookup(spec);
       if (!phone) return await finish('SKIPPED', data ? 'No valid Indian mobile on the client' : 'No matching client record');
       if (template.has_document) {
@@ -469,12 +482,13 @@ export const viaAws = (promise) => promise.catch((error) => {
 });
 
 /**
- * Submit a new version of a stage's template to Meta. The current approved version keeps
- * sending until this one is approved. A document header needs a sample PDF for review.
+ * Submit a new version to Meta. Applying it to a stage is a separate explicit action.
+ * A document header needs a sample PDF for review.
  */
-export async function submitTemplate({ event, body, hasDocument = false, userId = null }, db = pool) {
+export async function submitTemplate({ event, title, body, hasDocument = false, userId = null }, db = pool) {
   const spec = EVENTS[event];
   if (!spec) throw studioError('Unknown stage', 404); // marketing templates go through whatsappMarketing.js
+  const label = templateTitle(title ?? spec.label);
   const { text, fields } = compileBody(event, body);
   const { wabaId } = await viaAws(sender());
   const components = [];
@@ -498,40 +512,115 @@ export async function submitTemplate({ event, body, hasDocument = false, userId 
   const status = created.templateStatus || 'PENDING';
   const reason = status === 'REJECTED' ? await rejectionReason(wabaId, created.metaTemplateId) : null;
   const { rows: [row] } = await db.query(
-    `INSERT INTO whatsapp_templates (event, version, name, body, fields, has_document, status, category, rejected_reason, meta_template_id, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     RETURNING event, version, name, body, fields, has_document, status, category, rejected_reason, created_at`,
-    [event, version, name, String(body).trim(), fields, hasDocument, status, created.category || 'UTILITY', reason, created.metaTemplateId, userId],
+    `INSERT INTO whatsapp_templates (event, version, name, title, body, fields, has_document, status, category, rejected_reason, meta_template_id, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     RETURNING event, version, name, title, body, fields, has_document, status, category, rejected_reason, archived_at, created_at`,
+    [event, version, name, label, normalizeLineEndings(body).trim(), fields, hasDocument, status, created.category || 'UTILITY', reason, created.metaTemplateId, userId],
   );
   return row;
 }
 
-/** Delete a version from Meta and hide it in the Studio (its name is never reused). */
-export async function deleteTemplate(name, db = pool) {
-  const { rows: [row] } = await db.query(`SELECT id FROM whatsapp_templates WHERE name = $1 AND status <> 'DELETED'`, [name]);
-  if (!row) throw studioError('Template not found', 404);
+const templateTitle = (value) => {
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > 80) {
+    throw studioError('Give the template a title (up to 80 characters)');
+  }
+  return value.trim();
+};
+
+async function transaction(db, action) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await action(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function ensureTemplateUnused(name, db) {
+  const { rows: assigned } = await db.query('SELECT event FROM whatsapp_stage_settings WHERE template_name = $1', [name]);
+  if (assigned.length) throw studioError('This template is applied to a module. Unapply it before archiving or deleting.', 409);
+  // A worker may already have selected this stage's version before an admin unapplied
+  // it. The final template name is recorded after sending, so protect the entire event
+  // until any in-flight transactional message completes.
+  const { rows: inFlight } = await db.query(`SELECT 1 FROM whatsapp_messages m
+      JOIN whatsapp_templates t ON t.event = m.event
+      WHERE t.name = $1 AND m.campaign_id IS NULL AND m.status = 'SENDING' LIMIT 1`, [name]);
+  if (inFlight.length) throw studioError('A message for this module is still sending. Wait for it to finish before archiving or deleting.', 409);
   const { rows: busy } = await db.query(`SELECT 1 FROM whatsapp_messages m JOIN whatsapp_campaigns c ON c.id = m.campaign_id
       WHERE c.template_name = $1 AND m.status IN ('QUEUED', 'SENDING') LIMIT 1`, [name]);
   if (busy.length) throw studioError('A campaign is still sending with this template. Cancel it first.', 409);
-  const { wabaId } = await viaAws(sender());
-  await viaAws(aws().send(new DeleteWhatsAppMessageTemplateCommand({ id: wabaId, templateName: name, deleteAllLanguages: true })))
-    .catch((error) => { if (!/ResourceNotFound/.test(error.message)) throw error; });
-  await db.query(`UPDATE whatsapp_templates SET status = 'DELETED' WHERE id = $1`, [row.id]);
 }
 
-/** Turn a stage on/off and choose its attachment. */
-export async function saveStage(event, { enabled, attachment = null }, userId = null, db = pool) {
-  if (!EVENTS[event]) throw studioError('Unknown stage', 404);
-  if (typeof enabled !== 'boolean') throw studioError('enabled must be true or false');
-  if (attachment !== null && !DOCUMENTS[attachment]?.events.includes(event)) throw studioError('That document cannot be attached to this stage');
-  const { rows: [row] } = await db.query(
-    `INSERT INTO whatsapp_stage_settings (event, enabled, attachment, updated_by) VALUES ($1, $2, $3, $4)
-     ON CONFLICT (event) DO UPDATE SET enabled = EXCLUDED.enabled, attachment = EXCLUDED.attachment,
-       updated_by = EXCLUDED.updated_by, updated_at = now()
-     RETURNING event, enabled, attachment`,
-    [event, enabled, attachment, userId],
-  );
-  return row;
+/** Rename locally or archive/restore without deleting the approved template from Meta. */
+export async function updateTemplate(name, input = {}, db = pool, { marketingSiteId } = {}) {
+  if (input.archived !== undefined && typeof input.archived !== 'boolean') throw studioError('archived must be true or false');
+  const title = input.title !== undefined ? templateTitle(input.title) : undefined;
+  if (title === undefined && input.archived === undefined) throw studioError('Provide a title or archived status');
+  return transaction(db, async (client) => {
+    const { rows: [row] } = await client.query(`SELECT * FROM whatsapp_templates WHERE name = $1 AND status <> 'DELETED' FOR UPDATE`, [name]);
+    if (!row || (marketingSiteId !== undefined ? row.event !== 'MARKETING' || row.site_id !== marketingSiteId : !EVENTS[row.event])) throw studioError('Template not found', 404);
+    if (input.archived === true) await ensureTemplateUnused(name, client);
+    const { rows: [updated] } = await client.query(`UPDATE whatsapp_templates
+      SET title = $2, archived_at = CASE WHEN $3::boolean THEN COALESCE(archived_at, now()) ELSE NULL END
+      WHERE id = $1
+      RETURNING event, version, name, title, body, fields, has_document, status, category, rejected_reason, archived_at, created_at`,
+    [row.id, title ?? row.title ?? row.options?.title ?? row.name, input.archived ?? Boolean(row.archived_at)]);
+    return updated;
+  });
+}
+
+/** Delete from Meta and retain its name in the audit history. Applied versions are protected. */
+export async function deleteTemplate(name, db = pool, { marketingSiteId } = {}) {
+  return transaction(db, async (client) => {
+    const { rows: [row] } = await client.query(`SELECT id, event, site_id FROM whatsapp_templates WHERE name = $1 AND status <> 'DELETED' FOR UPDATE`, [name]);
+    if (!row || (marketingSiteId !== undefined ? row.event !== 'MARKETING' || row.site_id !== marketingSiteId : !EVENTS[row.event])) throw studioError('Template not found', 404);
+    await ensureTemplateUnused(name, client);
+    const { wabaId } = await viaAws(sender());
+    await viaAws(aws().send(new DeleteWhatsAppMessageTemplateCommand({ id: wabaId, templateName: name, deleteAllLanguages: true })))
+      .catch((error) => { if (!/ResourceNotFound/.test(error.message)) throw error; });
+    await client.query(`UPDATE whatsapp_templates SET status = 'DELETED' WHERE id = $1`, [row.id]);
+  });
+}
+
+/** Update a stage without changing omitted settings. Null template_name explicitly un-applies. */
+export async function saveStage(event, input = {}, userId = null, db = pool) {
+  const spec = EVENTS[event];
+  if (!spec) throw studioError('Unknown stage', 404);
+  if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw studioError('enabled must be true or false');
+  if (input.attachment !== undefined && input.attachment !== null && !DOCUMENTS[input.attachment]?.events.includes(event)) {
+    throw studioError('That document cannot be attached to this stage');
+  }
+  if (input.template_name !== undefined && input.template_name !== null && (typeof input.template_name !== 'string' || !input.template_name.trim())) {
+    throw studioError('template_name must be a template name or null');
+  }
+  return transaction(db, async (client) => {
+    await client.query(`INSERT INTO whatsapp_stage_settings (event, attachment, template_assignment_initialized)
+      VALUES ($1, $2, TRUE) ON CONFLICT (event) DO NOTHING`, [event, spec.attachment || null]);
+    const { rows: [saved] } = await client.query(`SELECT enabled, attachment, template_name FROM whatsapp_stage_settings WHERE event = $1 FOR UPDATE`, [event]);
+    const enabled = input.enabled ?? saved.enabled;
+    const attachment = input.attachment === undefined ? saved.attachment : input.attachment;
+    const templateName = input.template_name === undefined ? saved.template_name : input.template_name;
+    if (templateName !== null && (input.template_name !== undefined || input.attachment !== undefined)) {
+      const { rows: [template] } = await client.query(`SELECT event, status, archived_at, has_document FROM whatsapp_templates WHERE name = $1 FOR UPDATE`, [templateName]);
+      if (!template || template.event !== event) throw studioError('Choose a template created for this module', 409);
+      if (input.template_name !== undefined && template.status !== 'APPROVED') throw studioError('Only Meta-approved templates can be applied', 409);
+      if (input.template_name !== undefined && template.archived_at) throw studioError('Restore the archived template before applying it', 409);
+      if (template.has_document && !DOCUMENTS[attachment]?.events.includes(event)) {
+        throw studioError('Choose an attachment before applying a document template', 409);
+      }
+    }
+    const { rows: [row] } = await client.query(`UPDATE whatsapp_stage_settings
+      SET enabled = $2, attachment = $3, template_name = $4, template_assignment_initialized = TRUE,
+          updated_by = $5, updated_at = now()
+      WHERE event = $1 RETURNING event, enabled, attachment, template_name`, [event, enabled, attachment, templateName, userId]);
+    return row;
+  });
 }
 
 /** Send a stage's approved template, filled with sample values, to one number. */
@@ -541,7 +630,7 @@ export async function sendTestMessage(event, phone, db = pool) {
   const to = toE164(phone);
   if (!to) throw studioError('Enter a valid 10-digit Indian mobile number');
   const template = await activeTemplate(event, db);
-  if (!template) throw studioError('This stage has no approved template yet', 409);
+  if (!template) throw studioError('This stage has no approved template applied', 409);
   let media = null;
   if (template.has_document) {
     const doc = await stageDocument(event, db);
@@ -567,9 +656,9 @@ export async function studioState(db = pool) {
       error = `${e.name}: ${e.message}`;
     }
   }
-  const { rows: templates } = await db.query(`SELECT event, version, name, body, fields, has_document, status, category, rejected_reason, created_at
+  const { rows: templates } = await db.query(`SELECT event, version, name, title, body, fields, has_document, status, category, rejected_reason, archived_at, created_at
     FROM whatsapp_templates WHERE status <> 'DELETED' ORDER BY version DESC`);
-  const { rows: settings } = await db.query('SELECT event, enabled, attachment FROM whatsapp_stage_settings');
+  const { rows: settings } = await db.query('SELECT event, enabled, attachment, template_name FROM whatsapp_stage_settings');
   const { rows: recent } = await db.query(`SELECT id, event, ref_id, status, phone, template, error, created_at
     FROM whatsapp_messages ORDER BY id DESC LIMIT 30`);
   return {
@@ -580,12 +669,16 @@ export async function studioState(db = pool) {
     sender: info && { number: info.number, name: info.name, quality: info.quality },
     stages: Object.entries(EVENTS).map(([key, spec]) => {
       const saved = settings.find((s) => s.event === key);
+      const stageTemplates = templates.filter((t) => t.event === key);
       return {
         key, label: spec.label, description: spec.description, default_body: spec.body,
+        module: spec.module, submodule: spec.submodule, trigger: spec.trigger,
         fields: Object.entries(spec.fields).map(([name, f]) => ({ name, label: f.label, sample: f.sample })),
         documents: Object.entries(DOCUMENTS).filter(([, d]) => d.events.includes(key)).map(([docKey, d]) => ({ key: docKey, label: d.label })),
-        settings: saved ? { enabled: saved.enabled, attachment: saved.attachment } : { enabled: true, attachment: spec.attachment || null },
-        templates: templates.filter((t) => t.event === key),
+        settings: saved ? { enabled: saved.enabled, attachment: saved.attachment, template_name: saved.template_name }
+          : { enabled: true, attachment: spec.attachment || null, template_name: null },
+        active_template: stageTemplates.find((t) => t.name === saved?.template_name && t.status === 'APPROVED' && !t.archived_at) || null,
+        templates: stageTemplates,
       };
     }),
     recent,
