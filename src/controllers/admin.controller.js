@@ -3,6 +3,7 @@ import pool from '../config/db.js';
 import { isFullAdmin, canManageStaffAccess } from '../services/subAdminPermissions.js';
 import { isAdminRole, logActivity } from '../services/agentNetwork.service.js';
 import { ITEM_VISIBILITY_SETTINGS, NAVIGATION_SETTINGS, UI_ONLY_SETTINGS } from '../services/navigationSettings.js';
+import { PERMISSION_FLAGS } from '../services/permissions.service.js';
 
 /**
  * Access-control panel for the booking app (admin / super_admin only):
@@ -143,21 +144,33 @@ export const setUserPermission = asyncHandler(async (req, res) => {
 });
 
 /**
- * GET /admin/my-permissions — the CALLER's booking-module permission map (any
- * authenticated user; used by the sidebar and header). Only full admins bypass module
- * permissions, but their individually configured header visibility still applies.
+ * The CALLER's booking-module permission map: GET /admin/my-permissions and the
+ * `module_permissions` of GET /auth/me. Read from the session's per-request grants
+ * snapshot when authMiddleware loaded one (no query), else from user_permissions.
  */
-export const getMyPermissions = asyncHandler(async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT module, can_read, can_write, can_update, can_delete
-     FROM user_permissions WHERE user_id = $1 AND module = ANY($2)`,
-    [req.user.id, BOOKING_MODULES]
-  );
+export async function myModulePermissions(user, db = pool) {
+  const rows = user.grants
+    ? BOOKING_MODULES.filter((module) => user.grants[module])
+      .map((module) => ({ module, ...Object.fromEntries(PERMISSION_FLAGS.map((flag, i) => [flag, user.grants[module][i]])) }))
+    : (await db.query(
+      `SELECT module, can_read, can_write, can_update, can_delete
+       FROM user_permissions WHERE user_id = $1 AND module = ANY($2)`,
+      [user.id, BOOKING_MODULES]
+    )).rows;
   const permissions = {};
   for (const p of rows) {
     permissions[p.module] = {
       can_read: p.can_read, can_write: p.can_write, can_update: p.can_update, can_delete: p.can_delete,
     };
   }
-  res.json({ is_admin: isFullAdmin(req.user), permissions });
+  return { is_admin: isFullAdmin(user), permissions };
+}
+
+/**
+ * GET /admin/my-permissions — any authenticated user; used by the sidebar and header.
+ * Only full admins bypass module permissions, but their individually configured header
+ * visibility still applies.
+ */
+export const getMyPermissions = asyncHandler(async (req, res) => {
+  res.json(await myModulePermissions(req.user));
 });

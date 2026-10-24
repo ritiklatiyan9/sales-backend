@@ -13,6 +13,7 @@ import pool from '../config/db.js';
 import { createStaffIdentityService, matchesStaffPassword, normalizeLoginIdentifier } from '../services/staffIdentity.service.js';
 import { clientPortal } from './clientPortal.controller.js';
 import { clientPortalEnabled } from '../services/clientPortalAvailability.js';
+import { myModulePermissions } from './admin.controller.js';
 
 const googleClient = new OAuth2Client();
 const staffIdentity = createStaffIdentityService(pool);
@@ -337,28 +338,30 @@ export const refresh = asyncHandler(async (req, res) => {
   res.json({ accessToken, refreshToken: newRefreshToken });
 });
 
-/** GET /auth/me — current user + accessible sites (read-only from shared tables). */
+/**
+ * GET /auth/me — current user + accessible sites (read-only from shared tables), plus
+ * `module_permissions` (exactly GET /admin/my-permissions) so the client can skip that
+ * request at startup. req.user.role is the current database role (staffSession.js), so
+ * the three reads run in parallel.
+ */
 export const getMe = asyncHandler(async (req, res) => {
-  const user = await userModel.findById(req.user.id);
-  if (!user) return res.status(404).json({ message: 'User not found' });
-
   // Include address/city/state so the print forms can source full site details from
   // context (currentSite) instead of hardcoding a company/site name.
-  let sites;
-  if (user.role === 'admin' || user.role === 'super_admin') {
-    const { rows } = await pool.query('SELECT id, name, code, address, city, state FROM sites ORDER BY name');
-    sites = rows;
-  } else {
-    const { rows } = await pool.query(
-      `SELECT s.id, s.name, s.code, s.address, s.city, s.state FROM sites s
-       JOIN user_sites us ON us.site_id = s.id
-       WHERE us.user_id = $1 ORDER BY s.name`,
-      [user.id]
-    );
-    sites = rows;
-  }
+  const [user, { rows: sites }, modulePermissions] = await Promise.all([
+    userModel.findById(req.user.id),
+    req.user.role === 'admin' || req.user.role === 'super_admin'
+      ? pool.query('SELECT id, name, code, address, city, state FROM sites ORDER BY name')
+      : pool.query(
+        `SELECT s.id, s.name, s.code, s.address, s.city, s.state FROM sites s
+         JOIN user_sites us ON us.site_id = s.id
+         WHERE us.user_id = $1 ORDER BY s.name`,
+        [req.user.id]
+      ),
+    myModulePermissions(req.user),
+  ]);
+  if (!user) return res.status(404).json({ message: 'User not found' });
 
-  res.json({ user: userModel.sanitize(user), sites });
+  res.json({ user: userModel.sanitize(user), sites, module_permissions: modulePermissions });
 });
 
 /** PATCH /auth/profile — session-scoped self-service, never accepts role/site fields. */

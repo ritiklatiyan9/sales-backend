@@ -34,3 +34,8 @@ export const loginAccountLimit = rateLimit({ limit: 10, windowMs: 10 * 60_000,
 export const refreshLimit = rateLimit({ limit: 120, windowMs: 60_000 });
 export const publicVerifyLimit = rateLimit({ limit: 90, windowMs: 60_000 });
 export const documentUploadLimit = rateLimit({ limit: 40, windowMs: 60_000, key: req => req.user?.id || req.ip });
+// The sales login is shared by many devices: key by account + address so one office cannot starve another.
+// ponytail: behind a proxy without TRUST_PROXY every device shares req.ip, so the budget is per office;
+// 120/min still stops exact-number sweeps. Set TRUST_PROXY in production for per-device budgets.
+export const clientLookupLimit = rateLimit({ limit: 120, windowMs: 60_000, key: req => `lookup:${req.user?.id}:${req.ip}` });
+export const clientSearchLimit = rateLimit({ limit: 240, windowMs: 60_000, key: req => `search:${req.user?.id}:${req.ip}` });

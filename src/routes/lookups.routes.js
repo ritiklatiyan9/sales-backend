@@ -2,6 +2,8 @@ import { subAdminPermission } from '../middlewares/subAdminPermission.middleware
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import upload from '../middlewares/multer.middleware.js';
+import { clientLookupLimit, clientSearchLimit } from '../middlewares/rateLimit.middleware.js';
+import { clientOverview, lookupClient } from '../controllers/clientLookup.controller.js';
 import {
   searchClients, getClient, createClient, updateClient, availablePlots, uploadClientPhoto,
   getClientPayments, searchAgents, listClients, lookupClientReferral, listSiteBanks, deleteClientMember,
@@ -12,7 +14,9 @@ import {
 const router = express.Router();
 router.use(authMiddleware);
 
-router.get('/clients/search', searchClients);
+router.get('/clients/search', clientSearchLimit, searchClients);
+router.get('/clients/lookup', clientLookupLimit, lookupClient); // before /clients/:id
+router.get('/clients/overview', clientOverview);
 router.get('/clients', listClients);
 router.get('/agents/referral', lookupClientReferral);
 router.get('/agents/search', searchAgents);

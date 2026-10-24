@@ -22,7 +22,9 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD != null ? String(process.env.DB_PASSWORD) : '',
   ssl: sslOption,
   max: 10,
-  idleTimeoutMillis: 30000,
+  // Reconnecting through the Neon pooler costs 2–12 s; keep idle connections for 5 min
+  // (e.g. while staff photograph a document) instead of dropping them after 30 s.
+  idleTimeoutMillis: 5 * 60_000,
   connectionTimeoutMillis: 10000,
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,

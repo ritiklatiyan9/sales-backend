@@ -25,7 +25,7 @@ export async function drawFixture({ broker = false } = {}) {
   pool.connect = async () => client;
   await db.exec(`
     CREATE TABLE sites (id SERIAL PRIMARY KEY, name TEXT, address TEXT, city TEXT, state TEXT);
-    CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, role TEXT, referral_code TEXT, is_active BOOLEAN DEFAULT true, parent_user_id INTEGER, team_id INTEGER, phone TEXT, photo TEXT);
+    CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, role TEXT, referral_code TEXT, is_active BOOLEAN DEFAULT true, can_login_booking BOOLEAN DEFAULT true, parent_user_id INTEGER, team_id INTEGER, phone TEXT, photo TEXT);
     CREATE TABLE team_members (team_id INTEGER, user_id INTEGER, is_head BOOLEAN);
     CREATE TABLE teams (id SERIAL PRIMARY KEY, name TEXT NOT NULL, site_id INTEGER, status TEXT DEFAULT 'ACTIVE', created_by INTEGER, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
     CREATE TABLE user_sites (user_id INTEGER, site_id INTEGER);

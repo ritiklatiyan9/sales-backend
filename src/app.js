@@ -17,21 +17,18 @@ app.use(morgan((tokens,req,res) => [tokens.method(req,res),
   tokens.status(req,res),tokens['response-time'](req,res),'ms'].join(' ')));
 if (process.env.TRUST_PROXY) app.set('trust proxy',process.env.TRUST_PROXY.split(',').map(value=>value.trim()));
 
-const corsOriginHandler = (origin, callback) => callback(null, originAllowed(origin));
-
-// CORS — allow the booking frontend origins explicitly and handle preflight.
-app.use(cors({
-  origin: corsOriginHandler,
+// CORS — allow the booking frontend origins explicitly and handle preflight. maxAge lets
+// the browser reuse a preflight for 2 h instead of sending one before every request.
+const corsOptions = {
+  origin: (origin, callback) => callback(null, originAllowed(origin)),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-}));
-app.options('*', cors({
-  origin: corsOriginHandler,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-}));
+  exposedHeaders: ['Retry-After'], // the client honours a 429's wait instead of retrying blind
+  maxAge: 7200,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 app.post('/public/website/webhook',express.raw({type:'application/json',limit:'256kb'}),websiteWebhookHandler);
 app.use(express.json({ limit: '2mb' }));

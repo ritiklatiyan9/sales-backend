@@ -83,7 +83,8 @@ const rollupCaseAndBooking = async (documentId) => {
   const allDone = Number(countRows[0].total) > 0 && Number(countRows[0].not_done) === 0;
 
   if (allDone && row.case_status !== 'VERIFIED') {
-    await pool.query(`UPDATE kyc_cases SET status='OCR_DONE', updated_at=now() WHERE id=$1`, [row.case_id]);
+    // The SQL guard also covers a verify that commits after the read above.
+    await pool.query(`UPDATE kyc_cases SET status='OCR_DONE', updated_at=now() WHERE id=$1 AND status <> 'VERIFIED'`, [row.case_id]);
     if (row.booking_id) {
       await pool.query(
         `UPDATE bookings SET kyc_status='OCR_DONE', updated_at=now() WHERE id=$1 AND kyc_status <> 'VERIFIED'`,

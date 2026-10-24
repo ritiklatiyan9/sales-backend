@@ -19,10 +19,9 @@ import {
 import { websitePaymentForBooking } from '../services/websitePlotGuard.js';
 import { clientIdentityIntake } from '../services/clientIdentityIntake.service.js';
 import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
-import { hasPermission } from '../services/permissions.service.js';
 import {
-  clientRegistryError, clientSearchFilter, maskClientIdentity, memberPhoneSql,
-  normalizeClientIdentity, normalizeClientPhone, registerClientMember, resolveClientReferral,
+  allInOrder, clientRegistryError, clientSearchFilter, kycVerifiedSql, maskClientIdentity, memberPhoneSql,
+  normalizeClientIdentity, normalizeClientPhone, registerClientMember, requireClientRegistryPermission, resolveClientReferral,
 } from '../services/clientRegistry.service.js';
 import { uploadDocument } from './kyc.controller.js';
 import { signMemberDocumentUrl } from '../utils/memberDocumentUrls.js';
@@ -634,7 +633,8 @@ const clientLookupSelect = `
          CASE WHEN broker.id IS NOT NULL THEN COALESCE(m.referred_by_member_code,${memberCodeSql('broker')}) ELSE u.referral_code END AS referred_by_code,
          COALESCE(broker.full_name,u.name) AS referral_agent_name,
          CASE WHEN broker.id IS NOT NULL THEN COALESCE(m.referred_by_member_code,${memberCodeSql('broker')}) ELSE u.referral_code END AS referral_code,
-         k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
+         k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable,
+         ${kycVerifiedSql('m')} AS kyc_verified
     FROM members m
     LEFT JOIN users u ON u.id = m.referred_by_user_id
     LEFT JOIN members broker ON broker.id=m.referred_by_member_id AND broker.site_id=m.site_id
@@ -686,22 +686,19 @@ export const searchClients = asyncHandler(async (req, res) => {
   res.json(await Promise.all(rows.map(async (member) => maskClientIdentity(await withMemberPhoto(member)))));
 });
 
-/** GET /clients?site_id=&q=&page=&limit= — bounded reusable client directory. */
-const requireClientRegistryPermission = async (user, action = 'can_read') => {
-  const flags = action === 'can_read' ? ['can_read'] : ['can_read', action];
-  const allowed = await Promise.all(flags.map(flag => hasPermission(user, 'booking_clients', flag)));
-  if (allowed.some(value => !value)) throw clientRegistryError('Access Control has not granted this Clients action for your account', 403);
-};
-
+/** GET /clients?site_id=&q=&kyc=pending|verified&page=&limit= — bounded reusable client directory. */
 export const listClients = asyncHandler(async (req, res) => {
-  await requireClientRegistryPermission(req.user);
-  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const [, site] = await allInOrder([requireClientRegistryPermission(req.user), requireSiteAccess(req.user, req.query.site_id)]);
   const params = [site.id];
   const where = ['m.site_id = $1'];
   const memberType = memberTypeFilterFromQuery({ member_type: 'CLIENT', ...req.query });
   if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
   const search = clientSearchFilter(req.query.q, params);
   if (search) where.push(search);
+  // Same "registered" rule as the lookup and Home's pending count (any VERIFIED case at the site).
+  const kyc = String(req.query.kyc ?? '').trim().toLowerCase();
+  if (kyc && kyc !== 'pending' && kyc !== 'verified') throw clientRegistryError('kyc must be pending or verified');
+  if (kyc) where.push(`${kyc === 'pending' ? 'NOT ' : ''}${kycVerifiedSql('m')}`);
   const page = Math.max(1, Math.trunc(Number(req.query.page) || 1));
   const limit = Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || 25)));
   const whereSql = where.join(' AND ');
@@ -710,21 +707,13 @@ export const listClients = asyncHandler(async (req, res) => {
     pool.query(`WITH selected AS (
       SELECT m.id FROM members m WHERE ${whereSql}
       ORDER BY m.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}
-    ) ${clientLookupSelect}
-      JOIN selected selected_member ON selected_member.id = m.id
-      ORDER BY m.id DESC`, [...params, limit, (page - 1) * limit]),
+    ) SELECT page.*, (SELECT count(*)::int FROM draw_registrations r WHERE r.site_id = $1 AND r.client_member_id = page.id) AS draw_count
+      FROM (${clientLookupSelect} JOIN selected selected_member ON selected_member.id = m.id) page
+      ORDER BY page.id DESC`, [...params, limit, (page - 1) * limit]),
   ]);
-  const memberIds = records.rows.map((member) => member.id);
-  // A single grouped count for this page, rather than a query per member.
-  const counts = memberIds.length ? await pool.query(
-    `SELECT client_member_id, count(*)::int AS draw_count FROM draw_registrations
-      WHERE site_id = $1 AND client_member_id = ANY($2::int[])
-      GROUP BY client_member_id`, [site.id, memberIds],
-  ) : { rows: [] };
-  const drawCounts = new Map(counts.rows.map((row) => [Number(row.client_member_id), row.draw_count]));
   const total = count.rows[0].total;
   res.json({
-    items: await Promise.all(records.rows.map(async (member) => maskClientIdentity({ ...await withMemberPhoto(member), draw_count: drawCounts.get(Number(member.id)) || 0 }))),
+    items: await Promise.all(records.rows.map(async (member) => maskClientIdentity(await withMemberPhoto(member)))),
     total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
   });
 });
@@ -867,9 +856,11 @@ export const previewClientIdentity = asyncHandler(async (req, res) => {
 
 /** Upload through the existing KYC/OCR pipeline, into a case this user can own. */
 export const uploadClientDocument = asyncHandler(async (req, res, next) => {
-  await requireClientRegistryPermission(req.user, 'can_write');
-  if (!req.file) throw clientRegistryError('Upload a supporting document in the file field');
-  const member = await requireClientMember(req.user, req.params.id);
+  const [, member, visibleUserIds] = await allInOrder([
+    requireClientRegistryPermission(req.user, 'can_write'),
+    req.file ? requireClientMember(req.user, req.params.id) : Promise.reject(clientRegistryError('Upload a supporting document in the file field')),
+    getVisibleUserIds(req.user),
+  ]);
   const type = String(req.body?.type || 'OTHER').toUpperCase();
   if (!['AADHAAR', 'PAN', 'OTHER', 'PHOTO'].includes(type)) throw clientRegistryError('Supporting document type must be AADHAAR, PAN, PHOTO or OTHER');
   if (type === 'PHOTO' && (!['image/jpeg','image/png','image/webp'].includes(req.file.mimetype) || req.file.size > 5 * 1024 * 1024)) {
@@ -877,7 +868,6 @@ export const uploadClientDocument = asyncHandler(async (req, res, next) => {
   }
   req.clientIdentityOcrResult = clientIdentityIntake.cachedResult({ user: req.user, siteId: member.site_id,
     type, file: req.file, previewKey: req.body.preview_key });
-  const visibleUserIds = await getVisibleUserIds(req.user);
   const client = await pool.connect();
   let kyc;
   try {
@@ -891,6 +881,7 @@ export const uploadClientDocument = asyncHandler(async (req, res, next) => {
     throw error;
   } finally { client.release(); }
   req.body = { ...req.body, type, kyc_case_id: kyc.id, booking_id: undefined };
+  req.kycCase = kyc; // resolved under the lock above, so uploadDocument need not re-read it (it still checks access)
   // Onboarding: Aadhaar front + back + PAN uploaded → the client's KYC is verified.
   req.verifyOnIdentityComplete = true;
   uploadDocument(req, res, next);

@@ -51,7 +51,7 @@
     "migrate:client-registry": "node src/migrations/030_client_registry.js",
     "migrate:draw-enrollment": "node src/migrations/031_draw_enrollment.js",
     "migrate:client-flow": "node src/scripts/migrate_client_flow.js",
-    "test:client-flow": "node --test src/services/staffIdentity.service.test.mjs src/services/clientRegistry.service.test.mjs src/services/bookingWorkspaceAccess.test.mjs src/controllers/drawEnrollment.controller.test.mjs src/services/kycLoginIdentity.service.test.mjs src/services/clientPortal.service.test.mjs src/services/clientIdentityIntake.service.test.mjs src/services/clientPortalAvailability.test.mjs",
+    "test:client-flow": "node --test src/services/staffIdentity.service.test.mjs src/services/clientRegistry.service.test.mjs src/services/bookingWorkspaceAccess.test.mjs src/controllers/drawEnrollment.controller.test.mjs src/services/kycLoginIdentity.service.test.mjs src/services/clientPortal.service.test.mjs src/services/clientIdentityIntake.service.test.mjs src/services/clientPortalAvailability.test.mjs src/controllers/clientLookup.controller.test.mjs src/services/drawEnrollment.test.mjs src/controllers/clientUploadKyc.test.mjs src/controllers/onboardingKycVerify.test.mjs",
     "test:staff-identity": "node --test src/services/staffIdentity.service.test.mjs",
     "test:client-registry": "node --test src/services/clientRegistry.service.test.mjs",
     "migrate:kyc-login": "node src/migrations/032_kyc_login_identity.js",

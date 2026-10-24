@@ -1,6 +1,9 @@
 import { currentStaffSession } from '../services/staffSession.js';
 
 const authMiddleware = async (req, res, next) => {
+  // Only this middleware sets req.user: routers mounted after the '/' lookups router
+  // would otherwise look the session up a second time.
+  if (req.user) return next();
   const authorization = req.header('Authorization');
   const match = typeof authorization === 'string' && /^Bearer ([^\s]+)$/i.exec(authorization);
   if (!match) return res.status(401).json({ message: 'No token provided' });

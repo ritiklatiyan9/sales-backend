@@ -19,5 +19,13 @@ test('onboarding KYC is verified once Aadhaar front, back and PAN are on file', 
     const after = (await f.query('SELECT status, verified_by FROM kyc_cases WHERE id = $1', [kyc.id])).rows[0];
     assert.deepEqual(after, { status: 'VERIFIED', verified_by: 1 });
     assert.equal(await verifyWhenIdentityComplete(kyc, 1), false, 'already verified — no second write');
+    // An office rejection is never auto-verified, even with all three documents on file.
+    const { rows: [rejected] } = await f.query(`INSERT INTO kyc_cases (client_member_id, site_id, status) VALUES ($1, 1, 'REJECTED') RETURNING *`, [member.id]);
+    for (const [type, field] of [['AADHAAR', 'aadhar_front_url'], ['AADHAAR', 'aadhar_back_url'], ['PAN', 'pan_card_url']]) {
+      await f.query(`INSERT INTO documents (kyc_case_id, client_member_id, site_id, type, member_document_field, file_path, mime_type, file_size, ocr_status)
+        VALUES ($1, $2, 1, $3, $4, 'test/rejected', 'image/jpeg', 1, 'DONE')`, [rejected.id, member.id, type, field]);
+    }
+    assert.equal(await verifyWhenIdentityComplete(rejected, 1), false);
+    assert.deepEqual((await f.query('SELECT status, verified_by FROM kyc_cases WHERE id = $1', [rejected.id])).rows[0], { status: 'REJECTED', verified_by: null });
   } finally { await f.close(); }
 });

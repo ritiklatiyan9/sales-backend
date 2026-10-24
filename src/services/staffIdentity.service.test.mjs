@@ -41,7 +41,7 @@ test('phone login, Aadhaar enrollment and password revocation preserve shared id
   try {
     await db.exec(`CREATE TABLE users (
       id SERIAL PRIMARY KEY, name TEXT, email TEXT, phone TEXT, password TEXT, role TEXT,
-      is_active BOOLEAN NOT NULL DEFAULT true, token_version INTEGER NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT true, can_login_booking BOOLEAN NOT NULL DEFAULT true, token_version INTEGER NOT NULL DEFAULT 0,
       refresh_token TEXT, organization_id INTEGER, updated_at TIMESTAMPTZ DEFAULT now()
     ); CREATE TABLE sites (id INTEGER PRIMARY KEY, name TEXT, organization_id INTEGER);
     CREATE TABLE members (id INTEGER PRIMARY KEY, site_id INTEGER, member_type TEXT, member_types TEXT[]);

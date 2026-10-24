@@ -12,6 +12,7 @@ import { getVisibleUserIds, isAdminRole } from '../services/agentNetwork.service
 import { hasPermission } from '../services/permissions.service.js';
 import { findOrCreateMemberByPhone } from '../services/memberQuickAdd.service.js';
 import { queueWhatsApp } from '../services/whatsapp.service.js';
+import { identityDocsSql, missingIdentityDocuments } from '../services/clientRegistry.service.js';
 import {
   MEMBER_TYPE_OPTIONS,
   compareMemberTypes,
@@ -476,34 +477,61 @@ const resolveCase = async (body) => {
 };
 
 /**
- * POST /kyc/upload  (multipart: file=<binary>, booking_id|kyc_case_id, type)
- * Stores the file, inserts a PENDING document row, enqueues an async OCR job, and
- * returns immediately so the UI never blocks.
- */
-/**
  * Client onboarding rule: once the KYC case holds Aadhaar front, Aadhaar back and
- * PAN, it is verified (by the uploader). Returns true when the case is verified now.
+ * PAN (identityDocsSql, shared with the client lookup), it is verified by the uploader.
+ * An office REJECTED case is never flipped. Returns true when this call verified the case.
  */
 export async function verifyWhenIdentityComplete(kycCase, userId, db = pool) {
-  const { rows } = await db.query(
-    `SELECT bool_or(type = 'AADHAAR' AND member_document_field = 'aadhar_front_url') AS front,
-            bool_or(type = 'AADHAAR' AND member_document_field = 'aadhar_back_url') AS back,
-            bool_or(type = 'PAN') AS pan
-       FROM documents WHERE kyc_case_id = $1`, [kycCase.id]);
-  if (!(rows[0]?.front && rows[0]?.back && rows[0]?.pan)) return false;
   const { rowCount } = await db.query(
-    `UPDATE kyc_cases SET status = 'VERIFIED', verified_by = $1, verified_at = now(), updated_at = now()
-      WHERE id = $2 AND status <> 'VERIFIED'`, [userId || null, kycCase.id]);
+    `UPDATE kyc_cases k SET status = 'VERIFIED', verified_by = $1, verified_at = now(), updated_at = now()
+       FROM (${identityDocsSql('$2')}) d
+      WHERE k.id = $2 AND k.status NOT IN ('VERIFIED', 'REJECTED') AND d.aadhaar_front AND d.aadhaar_back AND d.pan`,
+    [userId || null, kycCase.id]);
   if (rowCount && kycCase.booking_id) {
     await db.query(`UPDATE bookings SET kyc_status = 'VERIFIED', status = CASE WHEN status = 'KYC_PENDING' THEN 'KYC_DONE' ELSE status END, updated_at = now() WHERE id = $1`, [kycCase.booking_id]);
   }
   return rowCount > 0;
 }
 
+/** Onboarding KYC state of one case for the /clients upload reply (the GET /clients/lookup `kyc` shape). */
+const identityKycState = (caseId, status, documents) => {
+  const verified = status === 'VERIFIED';
+  return { case_id: caseId, status, verified, documents, missing: verified ? [] : missingIdentityDocuments(documents) };
+};
+const readIdentityKycState = async (caseId) => {
+  const { rows: [row] } = await pool.query(
+    `SELECT k.status, d.* FROM kyc_cases k CROSS JOIN LATERAL (${identityDocsSql('k.id')}) d WHERE k.id = $1`, [caseId]);
+  return row ? identityKycState(caseId, row.status, { aadhaar_front: row.aadhaar_front, aadhaar_back: row.aadhaar_back, pan: row.pan }) : null;
+};
+
+/** Verify (unless the office rejected the case before this request) and announce a flip. */
+const verifyClientIdentity = async (kycCase, userId) => {
+  if (kycCase.status === 'REJECTED' || !(await verifyWhenIdentityComplete(kycCase, userId))) return false;
+  emitOcrUpdate({ bookingId: kycCase.booking_id, caseId: kycCase.id, status: 'VERIFIED' });
+  queueWhatsApp('KYC_VERIFIED', kycCase.id);
+  return true;
+};
+
+/** The /clients reply's confirmation; on failure the client re-reads the lookup instead. */
+const confirmClientKyc = (kycCase, userId) => verifyClientIdentity(kycCase, userId)
+  // A flip proves all three slots are on file; only an unflipped case needs the read.
+  .then((flipped) => (flipped
+    ? identityKycState(kycCase.id, 'VERIFIED', { aadhaar_front: true, aadhaar_back: true, pan: true })
+    : readIdentityKycState(kycCase.id)))
+  .catch((error) => { console.error('[kyc upload] confirmation failed:', error.code || error.name); return null; });
+
+/**
+ * POST /kyc/upload  (multipart: file=<binary>, booking_id|kyc_case_id, type)
+ * Stores the file, inserts a PENDING document row, enqueues an async OCR job, and
+ * returns immediately so the UI never blocks.
+ * POST /clients/:id/documents reuses it with req.kycCase + req.verifyOnIdentityComplete:
+ * identical retries are deduplicated and the reply carries the case's `kyc` state after
+ * the onboarding verify (the sales login cannot follow /kyc sockets).
+ */
 export const uploadDocument = asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded (field name: file)' });
 
-  const kycCase = await resolveCase(req.body);
+  const kycCase = req.kycCase || await resolveCase(req.body);
   if (!kycCase) return res.status(400).json({ message: 'Provide a valid booking_id or kyc_case_id' });
   if (!(await canAccessCase(req.user, kycCase))) {
     return res.status(403).json({ message: 'You are not authorised to upload to this KYC case' });
@@ -518,6 +546,30 @@ export const uploadDocument = asyncHandler(async (req, res) => {
     });
   }
   const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+  const clientUpload = Boolean(req.verifyOnIdentityComplete);
+  if (clientUpload) {
+    // The slot's newest document already holds these bytes = a retry (double tap, timeout):
+    // no new row, S3 object or OCR job. A different file in between is a replacement, not a retry.
+    // ponytail: check-then-insert; two simultaneous identical uploads can both pass. Upgrade: an
+    // advisory xact lock on (case, slot) around the INSERT if duplicates show up in data.
+    const { rows: [prior] } = await pool.query(
+      `SELECT id, ocr_status, ocr_job_id, member_document_field, file_hash, file_path FROM documents
+        WHERE kyc_case_id = $1 AND type = $2 AND member_document_field IS NOT DISTINCT FROM $3
+        ORDER BY id DESC LIMIT 1`, [kycCase.id, type, memberDocumentField]);
+    if (prior?.file_hash === fileHash) {
+      const kyc = await confirmClientKyc(kycCase, req.user?.id);
+      return res.status(200).json({
+        documentId: prior.id,
+        jobId: prior.ocr_job_id || null,
+        ocr_status: prior.ocr_status,
+        type,
+        member_document_field: prior.member_document_field || null,
+        deduplicated: true,
+        ...(type === 'PHOTO' ? { photo_url: getPublicKycUrl(prior.file_path) } : {}),
+        ...(kyc ? { kyc } : {}),
+      });
+    }
+  }
   const storageKey = await uploadKycDocument(req.file.buffer, req.file.originalname, req.file.mimetype);
 
   // Photos and the final booking/KYC-form documents don't need OCR — they're archive files.
@@ -554,6 +606,9 @@ export const uploadDocument = asyncHandler(async (req, res) => {
   // Portraits must be immediately available on the shared client and KYC profile.
   if (type === 'PHOTO') await linkDocToMember(type, storageKey, kycCase.client_member_id, memberDocumentField);
 
+  // Each verify runs after its own INSERT, so the last of concurrent uploads sees the full set.
+  const kyc = clientUpload ? await confirmClientKyc(kycCase, req.user?.id) : null;
+
   // Respond the moment the file is stored + row created — the UI no longer waits on
   // status roll-ups, job-id persistence, or the accounting mirror.
   res.status(201).json({
@@ -563,6 +618,7 @@ export const uploadDocument = asyncHandler(async (req, res) => {
     type,
     member_document_field: doc.member_document_field || null,
     ...(type === 'PHOTO' ? { photo_url: getPublicKycUrl(storageKey) } : {}),
+    ...(kyc ? { kyc } : {}),
   });
 
   // Fire-and-forget bookkeeping — never blocks the HTTP response.
@@ -586,10 +642,9 @@ export const uploadDocument = asyncHandler(async (req, res) => {
           [linked.col, doc.id]
         );
       }
-      if (req.verifyOnIdentityComplete && await verifyWhenIdentityComplete(kycCase, req.user?.id)) {
-        emitOcrUpdate({ bookingId: kycCase.booking_id, caseId: kycCase.id, status: 'VERIFIED' });
-        queueWhatsApp('KYC_VERIFIED', kycCase.id);
-      }
+      // The reply already verified explicit slots; a legacy Aadhaar without one only counts
+      // once the mirror above has picked its side.
+      if (clientUpload && type === 'AADHAAR' && !memberDocumentField && linked?.col) await verifyClientIdentity(kycCase, req.user?.id);
     } catch (err) {
       console.error('[kyc upload] post-processing failed:', err.message);
     }

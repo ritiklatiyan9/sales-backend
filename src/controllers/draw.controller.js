@@ -12,11 +12,10 @@ import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
-import { memberHasType } from '../services/memberRoles.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
 import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.model.js';
 import { validateDrawInstallmentPlan } from '../services/drawInstallmentPlan.js';
-import { normalizeDrawScheme } from '../services/drawEnrollment.js';
+import { clientDrawBlock, drawAvailability, drawOpenState, normalizeDrawScheme } from '../services/drawEnrollment.js';
 import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
 import { queueWhatsApp } from '../services/whatsapp.service.js';
 
@@ -121,6 +120,7 @@ export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
   await requireSiteAccess(req.user, siteId);
   const row = await getDrawSettings(siteId);
   const amount = Number(row?.draw_required_amount || 0);
+  const { open, reason } = drawAvailability(row); // the server's IST date, so no device clock decides
   res.json({
     site_id: Number(siteId),
     required_amount: amount > 0 ? amount : null,
@@ -130,6 +130,8 @@ export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
     wait_days: row?.draw_wait_days || 10,
     opening_date: row?.draw_opening_date || '',
     terms: row?.draw_terms || DEFAULT_DRAW_TERMS,
+    open,
+    reason,
   });
 });
 
@@ -247,16 +249,16 @@ export const createDraw = asyncHandler(async (req, res) => {
   }
 
   const setting = await getDrawSettings(site_id);
-  if (setting?.draw_enabled === false) {
+  const gate = drawOpenState(setting, { waitDays: req.body.wait_days }); // shared with the /clients lookup
+  if (gate.reason === 'DRAW_DISABLED') {
     return res.status(409).json({ message: 'Draw enrollment is disabled for this site. Continue with a direct booking.', code: 'DRAW_DISABLED' });
   }
   const drawScheme = normalizeDrawScheme(scheme_name, setting?.draw_scheme_name);
-  const required = Number(setting?.draw_required_amount || 0);
-  if (!required || required <= 0) {
+  if (gate.reason === 'NOT_CONFIGURED') {
     return res.status(400).json({ message: 'The draw amount for this site has not been set — an Admin must configure it in Draw Settings first' });
   }
-
-  const scheduledDate = openingDate(setting.draw_opening_date, req.body.wait_days ?? setting.draw_wait_days);
+  if (gate.error) throw gate.error;
+  const { required, scheduledDate } = gate;
   if (!client_member_id && (!String(full_name || '').trim() || String(full_name).length > 255)) throw workflowError('Customer name is required (up to 255 characters)');
   const requestKey = req.body.request_key || null;
   if (requestKey && !/^[a-zA-Z0-9_-]{8,100}$/.test(requestKey)) throw workflowError('Invalid registration request key');
@@ -311,8 +313,9 @@ export const createDraw = asyncHandler(async (req, res) => {
       SELECT m.site_id, m.member_type, m.member_types, m.referred_by_user_id, m.created_by, cu.role AS creator_role
       FROM members m LEFT JOIN users cu ON cu.id = m.created_by WHERE m.id = $1`, [memberId]);
     const mem = members[0];
-    if (!mem || Number(mem.site_id) !== Number(site_id)) throw workflowError('Customer does not belong to the selected site');
-    if (!memberHasType(mem, 'CLIENT')) throw workflowError('Select a registered client');
+    const block = clientDrawBlock(mem, site_id);
+    if (block === 'WRONG_SITE') throw workflowError('Customer does not belong to the selected site');
+    if (block) throw workflowError('Select a registered client');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`draw_enrollment:${Number(site_id)}:${Number(memberId)}`]);
     const existing = await drawModel.findActiveEnrollment({ siteId: site_id, clientMemberId: memberId, ...drawScheme }, client);
     // One client may hold several entries in the same draw — each is its own booking

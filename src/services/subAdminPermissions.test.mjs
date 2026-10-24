@@ -56,7 +56,10 @@ test('admins control sub-admin grants and APIs honor them without allowing self 
       const modules=['booking_bookings','booking_new_booking','booking_dashboard','booking_draws','booking_kyc_all','booking_kyc_new','booking_teams','booking_members','booking_clients'];
       for(const module of modules)await call(setUserPermission,{body:{module,can_read:false,can_write:true,can_update:true,can_delete:true}});
       const token=signAccessToken({id:2,version:1,role:'sub_admin'});
-      for(const [router,method,path,body] of [
+      // Route gates read the grants loaded with the session; the per-check query is the fallback only.
+      const base=fixture.pool.query;let permissionQueries=0;
+      fixture.pool.query=(sql,values)=>{if(/AS allowed FROM user_permissions/.test(sql))permissionQueries++;return base(sql,values);};
+      try{for(const [router,method,path,body] of [
         [bookingRoutes,'GET','/'],[bookingRoutes,'POST','/'],[bookingRoutes,'PUT','/1'],[bookingRoutes,'DELETE','/1'],
         [drawRoutes,'GET','/'],[drawRoutes,'POST','/1/payments'],[drawRoutes,'POST','/1/cancel'],[drawRoutes,'DELETE','/1'],
         [kycRoutes,'GET','/cases'],[kycRoutes,'POST','/cases'],[kycRoutes,'PATCH','/case/1/customer'],[kycRoutes,'DELETE','/case/1'],
@@ -65,7 +68,8 @@ test('admins control sub-admin grants and APIs honor them without allowing self 
         const result=await request(router,method,path,token,body);
         assert.equal(result.status,403,`${method} ${path}: ${JSON.stringify(result.data)}`);
         assert.equal(result.data.code,'MODULE_ACCESS_DENIED');
-      }
+      }}finally{fixture.pool.query=base;}
+      assert.equal(permissionQueries,0);
     });
     await t.test('company and banking edits follow separate sub-admin Update grants',async()=>{
       await call(setUserPermission,{body:{module:'booking_company_details',can_read:true,can_write:true,can_update:true,can_delete:false}});

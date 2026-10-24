@@ -2,14 +2,51 @@ import { parseMemberCode, canonicalMemberIdSql, findBrokerReferral, memberReferr
 import { requireSiteAccess } from './bookingWorkspaceAccess.js';
 import { isAdminRole } from './agentNetwork.service.js';
 import { memberTypePayload, memberHasType, addMemberType } from './memberRoles.service.js';
+import { hasPermission } from './permissions.service.js';
 import kycCaseModel from '../models/KycCase.model.js';
 
 export const clientRegistryError = (message, status = 400, code) =>
   Object.assign(new Error(message), { status, ...(code ? { code } : {}) });
 
+export const requireClientRegistryPermission = async (user, action = 'can_read') => {
+  const flags = action === 'can_read' ? ['can_read'] : ['can_read', action];
+  const allowed = await Promise.all(flags.map(flag => hasPermission(user, 'booking_clients', flag)));
+  if (allowed.some(value => !value)) throw clientRegistryError('Access Control has not granted this Clients action for your account', 403);
+};
+
+/** Promise.all for independent checks/reads that still fails like the sequential awaits it
+ *  replaces: the first rejection in argument order wins, whichever settled first. */
+export async function allInOrder(promises) {
+  const results = await Promise.allSettled(promises);
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed) throw failed.reason;
+  return results.map(result => result.value);
+}
+
 // Keep this expression identical to migration 030's index and duplicate guard.
 export const memberPhoneSql = (alias = 'm') =>
   `RIGHT(regexp_replace(COALESCE(${alias}.phone, ''), '\\D', '', 'g'), 10)`;
+
+// Onboarding KYC is complete once one case holds these three slots. identityDocsSql is
+// the single definition shared by the auto-verify rule, the lookup and the upload reply.
+export const IDENTITY_DOCUMENTS = ['aadhaar_front', 'aadhaar_back', 'pan'];
+export const identityDocsSql = caseId => `SELECT
+    COALESCE(bool_or(type = 'AADHAAR' AND member_document_field = 'aadhar_front_url'), false) AS aadhaar_front,
+    COALESCE(bool_or(type = 'AADHAAR' AND member_document_field = 'aadhar_back_url'), false) AS aadhaar_back,
+    COALESCE(bool_or(type = 'PAN'), false) AS pan
+  FROM documents WHERE kyc_case_id = ${caseId}`;
+export const missingIdentityDocuments = docs => IDENTITY_DOCUMENTS.filter(key => !docs?.[key]);
+
+/** Registered = any VERIFIED case at the member's site (client portal and dashboard rule). */
+export const kycVerifiedSql = (alias = 'm') => `EXISTS (SELECT 1 FROM kyc_cases kv
+    WHERE kv.client_member_id = ${alias}.id AND kv.site_id = ${alias}.site_id AND kv.status = 'VERIFIED')`;
+
+/** The case POST /clients/:id/documents writes to: mirrors KycCase.getOrCreateForMember. */
+export const uploadCaseLateral = (alias, visibleParam, as = 'upload_case') => `LEFT JOIN LATERAL (
+    SELECT kc.id, kc.status FROM kyc_cases kc
+     WHERE kc.client_member_id = ${alias}.id AND kc.booking_id IS NULL
+       AND (${visibleParam}::int[] IS NULL OR kc.created_by = ANY(${visibleParam}::int[]))
+     ORDER BY kc.id DESC LIMIT 1) ${as} ON true`;
 
 export function normalizeClientPhone(value, { required = false, strict = false } = {}) {
   const input = String(value ?? '').trim();
