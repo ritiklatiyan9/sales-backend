@@ -64,11 +64,12 @@ can still affect the first request and are independent of app/database caching.
 
 Mobile credentials remain the registered Indian mobile number and Aadhaar, as
 requested for this app. This is a separate mobile credential realm, not a change
-to web portal password-change behavior or staff login. Tokens expire after one
-hour and use issuer `my-real-assets-bookings`, a dedicated key derivation and
+to web portal password-change behavior or staff login. Tokens expire after 30
+days and use issuer `my-real-assets-bookings`, a dedicated key derivation and
 `mobile-client` realm. Staff, older Accounts-mobile and web portal tokens cannot
 authenticate these endpoints. Neither raw mobile nor Aadhaar is included in the
-token or response. The app keeps the token in memory only.
+token or response. The app keeps the scoped token in device-secured encrypted
+storage for the session duration; financial caches remain memory-only.
 
 Each request rechecks the current exact mobile/Aadhaar identity. Inactive members
 are denied. A deactivated private Bookings client account explicitly linked to a
@@ -117,3 +118,7 @@ Mobile tests use synthetic PGlite records and assert read-only behavior, exact
 identity boundaries, account deactivation, domain separation, cash/refunds,
 allocation math, batching/cache revocation, explicit refresh, gzip and production
 enablement. No real client's Aadhaar is used to run the tests.
+
+## Persistent mobile sessions
+
+Login returns `expiresAt` and `sessionDurationDays:30` alongside the access token. The public status reports `sessionDurationDays:30` so deployment checks can verify the duration. Clients store only the scoped token and minimal profile in device-secured encrypted storage; Aadhaar is never stored. Signature, expiry, current identity, inactive/deactivated status and ownership remain server-validated on authenticated reads. Signing-key rotation revokes saved sessions. Existing one-hour tokens retain their original expiry; sign in once after this update to receive a 30-day session.

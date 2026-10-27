@@ -78,7 +78,9 @@ test('mobile customer portal enforces identity and property boundaries with real
   await t.test('credentials are never returned or placed in JWT payloads; staff tokens are refused', async () => {
     assert.deepEqual(login.user, { id: 'client:1', name: 'Example Owner', role: 'client' });
     const claims = jwt.decode(login.token);
-    assert.equal(claims.exp - claims.iat, 3600);
+    assert.equal(claims.exp - claims.iat, 30 * 24 * 60 * 60);
+    assert.equal(login.sessionDurationDays, 30);
+    assert.equal(Date.parse(login.expiresAt), claims.exp * 1000);
     for (const value of [credentials.mobile, credentials.aadhaar, '2345 6789 0123']) {
       assert.ok(!JSON.stringify(login).includes(value));
       assert.ok(!JSON.stringify(claims).includes(value));
@@ -340,7 +342,7 @@ test('production mobile access requires its own opt-in; public status does not e
       json(body) { resolve({ status: this.statusCode, headers: this.headers, body }); } };
     router.handle(req, res, error => reject(error || new Error('No route matched')));
   });
-  assert.deepEqual((await invoke('GET', '/status')).body, { service: 'my-real-assets', apiVersion: 1, enabled: false });
+  assert.deepEqual((await invoke('GET', '/status')).body, { service: 'my-real-assets', apiVersion: 1, enabled: false, sessionDurationDays: 30 });
   assert.equal((await invoke('GET', '/plots')).status, 503);
   assert.equal((await invoke('POST', '/auth/login')).status, 503);
   assert.equal(authCalls, 0);

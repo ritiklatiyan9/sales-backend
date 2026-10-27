@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { gzip } from 'node:zlib';
 import express from 'express';
 import pool from '../config/db.js';
-import { createMobilePortalService, normalizeMobile } from '../services/mobilePortal.service.js';
+import { createMobilePortalService, normalizeMobile, MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
 
 const gzipAsync = promisify(gzip);
 async function sendPortfolioJson(req, res, payload) {
@@ -66,7 +66,7 @@ export function createMobilePortalRouter(service, {
   });
   router.use((_req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
   router.get('/status', (_req, res) => res.json({
-    service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()),
+    service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()), sessionDurationDays: MOBILE_SESSION_DAYS,
   }));
   // Mobile access is independent of the existing paused web client portal.
   // A production deployment opts in explicitly; disabled access never enters auth.

@@ -4,6 +4,7 @@ import { allocateInstallmentPayments } from './mobileInstallmentAllocation.servi
 
 const ISSUER = 'my-real-assets-bookings';
 const AUDIENCE = 'my-real-assets-client';
+export const MOBILE_SESSION_DAYS = 30;
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const unauthorized = () => fail(401, 'Please sign in again.');
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
@@ -299,10 +300,13 @@ export function createMobilePortalService(db, {
       const digest = identityKey(mobile, aadhaar);
       const members = await membersFor(mobile, digest);
       if (!members.length) fail(401, 'Mobile number or Aadhaar did not match.');
+      const token = jwt.sign({ realm: 'mobile-client', identity: digest }, privateKey('access'), {
+        algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-client:${members[0].id}`, expiresIn: `${MOBILE_SESSION_DAYS}d`,
+      });
       return {
-        token: jwt.sign({ realm: 'mobile-client', identity: digest }, privateKey('access'), {
-          algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-client:${members[0].id}`, expiresIn: '1h',
-        }),
+        token,
+        expiresAt: new Date(jwt.decode(token).exp * 1000).toISOString(),
+        sessionDurationDays: MOBILE_SESSION_DAYS,
         user: userFor(members),
       };
     },
