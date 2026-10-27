@@ -142,7 +142,7 @@ export function projectMobilePlot(plot, schedule, receipts, today = todayInIndia
   };
 }
 
-export function createMobilePortalService(db, {
+export function createMobileFinancialReader(db, {
   financeCacheMs = 5000,
   financeCacheMaxEntries = 256,
   financeCacheMaxBytes = 8 * 1024 * 1024,
@@ -229,6 +229,12 @@ export function createMobilePortalService(db, {
     await Promise.all([...waiting].map(async ([id, promise]) => values.set(id, await promise)));
     return values;
   }
+  return financialsFor;
+}
+
+export function createMobilePortalService(db, options = {}) {
+  const { now = Date.now } = options;
+  const financialsFor = createMobileFinancialReader(db, options);
   const userFor = members => ({ id: `client:${members[0].id}`, name: members[0].full_name || 'Property owner', role: 'client' });
   async function membersFor(mobile, digest) {
     const result = await db.query(`${memberSelect} AND right(regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g'),10)=$1 AND ${phoneSql}=$1 ORDER BY m.id LIMIT 1001`, [mobile]);

@@ -6,7 +6,7 @@ import pool from '../config/db.js';
 import { createMobilePortalService, normalizeMobile, MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
 
 const gzipAsync = promisify(gzip);
-async function sendPortfolioJson(req, res, payload) {
+export async function sendPortfolioJson(req, res, payload) {
   res.vary('Accept-Encoding');
   // Small JSON stays uncompressed. Fast asynchronous gzip reduces mobile data
   // without blocking the event loop or changing private/no-store semantics.
