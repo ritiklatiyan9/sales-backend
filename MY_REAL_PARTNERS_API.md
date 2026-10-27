@@ -10,7 +10,7 @@ remains separate.
 ## Mobile sign-in and recovery
 
 - `GET /status`: public `{service:"my-real-assets-broker",apiVersion:1,authVersion:2,
-  enabled:true,sessionDurationDays:30,passwordReset:"registered-email-otp",
+  portfolioVersion:2,commissionLinkedPlots:true,enabled:true,sessionDurationDays:30,passwordReset:"registered-email-otp",
   recoveryEmailEnabled:true}`. The email flag reports transport configuration;
   it does not send a test message or guarantee delivery to every address.
 - `POST /auth/login`: `{mobile,password}`. Initial app password is the broker's
@@ -89,14 +89,38 @@ sessions without changing or replacing the independent app credential. Before
 an app password is customized, initial Aadhaar sign-in remains available as
 explicitly requested for this separate app.
 
-A plot requires its latest booking, current explicit buyer and direct broker
-attribution. Same-site `booking_agent_id` takes priority over `agent_user_id`.
-A cancelled/withdrawn latest booking never revives older broker access. Direct
-client referral links may expose contact with zero plots; referrals never grant
-plots assigned to another broker. `referred_by_member_id` takes priority over
-`referred_by_user_id`. Staff creation, team hierarchy, commission rows and names
-such as `booking_by` are not private access authorities. Direct Accounts-only
-plots without explicit current booking attribution are excluded safely.
+A plot is visible through either explicit current booking attribution or its
+structured Accounts commission relationship. The existing booking rule requires
+its latest booking/current buyer; same-site `booking_agent_id` takes priority
+over `agent_user_id`, and cancelled/withdrawn bookings do not revive older
+booking access.
+
+The approved commission rule additionally includes `plot_commissions_v2` rows
+whose `plot_id`, `site_id` and member `agent_id` match the plot and the current
+broker identity. Pending, Partial and Completed master records grant this
+relationship; rejected, cancelled, deleted and other invalid masters do not.
+The broker may be a co-broker while another person is recorded as Booking By.
+A name typo or a different primary broker does not hide an explicit commission
+relationship. Legacy name-only commission rows grant no access. Commission
+scope is queried afresh on every request, including when finance is cached.
+
+For commission-linked plots, current client contact comes from the plot's
+explicit same-site active buyer member, regardless of the member's registration
+role. If no explicit buyer is recorded, an exact same-site buyer name may resolve
+contact only when it identifies exactly one member across the entire directory;
+inactive duplicates still make the name ambiguous. An invalid explicit buyer
+pointer never falls through to a guessed name match. When buyer identity is
+missing, inactive or ambiguous, the plot remains visible under a synthetic
+`plot-owner:<plotId>` client with its current ledger buyer name and blank contact
+fields. Historical commission buyer snapshots and similarly named people are
+never used to invent a current client ID or contact details.
+
+Direct client referral links may expose contact with zero plots; a referral
+alone never grants another broker's plots. `referred_by_member_id` takes priority
+over `referred_by_user_id`. Staff creation, team hierarchy, `booking_by` names and
+buyer names do not independently grant private plot access. Only committed Booked, Sold and Registry plots qualify for the commission
+branch; transferred, under-cancellation, available/company and other inactive
+states do not inherit access from an old commission record.
 
 ## Deployment and performance
 
@@ -119,7 +143,7 @@ npm run migrate:broker-mobile
 This index uses `CREATE INDEX CONCURRENTLY`; source deployment alone does not
 apply it. Neither portfolio reads nor app startup perform schema migrations.
 
-The portfolio uses batched scope and financial reads; concurrent financial misses
+The portfolio reads booking and commission scope in parallel, then uses batched financial reads; concurrent financial misses
 share work, cache entries/bytes are bounded, and histories load on opening one
 plot. Above 1,000 clients or 1,000 plots, the API returns explicit 503 instead of
 partial totals. Pagination is not currently exposed.
@@ -139,5 +163,5 @@ npm run test:mobile-portal
 Tests use synthetic PGlite records and an injected email sender. No real client
 identity or actual OTP delivery is used. They cover independent/mixed-role broker
 login, shared phones, custom passwords and recovery, historical enrollment and
-revocation, concurrent OTP operations, cross-broker plots, privacy and posting
-math. Existing client financial calculations and API remain unchanged.
+revocation, concurrent OTP operations, cross-broker/co-broker plots, Accounts-only commission relationships, current
+buyer resolution and masked contacts, privacy and posting math. Existing client financial calculations and API remain unchanged.

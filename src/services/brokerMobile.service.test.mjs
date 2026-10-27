@@ -20,7 +20,8 @@ async function fixture() {
     CREATE TABLE booking_user_kyc_links(user_id integer,member_id integer,kyc_case_id integer,phone text,aadhaar_last4 text);
     CREATE TABLE kyc_cases(id integer PRIMARY KEY,client_member_id integer,site_id integer,status text);
     CREATE TABLE members(id integer PRIMARY KEY,site_id integer,full_name text,phone text,email text,address text,city text,state text,pincode text,aadhar_no text,pan_no text,account_no text,passport_no text,member_type text,member_types text[],is_active boolean DEFAULT true,status text DEFAULT 'ACTIVE',referred_by_member_id integer,referred_by_user_id integer);
-    CREATE TABLE plots(id integer PRIMARY KEY,site_id integer,plot_no text,plot_size numeric,sale_price numeric,booking_date date,status text,buyer_member_id integer,booking_by text,full_payment_due boolean DEFAULT false,full_payment_due_date date);
+    CREATE TABLE plots(id integer PRIMARY KEY,site_id integer,plot_no text,plot_size numeric,sale_price numeric,booking_date date,status text,buyer_member_id integer,booking_by text,buyer_name text,full_payment_due boolean DEFAULT false,full_payment_due_date date);
+    CREATE TABLE plot_commissions_v2(id integer PRIMARY KEY,site_id integer,plot_id integer,agent_id integer,total_commission numeric DEFAULT 0,status text DEFAULT 'Pending');
     CREATE TABLE bookings(id integer PRIMARY KEY,site_id integer,plot_id integer,client_member_id integer,status text,booking_agent_id integer,agent_user_id integer,created_by integer);
     CREATE TABLE plot_installments(id integer PRIMARY KEY,plot_id integer,installment_name text,amount numeric,due_date date,sort_order integer,status text DEFAULT 'pending');
     CREATE TABLE plot_payments(id integer PRIMARY KEY,site_id integer,plot_id integer,amount numeric,date date,payment_type text,status text,cheque_status text,reference text);
@@ -180,9 +181,120 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
   });
   await t.test('financial reads batch, cache and refresh without per-client queries',async()=>{
     const first=queries.length;await service.portfolio(session);
-    assert.equal(queries.length-first,2,'warm finance cache leaves plot-scope and client-scope SQL only');
-    const second=queries.length;await service.portfolio(session,{forceFresh:true});assert.equal(queries.length-second,4);
+    assert.equal(queries.length-first,3,'warm finance cache leaves Bookings/commission scope and client-scope SQL only');
+    const second=queries.length;await service.portfolio(session,{forceFresh:true});assert.equal(queries.length-second,5);
     assert.ok(!queries.some(q=>/^(?:UPDATE|DELETE FROM|INSERT INTO) (?:plots|members|bookings|plot_payments|plot_installments)\b/.test(q)));
+  });
+});
+
+test('commission-linked Accounts plots include approved related owners without leaking ambiguous contacts',async t=>{
+  const previous=process.env.MOBILE_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET='synthetic-commission-entitlement-secret-long-enough';
+  const db=await fixture();
+  t.after(async()=>{await db.close();if(previous===undefined)delete process.env.MOBILE_PORTAL_SECRET;else process.env.MOBILE_PORTAL_SECRET=previous;});
+  await db.exec(`
+    INSERT INTO members(id,site_id,full_name,phone,email,address,aadhar_no,pan_no,account_no,member_type) VALUES
+      (40,1,'Accounts Only Buyer','9876590040','accounts-owner@example.test','40 Synthetic Street','912345678901','ZZZZZ1234Z','PRIVATE-ACCOUNTS-BANK','CLIENT'),
+      (41,1,'Duplicate Ledger Buyer','9876590041','duplicate-active@example.test','PRIVATE-DUPLICATE-ADDRESS',NULL,NULL,NULL,'CLIENT'),
+      (42,1,'Duplicate Ledger Buyer','9876590042','duplicate-inactive@example.test',NULL,NULL,NULL,NULL,'CLIENT'),
+      (43,2,'Cross Site Buyer','9876590043','crosssite@example.test','PRIVATE-CROSSSITE-ADDRESS',NULL,NULL,NULL,'CLIENT'),
+      (44,1,'Broker As Buyer','9876590044','broker-owner@example.test','44 Synthetic Street',NULL,NULL,NULL,'BROKER'),
+      (45,1,'Inactive Ledger Buyer','9876590045','inactive-owner@example.test','PRIVATE-INACTIVE-ADDRESS',NULL,NULL,NULL,'CLIENT'),
+      (46,1,'Unique Name Buyer','9876590046','unique-owner@example.test','46 Synthetic Street',NULL,NULL,NULL,'CLIENT'),
+      (47,1,'Fallback Name Contact','9876590047','do-not-fallback@example.test','PRIVATE-FALLBACK-ADDRESS',NULL,NULL,NULL,'CLIENT');
+    UPDATE members SET status='INACTIVE' WHERE id=42;
+    UPDATE members SET status='BLOCKED' WHERE id=45;
+    INSERT INTO plots(id,site_id,plot_no,plot_size,sale_price,booking_date,status,buyer_member_id,booking_by,buyer_name) VALUES
+      (21,1,'LEGACY-1',150,1000,'2026-01-01','REGISTRY',40,'Partner A Typo','Old Recorded Buyer Label'),
+      (22,1,'LEGACY-2',150,1000,'2026-01-01','REGISTRY',NULL,'Partner B',' unique name buyer '),
+      (23,1,'LEGACY-3',150,1000,'2026-01-01','REGISTRY',NULL,'Partner B','Duplicate Ledger Buyer'),
+      (24,1,'LEGACY-4',150,1000,'2026-01-01','REGISTRY',43,'Partner B','Fallback Name Contact'),
+      (25,1,'LEGACY-5',150,1000,'2026-01-01','SOLD',44,'Partner B','Broker As Buyer'),
+      (26,1,'DENIED-COMMISSION-CANCELLED',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (27,1,'DENIED-COMMISSION-REJECTED',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (28,1,'DENIED-COMMISSION-DELETED',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (29,1,'DENIED-COMMISSION-WRONG-SITE',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (30,1,'DENIED-COMMISSION-OTHER-BROKER',150,1000,'2026-01-01','REGISTRY',40,'Partner A','Accounts Only Buyer'),
+      (31,1,'DENIED-CANCELLED-PLOT',150,1000,'2026-01-01','CANCELLED',40,'Partner B','Accounts Only Buyer'),
+      (32,1,'DENIED-DELETED-PLOT',150,1000,'2026-01-01','DELETED',40,'Partner B','Accounts Only Buyer'),
+      (33,1,'DENIED-COMPANY-PLOT',150,1000,'2026-01-01','COMPANY',40,'Partner B','Accounts Only Buyer'),
+      (34,1,'DENIED-AVAILABLE-PLOT',150,1000,'2026-01-01','AVAILABLE',40,'Partner B','Accounts Only Buyer'),
+      (35,3,'DENIED-OTHER-ORGANIZATION',150,1000,'2026-01-01','REGISTRY',30,'Partner A','Other Org Client'),
+      (36,1,'LEGACY-6',150,1000,'2026-01-01','REGISTRY',45,'Partner B','Inactive Ledger Buyer'),
+      (37,1,'LEGACY-7',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (38,1,'DENIED-COMMISSION-UNKNOWN',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (39,1,'DENIED-COMMISSION-NULL',150,1000,'2026-01-01','REGISTRY',40,'Partner B','Accounts Only Buyer'),
+      (40,2,'LEGACY-SECOND-SITE',180,2000,'2026-01-01','REGISTRY',20,'Other Primary Broker','Client At Site Two'),
+      (41,1,'DENIED-TRANSFERRED-PLOT',150,1000,'2026-01-01','TRANSFERRED',40,'Partner B','Accounts Only Buyer'),
+      (42,1,'DENIED-UNDER-CANCELLATION-PLOT',150,1000,'2026-01-01','UNDER CANCELLATION',40,'Partner B','Accounts Only Buyer'),
+      (43,1,'DENIED-UNKNOWN-PLOT-STATUS',150,1000,'2026-01-01','UNKNOWN',40,'Partner B','Accounts Only Buyer');
+    INSERT INTO plot_commissions_v2(id,site_id,plot_id,agent_id,total_commission,status) VALUES
+      (501,1,21,101,100,'Completed'),(502,1,22,101,100,'Partial'),(503,1,23,101,100,'Pending'),
+      (504,1,24,101,100,'Pending'),(505,1,25,101,100,'Completed'),(506,1,26,101,100,'cancelled'),
+      (507,1,27,101,100,'REJECTED'),(508,1,28,101,100,'deleted'),(509,2,29,201,100,'Pending'),
+      (510,1,30,102,100,'Pending'),(511,1,31,101,100,'Pending'),(512,1,32,101,100,'Pending'),
+      (513,1,33,101,100,'Completed'),(514,1,34,101,100,'Pending'),(515,3,35,301,100,'Pending'),
+      (516,1,36,101,100,'Partial'),(517,1,37,101,100,'Pending'),(518,1,38,101,100,'UNKNOWN'),
+      (519,1,39,101,100,NULL),(520,1,21,101,50,'Pending'),(521,1,21,102,50,'Completed'),
+      (540,2,40,201,200,'Partial'),(541,1,41,101,100,'Pending'),
+      (542,1,42,101,100,'Partial'),(543,1,43,101,100,'Completed');
+    INSERT INTO bookings VALUES(137,1,37,40,'CANCELLED',102,2,2);
+    INSERT INTO plot_installments(id,plot_id,installment_name,amount,due_date,sort_order) VALUES
+      (21,21,'Booking amount',200,'2026-01-01',1),(22,21,'Final installment',800,'2027-01-01',2);
+    INSERT INTO plot_payments VALUES
+      (21,1,21,300,'2026-01-01','CASH','approved',NULL,'LEGACY-CASH'),
+      (22,1,21,200,'2026-02-01','BANK','approved',NULL,'LEGACY-BANK'),
+      (23,1,21,-50,'2026-03-01','BANK','approved',NULL,'LEGACY-REFUND');
+  `);
+  const service=createBrokerMobileService(db,{financeCacheMs:5000,bcryptRounds:4});
+  const session=await service.getSession((await service.login(credentials)).token);
+  const permitted=['21','22','23','24','25','36','37','40'];
+  await t.test('explicit commission membership grants Accounts-only and other-primary plots once each',async()=>{
+    const portfolio=await service.portfolio(session);
+    const ids=portfolio.clients.flatMap(client=>client.plots.map(plot=>plot.id));
+    for(const id of permitted)assert.equal(ids.filter(value=>value===id).length,1,`commission-linked plot ${id}`);
+    for(const id of ['26','27','28','29','30','31','32','33','34','35','38','39','41','42','43']){
+      assert.ok(!ids.includes(id));await assert.rejects(service.plot(session,id),{statusCode:404});
+    }
+    assert.equal(portfolio.clients.find(client=>client.id==='40').name,'Accounts Only Buyer','explicit buyer ID beats the recorded label');
+    assert.equal(portfolio.clients.find(client=>client.id==='46').phone,'9876590046','unique current ledger name resolves its same-site contact');
+    assert.equal(portfolio.clients.find(client=>client.id==='44').phone,'9876590044','a current explicit buyer can have another member role');
+    assert.ok(!JSON.stringify(portfolio).match(/912345678901|ZZZZZ1234Z|PRIVATE-ACCOUNTS-BANK/));
+    const disabled=createBrokerMobileService(db,{includeCommissionPlots:false,bcryptRounds:4});
+    const without=await disabled.portfolio(session);
+    assert.ok(without.clients.flatMap(client=>client.plots).every(plot=>!permitted.includes(plot.id)));
+  });
+  await t.test('ambiguous, cross-site and inactive buyer identities keep only recorded names and blank contacts',async()=>{
+    const portfolio=await service.portfolio(session);
+    for(const [id,name]of[['23','Duplicate Ledger Buyer'],['24','Fallback Name Contact'],['36','Inactive Ledger Buyer']]){
+      const client=portfolio.clients.find(row=>row.id===`plot-owner:${id}`);
+      assert.ok(client,`safe recorded owner for plot ${id}`);assert.equal(client.name,name);
+      for(const key of['phone','email','address','city','state','pincode'])assert.equal(client[key],'');
+      assert.deepEqual(client.plots.map(plot=>plot.id),[id]);
+    }
+    assert.ok(!portfolio.clients.some(client=>['41','42','43','45','47'].includes(client.id)));
+    assert.ok(!/PRIVATE-DUPLICATE-ADDRESS|PRIVATE-CROSSSITE-ADDRESS|PRIVATE-FALLBACK-ADDRESS|PRIVATE-INACTIVE-ADDRESS/.test(JSON.stringify(portfolio)));
+  });
+  await t.test('commission access shares cash, bank, refunds, installment allocation and lazy financial histories',async()=>{
+    const{plot}=await service.plot(session,'21');
+    assert.equal(plot.number,'LEGACY-1');assert.equal(plot.area,150);
+    assert.equal(plot.totalAmount,1000);assert.equal(plot.paidAmount,450);assert.equal(plot.balanceAmount,550);
+    assert.deepEqual(plot.installments.map(row=>row.paidAmount),[200,250]);
+    assert.equal(plot.payments.length,3);assert.ok(plot.payments.some(row=>row.mode==='CASH'));
+    assert.ok(plot.payments.some(row=>row.status==='refund'));
+    assert.ok((await service.portfolio(session)).clients.every(client=>client.plots.every(row=>!Object.hasOwn(row,'payments'))));
+  });
+  await t.test('changing or removing commission entitlement revokes access even with warm financial caches',async()=>{
+    await service.plot(session,'21');await service.portfolio(session);
+    await db.exec('UPDATE plot_commissions_v2 SET agent_id=102 WHERE plot_id=21');
+    await assert.rejects(service.plot(session,'21'),{statusCode:404});
+    assert.ok(!(await service.portfolio(session)).clients.flatMap(client=>client.plots).some(plot=>plot.id==='21'));
+    await db.exec('UPDATE plot_commissions_v2 SET agent_id=101 WHERE id=501');
+    assert.equal((await service.plot(session,'21')).plot.id,'21');
+    await db.exec('DELETE FROM plot_commissions_v2 WHERE id=501');
+    await assert.rejects(service.plot(session,'21'),{statusCode:404});
+    await db.exec("UPDATE plot_commissions_v2 SET agent_id=101,status='Cancelled' WHERE id=520");
+    await assert.rejects(service.plot(session,'21'),{statusCode:404});
   });
 });
 
