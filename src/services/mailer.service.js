@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import { buildBrokerPasswordResetEmail } from './brokerResetEmail.service.js';
 
 /**
  * Outbound mail (Nodemailer) — used for the admin login OTP.
@@ -30,6 +31,12 @@ if (HOST && USER && PASS) {
 }
 
 export const mailerEnabled = () => !!transporter;
+
+/** Neutral broker-app recovery email; never logs a code or recipient. */
+export async function sendBrokerPasswordResetEmail(details) {
+  if (!transporter) throw new Error('Email verification transport is unavailable');
+  await transporter.sendMail(buildBrokerPasswordResetEmail({ ...details, fromAddress: USER }));
+}
 
 /** Send the 6-digit login code. Throws on delivery failure (caller surfaces 502). */
 export async function sendLoginOtpEmail({ to, name, otp, minutes }) {

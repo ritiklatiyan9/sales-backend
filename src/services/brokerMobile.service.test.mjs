@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { createHash } from 'node:crypto';
+import { migrateBrokerMobileAuth } from '../migrations/044_broker_mobile_auth.js';
 import { PGlite } from '@electric-sql/pglite';
 import { createBrokerMobileService } from './brokerMobile.service.js';
 import { createBrokerMobileRouter, createBrokerMobileLoginLimiter } from '../routes/brokerMobile.routes.js';
 import { postingPolicySql } from '../test/mobilePostingPolicy.fixture.mjs';
 
-const credentials={identifier:'9876500001',password:'SyntheticPartnerPassword!'};
+const credentials={mobile:'9876500001',password:'234567890123'};
 async function fixture() {
   const db=new PGlite();
   await db.exec(`
@@ -82,31 +83,31 @@ async function fixture() {
   await db.query('INSERT INTO booking_staff_identities VALUES(1,$1,$2,\'0123\')',[
     await bcrypt.hash('234567890123',4),createHash('sha256').update(hash).digest('hex'),
   ]);
-  return db;
+  let tail=Promise.resolve();
+  const adapter={query:(sql,args)=>db.query(sql,args),exec:sql=>db.exec(sql),close:()=>db.close(),async connect(){const before=tail;let unlock;tail=new Promise(resolve=>{unlock=resolve;});await before;return {query:(sql,args)=>db.query(sql,args),release:unlock};}};
+  await migrateBrokerMobileAuth(adapter);
+  return adapter;
 }
 
 test('broker mobile SQL enforces per-plot scope, privacy and current access',async t=>{
   const previous=process.env.MOBILE_PORTAL_SECRET;
   process.env.MOBILE_PORTAL_SECRET='synthetic-test-only-broker-secret-long-enough';
   const db=await fixture();const queries=[];
-  const service=createBrokerMobileService({query:(sql,args)=>{queries.push(sql);return db.query(sql,args);}},{financeCacheMs:5000});
+  const service=createBrokerMobileService({...db,query:(sql,args)=>{queries.push(sql);return db.query(sql,args);}},{financeCacheMs:5000,bcryptRounds:4});
   t.after(async()=>{await db.close();if(previous===undefined)delete process.env.MOBILE_PORTAL_SECRET;else process.env.MOBILE_PORTAL_SECRET=previous;});
   const login=await service.login(credentials);let session=await service.getSession(login.token);
   await t.test('login uses enrolled Bookings credentials and a separate scoped 30-day realm',async()=>{
     const claims=jwt.decode(login.token);
-    assert.equal(claims.realm,'mobile-broker');assert.equal(claims.exp-claims.iat,30*86400);
+    assert.equal(claims.realm,'mobile-broker-member');assert.equal(claims.exp-claims.iat,30*86400);
     assert.deepEqual(login.user,{id:'broker:1',name:'Partner A',role:'broker'});
     assert.equal(login.sessionDurationDays,30);assert.equal(Date.parse(login.expiresAt),claims.exp*1000);
     const sensitive=/9876500001|234567890123|password|aadhaar|aadhar|pan_no/i;
     assert.ok(!sensitive.test(JSON.stringify(claims)));assert.ok(!sensitive.test(JSON.stringify(login)));
     await assert.rejects(service.login({...credentials,password:'wrong'}),{statusCode:401});
-    await assert.rejects(service.login({...credentials,identifier:'staff@test.example'}),{statusCode:401});
+    await assert.rejects(service.login({...credentials,mobile:'9876500003'}),{statusCode:401});
     await assert.rejects(service.login({...credentials,role:'client'}),{statusCode:401});
     await assert.rejects(service.getSession(jwt.sign({id:1,role:'agent'},'staff-secret')),{statusCode:401});
-    assert.ok((await service.login({mobile:credentials.identifier,aadhaar:'2345 6789 0123'})).token);
-    const email=await service.login({identifier:'email@test.example',password:credentials.password});
-    assert.deepEqual((await service.portfolio(await service.getSession(email.token))).clients.flatMap(c=>c.plots.map(p=>p.id)),['12']);
-    await assert.rejects(service.login({identifier:'9876500004',password:credentials.password}),{statusCode:401});
+    assert.ok((await service.login({mobile:credentials.mobile,aadhaar:'2345 6789 0123'})).token);
   });
   await t.test('same customer may have different brokers; overrides, latest cancellations and current buyers win',async()=>{
     const portfolio=await service.portfolio(session);
@@ -142,8 +143,8 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
     await db.exec('UPDATE bookings SET booking_agent_id=101 WHERE id=1; UPDATE plots SET buyer_member_id=11 WHERE id=1');
     await assert.rejects(service.plot(session,'1'),{statusCode:404});
     await db.exec('UPDATE plots SET buyer_member_id=10 WHERE id=1; DELETE FROM user_sites WHERE user_id=1 AND site_id=2');
-    session=await service.getSession(login.token);await assert.rejects(service.plot(session,'7'),{statusCode:404});
-    await db.exec('INSERT INTO user_sites VALUES(1,2)');session=await service.getSession(login.token);
+    await assert.rejects(service.getSession(login.token),{statusCode:401});session=await service.getSession((await service.login(credentials)).token);await assert.rejects(service.plot(session,'7'),{statusCode:404});
+    await db.exec('INSERT INTO user_sites VALUES(1,2)');session=await service.getSession((await service.login(credentials)).token);
   });
   await t.test('password/version, disabled account, revoked verified link and broker role revoke tokens',async()=>{
     for(const [change,restore] of [
@@ -168,17 +169,10 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
     await db.exec('UPDATE booking_user_kyc_links SET member_id=101 WHERE user_id=1');
     assert.ok(await service.getSession(login.token));
   });
-  await t.test('duplicate phone or email never selects an arbitrary broker',async()=>{
-    await db.exec("UPDATE users SET phone='9876500001' WHERE id=2");
-    await assert.rejects(service.login(credentials),{statusCode:401});
-    await db.exec("UPDATE users SET phone='9876500002',email='a@test.example' WHERE id=2");
-    await assert.rejects(service.login({...credentials,identifier:'a@test.example'}),{statusCode:401});
-    await db.exec("UPDATE users SET email='b@test.example' WHERE id=2");
-  });
   await t.test('inactive clients and cross-site brokers are removed despite a warm financial cache',async()=>{
     await service.portfolio(session);
     await db.exec("UPDATE members SET status='BLOCKED' WHERE id=10; UPDATE members SET status='INACTIVE' WHERE id=201");
-    const fresh=await service.getSession(login.token);
+    const fresh=await service.getSession((await service.login(credentials)).token);
     const portfolio=await service.portfolio(fresh);
     assert.ok(!portfolio.clients.some(c=>c.id==='10'||c.id==='20'));
     for(const id of ['1','7'])await assert.rejects(service.plot(fresh,id),{statusCode:404});
@@ -188,7 +182,7 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
     const first=queries.length;await service.portfolio(session);
     assert.equal(queries.length-first,2,'warm finance cache leaves plot-scope and client-scope SQL only');
     const second=queries.length;await service.portfolio(session,{forceFresh:true});assert.equal(queries.length-second,4);
-    assert.ok(queries.every(q=>/^SELECT\b|^WITH\b/.test(q)));
+    assert.ok(!queries.some(q=>/^(?:UPDATE|DELETE FROM|INSERT INTO) (?:plots|members|bookings|plot_payments|plot_installments)\b/.test(q)));
   });
 });
 
@@ -201,7 +195,7 @@ test('broker router is opt-in, scoped and returns only safe service errors',asyn
   let touched=false;
   const service={async getSession(){touched=true;throw new Error('SQL password=secret');}};
   const off=createBrokerMobileRouter(service,{isEnabled:()=>false});
-  const status=await invoke(off,'GET','/status');assert.deepEqual(status.body,{service:'my-real-assets-broker',apiVersion:1,enabled:false,sessionDurationDays:30});
+  const status=await invoke(off,'GET','/status');assert.equal(status.body.service,'my-real-assets-broker');assert.equal(status.body.authVersion,2);assert.equal(status.body.enabled,false);assert.equal(status.body.passwordReset,'registered-email-otp');
   assert.equal((await invoke(off,'GET','/portfolio')).status,503);assert.equal(touched,false);
   const on=createBrokerMobileRouter(service,{isEnabled:()=>true});
   const anon=await invoke(on,'GET','/portfolio');assert.equal(anon.status,401);assert.match(anon.headers['Cache-Control'],/no-store/);

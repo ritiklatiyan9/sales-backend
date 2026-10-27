@@ -76,8 +76,9 @@
     "test:whatsapp": "node --test src/services/whatsapp.service.test.mjs src/services/whatsappMarketing.test.mjs",
     "test:security": "node --test src/security/security.test.mjs src/security/authSecurity.test.mjs src/services/realtimeAccess.test.mjs",
     "test:access-control": "node --test src/services/subAdminPermissions.test.mjs src/services/bookingWorkspaceAccess.test.mjs src/controllers/navigationSettings.controller.test.mjs src/controllers/headerAccess.controller.test.mjs",
+    "migrate:broker-mobile-auth": "node src/migrations/044_broker_mobile_auth.js",
     "migrate:broker-mobile": "node src/migrations/043_broker_mobile_indexes.js",
-    "test:broker-mobile": "node --test src/services/brokerMobile.service.test.mjs",
+    "test:broker-mobile": "node --test src/services/brokerMobile.service.test.mjs src/services/brokerMobileAuth.service.test.mjs src/services/brokerResetEmail.service.test.mjs",
     "test:mobile-portal": "node --test src/services/mobilePortal.service.test.mjs src/services/mobileInstallmentAllocation.service.test.mjs"
   },
   "dependencies": {

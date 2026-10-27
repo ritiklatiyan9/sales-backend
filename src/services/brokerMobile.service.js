@@ -1,33 +1,12 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import jwt from 'jsonwebtoken';
-import { STAFF_AUTH_SELECT, PHONE_LOOKUP_SQL, matchesStaffPassword, normalizeLoginIdentifier } from './staffIdentity.service.js';
-import { createMobileFinancialReader, projectMobilePlot, MOBILE_SESSION_DAYS, normalizeMobile } from './mobilePortal.service.js';
+import { createBrokerMobileAuthService } from './brokerMobileAuth.service.js';
+import { createMobileFinancialReader, projectMobilePlot } from './mobilePortal.service.js';
 
-const ISSUER = 'my-real-assets-broker-bookings';
-const AUDIENCE = 'my-real-assets-broker';
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
-const unauthorized = () => fail(401, 'Please sign in again.');
-const invalidLogin = () => fail(401, 'Broker sign-in details did not match.');
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
-const privateKey = purpose => {
-  const root = process.env.MOBILE_PORTAL_SECRET || process.env.JWT_ACCESS_SECRET;
-  if (!root || root.length < 32) fail(503, 'Sign-in is temporarily unavailable.');
-  return createHmac('sha256', root).update(`bookings/my-real-assets-broker/v1/${purpose}`).digest();
-};
-const fingerprint = (user, anchorIdentity = '') => createHmac('sha256', privateKey('identity')).update(JSON.stringify([
-  user.id, user.password, user.token_version, user.phone, user.email,
-  user.booking_aadhaar_password_hash, user.booking_aadhaar_password_fingerprint,
-  user.booking_kyc_member_id, user.booking_kyc_case_id, anchorIdentity,
-])).digest('hex');
-const equalFingerprint = (a, b) => typeof a === 'string' && typeof b === 'string'
-  && /^[a-f0-9]{64}$/.test(a) && /^[a-f0-9]{64}$/.test(b)
-  && timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
-const safeUser = user => ({ id: `broker:${user.id}`, name: user.name || 'Partner', role: 'broker' });
 const active = alias => `(COALESCE(to_jsonb(${alias})->>'is_active','true') <> 'false'
   AND upper(trim(COALESCE(to_jsonb(${alias})->>'status','ACTIVE'))) NOT IN ('INACTIVE','BLOCKED','DISABLED','DEACTIVATED','DELETED','SUSPENDED'))`;
 const brokerRole = alias => `'BROKER'=ANY(COALESCE(${alias}.member_types,ARRAY[${alias}.member_type]))`;
 const clientRole = alias => `'CLIENT'=ANY(COALESCE(${alias}.member_types,ARRAY[${alias}.member_type]))`;
-const normalizedAadhaar = value => typeof value === 'string' ? value.replace(/[\s-]/g, '') : '';
 const indiaToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 
 // Staff-created records, name matches, team hierarchy, commission rows and a
@@ -35,8 +14,7 @@ const indiaToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolk
 // A member override has priority over the booking's user attribution. Even an
 // invalid/moved override fails closed rather than falling back to agent_user_id.
 const scopedPlotsSql = `WITH allowed_sites AS (
-    SELECT s.id FROM sites s JOIN user_sites us ON us.site_id=s.id AND us.user_id=$1
-    WHERE ($3::integer IS NULL OR s.organization_id=$3)
+    SELECT s.id FROM sites s WHERE s.id=ANY($3::integer[])
   )
   SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
     m.id AS client_id,
@@ -56,7 +34,7 @@ const scopedPlotsSql = `WITH allowed_sites AS (
     AND upper(trim(COALESCE(p.status,''))) NOT IN ('AVAILABLE','COMPANY')
     AND CASE WHEN b.booking_agent_id IS NOT NULL THEN EXISTS (
       SELECT 1 FROM members bm WHERE bm.id=b.booking_agent_id AND bm.site_id=p.site_id AND bm.id=ANY($2::integer[])
-      AND ${brokerRole('bm')} AND ${active('bm')}) ELSE b.agent_user_id=$1 END`;
+      AND ${brokerRole('bm')} AND ${active('bm')}) ELSE b.agent_user_id=ANY($1::integer[]) END`;
 
 const clientColumns = `m.id,m.full_name,m.phone,m.email,m.address,m.city,m.state,m.pincode`;
 const safeClient = row => ({
@@ -79,52 +57,8 @@ export function createBrokerMobileService(db, options = {}) {
   // Financial calculations, posting policy, batch queries and bounded caching
   // are shared with the client app; this instance has its own cache boundary.
   const financialsFor = createMobileFinancialReader(db, options);
-  function assertBroker(user) {
-    if (!user || user.role !== 'agent' || user.is_active !== true || user.can_login_booking === false
-      || (user.agent_status != null && user.agent_status !== 'ACTIVE')) unauthorized();
-  }
-  async function brokerIdentityFor(user) {
-    if (user.booking_kyc_member_id == null) return { ids: [], anchorIdentity: '' };
-    // An enrolled link must remain a verified, active broker at its actual site.
-    const anchor = (await db.query(`SELECT m.id,m.site_id,m.phone,m.aadhar_no
-      FROM members m JOIN kyc_cases k ON k.id=$2 AND k.client_member_id=m.id AND k.site_id=m.site_id AND k.status='VERIFIED'
-      JOIN sites s ON s.id=m.site_id
-      WHERE m.id=$1 AND ${active('m')} AND ${brokerRole('m')}
-      AND ($3::integer IS NULL OR s.organization_id=$3)`,
-    [user.booking_kyc_member_id, user.booking_kyc_case_id, user.organization_id ?? null])).rows[0];
-    if (!anchor) unauthorized();
-    const mobile = normalizeMobile(anchor.phone);
-    const aadhaar = normalizedAadhaar(anchor.aadhar_no);
-    const anchorIdentity = `${mobile}:${aadhaar}`;
-    // Cross-site registrations require the full exact person identity. Shared
-    // phone numbers, names and canonical BRK codes are not access authorities.
-    if (!mobile || !/^[2-9]\d{11}$/.test(aadhaar)) return { ids: [anchor.id], anchorIdentity };
-    const { rows } = await db.query(`SELECT m.id,m.phone,m.aadhar_no FROM members m
-      JOIN sites s ON s.id=m.site_id JOIN user_sites us ON us.site_id=s.id AND us.user_id=$1
-      WHERE ${brokerRole('m')} AND ${active('m')} AND ($3::integer IS NULL OR s.organization_id=$3)
-      AND right(regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g'),10)=$2 ORDER BY m.id LIMIT 1001`,
-    [user.id, mobile, user.organization_id ?? null]);
-    if (rows.length > 1000) unauthorized();
-    return { ids: rows.filter(row => normalizeMobile(row.phone) === mobile && normalizedAadhaar(row.aadhar_no) === aadhaar).map(row => row.id), anchorIdentity };
-  }
-  async function makeSession(user, method = 'email') {
-    assertBroker(user);
-    if (method === 'phone' && user.booking_linked_broker !== true) unauthorized();
-    const identity = await brokerIdentityFor(user);
-    return { sourceUser: user, brokerMemberIds: identity.ids, user: safeUser(user), identity: fingerprint(user, identity.anchorIdentity) };
-  }
-  async function getSession(token) {
-    let claims;
-    try { claims = jwt.verify(token, privateKey('access'), { algorithms: ['HS256'], issuer: ISSUER, audience: AUDIENCE }); }
-    catch { unauthorized(); }
-    if (claims.realm !== 'mobile-broker' || !/^mra-broker:[1-9]\d*$/.test(claims.sub || '') || !['phone','email'].includes(claims.method)) unauthorized();
-    const user = (await db.query(`${STAFF_AUTH_SELECT} WHERE u.id=$1`, [Number(claims.sub.split(':')[1])])).rows[0];
-    assertBroker(user);
-    const session = await makeSession(user, claims.method);
-    if (!equalFingerprint(claims.identity, session.identity)) unauthorized();
-    return session;
-  }
-  const parameters = session => [session.sourceUser.id, session.brokerMemberIds, session.sourceUser.organization_id ?? null];
+  const auth = createBrokerMobileAuthService(db, options);
+  const parameters = session => [session.userIds, session.brokerMemberIds, session.siteIds];
   async function scopedPlots(session, id) {
     const args = parameters(session);
     if (id !== undefined) {
@@ -137,26 +71,7 @@ export function createBrokerMobileService(db, options = {}) {
     return rows;
   }
   return {
-    getSession,
-    async login(body) {
-      if (!body || typeof body !== 'object' || Array.isArray(body) || (body.role !== undefined && body.role !== 'broker')) invalidLogin();
-      const identifier = body.identifier ?? body.mobile;
-      const password = body.password ?? body.aadhaar;
-      const parsed = normalizeLoginIdentifier(identifier);
-      if (!parsed || typeof password !== 'string' || !password || password.length > 256) invalidLogin();
-      const query = parsed.type === 'phone'
-        ? `${STAFF_AUTH_SELECT} WHERE ${PHONE_LOOKUP_SQL.replace(/\bphone\b/g,'u.phone')}=$1 LIMIT 2`
-        : `${STAFF_AUTH_SELECT} WHERE lower(btrim(u.email))=$1 LIMIT 2`;
-      const candidates = (await db.query(query, [parsed.value])).rows;
-      if (candidates.length !== 1) invalidLogin();
-      const user = candidates[0];
-      if (user.role !== 'agent' || !await matchesStaffPassword(user, password, { phoneLogin: parsed.type === 'phone' })) invalidLogin();
-      const session = await makeSession(user, parsed.type);
-      const token = jwt.sign({ realm: 'mobile-broker', identity: session.identity, method: parsed.type }, privateKey('access'), {
-        algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-broker:${user.id}`, expiresIn: `${MOBILE_SESSION_DAYS}d`,
-      });
-      return { token, user: session.user, expiresAt: new Date(jwt.decode(token).exp*1000).toISOString(), sessionDurationDays: MOBILE_SESSION_DAYS };
-    },
+    ...auth,
     async portfolio(session, { forceFresh = false } = {}) {
       const plots = await scopedPlots(session);
       const args = parameters(session);
@@ -164,11 +79,10 @@ export function createBrokerMobileService(db, options = {}) {
       // Referral precedence is explicit member first, then user only when the
       // member referral is absent. Referrals expose contact, never other plots.
       const { rows } = await db.query(`SELECT ${clientColumns} FROM members m JOIN sites s ON s.id=m.site_id
-        JOIN user_sites us ON us.site_id=s.id AND us.user_id=$1
-        WHERE ($3::integer IS NULL OR s.organization_id=$3) AND ${clientRole('m')} AND ${active('m')}
+        WHERE s.id=ANY($3::integer[]) AND ${clientRole('m')} AND ${active('m')}
         AND (m.id=ANY($4::integer[]) OR CASE WHEN m.referred_by_member_id IS NOT NULL THEN EXISTS (
           SELECT 1 FROM members bm WHERE bm.id=m.referred_by_member_id AND bm.site_id=m.site_id AND bm.id=ANY($2::integer[])
-          AND ${brokerRole('bm')} AND ${active('bm')}) ELSE m.referred_by_user_id=$1 END)
+          AND ${brokerRole('bm')} AND ${active('bm')}) ELSE m.referred_by_user_id=ANY($1::integer[]) END)
         ORDER BY lower(m.full_name),m.id LIMIT 1001`, args);
       if (rows.length > 1000) fail(503, 'Your portfolio is temporarily unavailable.');
       const clients = rows.map(safeClient);
