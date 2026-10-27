@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "src/server.js",
-  "description": "Booking & KYC module API — co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
+  "description": "Booking & KYC module API \u2014 co-exists with RGAccount accounting system (shared Postgres/Redis/JWT/S3)",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
@@ -78,8 +78,9 @@
     "test:access-control": "node --test src/services/subAdminPermissions.test.mjs src/services/bookingWorkspaceAccess.test.mjs src/controllers/navigationSettings.controller.test.mjs src/controllers/headerAccess.controller.test.mjs",
     "migrate:broker-mobile-auth": "node src/migrations/044_broker_mobile_auth.js",
     "migrate:broker-mobile": "node src/migrations/043_broker_mobile_indexes.js",
-    "test:broker-mobile": "node --test src/services/brokerMobile.service.test.mjs src/services/brokerMobileAuth.service.test.mjs src/services/brokerResetEmail.service.test.mjs",
-    "test:mobile-portal": "node --test src/services/mobilePortal.service.test.mjs src/services/mobileInstallmentAllocation.service.test.mjs"
+    "test:broker-mobile": "node --test src/services/brokerMobile.service.test.mjs src/services/brokerMobileAuth.service.test.mjs src/services/brokerPresentation.service.test.mjs src/services/brokerResetEmail.service.test.mjs",
+    "test:mobile-portal": "node --test src/services/mobilePortal.service.test.mjs src/services/mobileInstallmentAllocation.service.test.mjs",
+    "test:broker-gateway": "node --test src/brokerGateway.server.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.700.0",

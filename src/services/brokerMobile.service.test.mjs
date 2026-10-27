@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { migrateBrokerMobileAuth } from '../migrations/044_broker_mobile_auth.js';
 import { PGlite } from '@electric-sql/pglite';
 import { createBrokerMobileService } from './brokerMobile.service.js';
+import { createBrokerPresentation } from './brokerPresentation.service.js';
 import { createBrokerMobileRouter, createBrokerMobileLoginLimiter } from '../routes/brokerMobile.routes.js';
 import { postingPolicySql } from '../test/mobilePostingPolicy.fixture.mjs';
 
@@ -13,6 +14,8 @@ const credentials={mobile:'9876500001',password:'234567890123'};
 async function fixture() {
   const db=new PGlite();
   await db.exec(`
+    CREATE TABLE organizations(id integer PRIMARY KEY,name text);
+    INSERT INTO organizations VALUES(1,'Private Organization Brand'),(2,'Other Organization Brand');
     CREATE TABLE sites(id integer PRIMARY KEY,name text,organization_id integer);
     CREATE TABLE users(id integer PRIMARY KEY,name text,email text,phone text,password text,role text,is_active boolean DEFAULT true,can_login_booking boolean DEFAULT true,organization_id integer,token_version integer DEFAULT 0,agent_status text DEFAULT 'ACTIVE');
     CREATE TABLE user_sites(user_id integer,site_id integer);
@@ -97,6 +100,8 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
   const service=createBrokerMobileService({...db,query:(sql,args)=>{queries.push(sql);return db.query(sql,args);}},{financeCacheMs:5000,bcryptRounds:4});
   t.after(async()=>{await db.close();if(previous===undefined)delete process.env.MOBILE_PORTAL_SECRET;else process.env.MOBILE_PORTAL_SECRET=previous;});
   const login=await service.login(credentials);let session=await service.getSession(login.token);
+  const pid=id=>createBrokerPresentation(session).propertyId(id);
+  const cid=id=>createBrokerPresentation(session).clientId(id);
   await t.test('login uses enrolled Bookings credentials and a separate scoped 30-day realm',async()=>{
     const claims=jwt.decode(login.token);
     assert.equal(claims.realm,'mobile-broker-member');assert.equal(claims.exp-claims.iat,30*86400);
@@ -112,21 +117,21 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
   });
   await t.test('same customer may have different brokers; overrides, latest cancellations and current buyers win',async()=>{
     const portfolio=await service.portfolio(session);
-    assert.deepEqual(portfolio.clients.flatMap(c=>c.plots.map(p=>p.id)).sort(),['1','13','7']);
-    assert.deepEqual(portfolio.clients.map(c=>c.id).sort(),['10','11','13','20']);
-    assert.equal(portfolio.clients.find(c=>c.id==='11').plots.length,0);
+    assert.deepEqual(portfolio.clients.flatMap(c=>c.plots.map(p=>p.id)).sort(),['1','13','7'].map(pid).sort());
+    assert.deepEqual(portfolio.clients.map(c=>c.id).sort(),['10','11','13','20'].map(cid).sort());
+    assert.equal(portfolio.clients.find(c=>c.id===cid('11')).plots.length,0);
     assert.equal(portfolio.summary.clientCount,4);assert.equal(portfolio.summary.plotCount,3);
-    for(const id of ['2','3','4','5','6','8','9','10','11','12','14','999','2147483648','1 OR 1=1'])await assert.rejects(service.plot(session,id),{statusCode:404});
+    for(const id of ['2','3','4','5','6','8','9','10','11','12','14','999','2147483648','1 OR 1=1'])await assert.rejects(service.plot(session,pid(id)),{statusCode:404});
   });
   await t.test('cash and direct receipts, approved refunds and the same posting math are preserved',async()=>{
-    const {plot}=await service.plot(session,'1');
+    const {plot}=await service.plot(session,pid('1'));
     assert.equal(plot.paidAmount,225);assert.equal(plot.balanceAmount,775);
     assert.deepEqual(plot.installments.map(i=>i.paidAmount),[175,50]);
     assert.equal(plot.payments.length,4);assert.ok(plot.payments.some(p=>p.mode==='CASH'));
     assert.ok(plot.payments.some(p=>p.status==='refund'));assert.ok(!plot.payments.some(p=>p.reference==='UNCLEARED'||p.reference==='WRONG-SITE'));
   });
   await t.test('whitelisted DTOs exclude identity, bank, document and company data; histories are lazy',async()=>{
-    const portfolio=await service.portfolio(session);const {plot}=await service.plot(session,'1');
+    const portfolio=await service.portfolio(session);const {plot}=await service.plot(session,pid('1'));
     for(const value of [portfolio,plot]){
       const json=JSON.stringify(value);
       assert.ok(!/aadhaar|aadhar|pan_no|passport|account_no|document|BANK-PRIVATE|PASSPORT-PRIVATE|567890123456|5678 9012 3456|ABCDE1234F|Private Company Branding|Other Site Name/i.test(json));
@@ -134,17 +139,59 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
     assert.ok(portfolio.clients.every(c=>c.plots.every(p=>!Object.hasOwn(p,'payments'))));
     assert.deepEqual(Object.keys(portfolio.clients[0]).sort(),['id','name','phone','email','address','city','state','pincode','plots'].sort());
     assert.equal(plot.projectName,'Your Property');
-    assert.ok(plot.payments.some(p=>p.reference.includes('[private ID]')));
+    assert.ok(plot.payments.every(p=>/^Receipt RX-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$/.test(p.reference)));
+  });
+  await t.test('opaque references work on cold readers, reject numeric ids and stay broker-specific',async()=>{
+    const cold=createBrokerMobileService(db,{bcryptRounds:4});
+    assert.equal((await cold.plot(session,pid('1'))).plot.id,pid('1'));
+    for(const id of ['1','117','1 OR 1=1','pr_invalid'])await assert.rejects(cold.plot(session,id),{statusCode:404});
+    const other=await service.getSession((await service.login({mobile:'9876500002',password:'345678901234'})).token);
+    const otherId=createBrokerPresentation(other).propertyId('2');
+    assert.equal((await cold.plot(other,otherId)).plot.number,'A2');
+    await assert.rejects(cold.plot(other,pid('1')),{statusCode:404});
+    await assert.rejects(cold.plot(session,otherId),{statusCode:404});
+  });
+  await t.test('matching plot numbers in different sites retain distinct private collections and property references',async()=>{
+    await db.exec("UPDATE plots SET plot_no='A1' WHERE id=7");
+    const portfolio=await service.portfolio(session);
+    const plots=portfolio.clients.flatMap(client=>client.plots).filter(plot=>plot.number==='A1');
+    assert.equal(plots.length,2);
+    assert.equal(new Set(plots.map(plot=>plot.propertyRef)).size,2);
+    assert.equal(new Set(plots.map(plot=>plot.collectionId)).size,2);
+    assert.equal(new Set(plots.map(plot=>plot.collectionLabel)).size,2);
+    assert.equal(portfolio.collections.length,2);
+    assert.equal(portfolio.collections.reduce((sum,collection)=>sum+collection.plotCount,0),portfolio.summary.plotCount);
+    for(const plot of plots){
+      assert.match(plot.collectionId,/^col_[a-f0-9]{32}$/);
+      assert.match(plot.propertyRef,/^RA-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$/);
+      assert.ok(!Object.hasOwn(plot,'siteId'));assert.ok(!Object.hasOwn(plot,'projectId'));
+    }
+    await db.exec("UPDATE plots SET plot_no='B1' WHERE id=7");
+  });
+  await t.test('authoritative site and organization brands are redacted from contacts and signed-in broker names',async()=>{
+    await db.exec(`UPDATE members SET full_name='Partner A | PrivateCompanyBranding' WHERE id=101;
+      UPDATE members SET address='Private Organization Brand, 42 Example Street',email='contact@privatecompanybranding.example' WHERE id=10`);
+    const refreshed=await service.getSession(login.token);
+    assert.equal(refreshed.user.name,'Partner A');
+    const portfolio=await service.portfolio(refreshed);
+    assert.equal(portfolio.presentationVersion,3,'the profile confidentiality contract is explicit in each portfolio response');
+    assert.deepEqual(portfolio.broker,{id:login.user.id,name:'Partner A',role:'broker'},'portfolio refreshes the sanitized broker profile without replacing session identity');
+    const client=portfolio.clients.find(row=>row.id===cid('10'));
+    assert.equal(client.address,'[Private], 42 Example Street');
+    assert.equal(client.email,'');
+    assert.ok(!/Private.?Company.?Branding|Private.?Organization.?Brand/i.test(JSON.stringify(portfolio)));
+    await db.exec(`UPDATE members SET full_name='Partner A' WHERE id=101;
+      UPDATE members SET address='42 Example Street',email='client@test.example' WHERE id=10`);
   });
   await t.test('scope changes take effect immediately while financial cache is warm',async()=>{
     await service.portfolio(session);
     await db.exec('UPDATE bookings SET booking_agent_id=102 WHERE id=1');
-    await assert.rejects(service.plot(session,'1'),{statusCode:404});
-    assert.ok(!(await service.portfolio(session)).clients.flatMap(c=>c.plots).some(p=>p.id==='1'));
+    await assert.rejects(service.plot(session,pid('1')),{statusCode:404});
+    assert.ok(!(await service.portfolio(session)).clients.flatMap(c=>c.plots).some(p=>p.id===pid('1')));
     await db.exec('UPDATE bookings SET booking_agent_id=101 WHERE id=1; UPDATE plots SET buyer_member_id=11 WHERE id=1');
-    await assert.rejects(service.plot(session,'1'),{statusCode:404});
+    await assert.rejects(service.plot(session,pid('1')),{statusCode:404});
     await db.exec('UPDATE plots SET buyer_member_id=10 WHERE id=1; DELETE FROM user_sites WHERE user_id=1 AND site_id=2');
-    await assert.rejects(service.getSession(login.token),{statusCode:401});session=await service.getSession((await service.login(credentials)).token);await assert.rejects(service.plot(session,'7'),{statusCode:404});
+    await assert.rejects(service.getSession(login.token),{statusCode:401});session=await service.getSession((await service.login(credentials)).token);await assert.rejects(service.plot(session,pid('7')),{statusCode:404});
     await db.exec('INSERT INTO user_sites VALUES(1,2)');session=await service.getSession((await service.login(credentials)).token);
   });
   await t.test('password/version, disabled account, revoked verified link and broker role revoke tokens',async()=>{
@@ -175,8 +222,8 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
     await db.exec("UPDATE members SET status='BLOCKED' WHERE id=10; UPDATE members SET status='INACTIVE' WHERE id=201");
     const fresh=await service.getSession((await service.login(credentials)).token);
     const portfolio=await service.portfolio(fresh);
-    assert.ok(!portfolio.clients.some(c=>c.id==='10'||c.id==='20'));
-    for(const id of ['1','7'])await assert.rejects(service.plot(fresh,id),{statusCode:404});
+    assert.ok(!portfolio.clients.some(c=>c.id===cid('10')||c.id===cid('20')));
+    for(const id of ['1','7'])await assert.rejects(service.plot(fresh,pid(id)),{statusCode:404});
     await db.exec("UPDATE members SET status='ACTIVE' WHERE id IN (10,201)");
   });
   await t.test('financial reads batch, cache and refresh without per-client queries',async()=>{
@@ -248,35 +295,37 @@ test('commission-linked Accounts plots include approved related owners without l
   `);
   const service=createBrokerMobileService(db,{financeCacheMs:5000,bcryptRounds:4});
   const session=await service.getSession((await service.login(credentials)).token);
+  const pid=id=>createBrokerPresentation(session).propertyId(id);
+  const cid=id=>createBrokerPresentation(session).clientId(id);
   const permitted=['21','22','23','24','25','36','37','40'];
   await t.test('explicit commission membership grants Accounts-only and other-primary plots once each',async()=>{
     const portfolio=await service.portfolio(session);
     const ids=portfolio.clients.flatMap(client=>client.plots.map(plot=>plot.id));
-    for(const id of permitted)assert.equal(ids.filter(value=>value===id).length,1,`commission-linked plot ${id}`);
+    for(const id of permitted)assert.equal(ids.filter(value=>value===pid(id)).length,1,`commission-linked plot ${id}`);
     for(const id of ['26','27','28','29','30','31','32','33','34','35','38','39','41','42','43']){
-      assert.ok(!ids.includes(id));await assert.rejects(service.plot(session,id),{statusCode:404});
+      assert.ok(!ids.includes(pid(id)));await assert.rejects(service.plot(session,pid(id)),{statusCode:404});
     }
-    assert.equal(portfolio.clients.find(client=>client.id==='40').name,'Accounts Only Buyer','explicit buyer ID beats the recorded label');
-    assert.equal(portfolio.clients.find(client=>client.id==='46').phone,'9876590046','unique current ledger name resolves its same-site contact');
-    assert.equal(portfolio.clients.find(client=>client.id==='44').phone,'9876590044','a current explicit buyer can have another member role');
+    assert.equal(portfolio.clients.find(client=>client.id===cid('40')).name,'Accounts Only Buyer','explicit buyer ID beats the recorded label');
+    assert.equal(portfolio.clients.find(client=>client.id===cid('46')).phone,'9876590046','unique current ledger name resolves its same-site contact');
+    assert.equal(portfolio.clients.find(client=>client.id===cid('44')).phone,'9876590044','a current explicit buyer can have another member role');
     assert.ok(!JSON.stringify(portfolio).match(/912345678901|ZZZZZ1234Z|PRIVATE-ACCOUNTS-BANK/));
     const disabled=createBrokerMobileService(db,{includeCommissionPlots:false,bcryptRounds:4});
     const without=await disabled.portfolio(session);
-    assert.ok(without.clients.flatMap(client=>client.plots).every(plot=>!permitted.includes(plot.id)));
+    assert.ok(without.clients.flatMap(client=>client.plots).every(plot=>!permitted.map(pid).includes(plot.id)));
   });
   await t.test('ambiguous, cross-site and inactive buyer identities keep only recorded names and blank contacts',async()=>{
     const portfolio=await service.portfolio(session);
     for(const [id,name]of[['23','Duplicate Ledger Buyer'],['24','Fallback Name Contact'],['36','Inactive Ledger Buyer']]){
-      const client=portfolio.clients.find(row=>row.id===`plot-owner:${id}`);
+      const client=portfolio.clients.find(row=>row.id===cid(`plot-owner:${id}`));
       assert.ok(client,`safe recorded owner for plot ${id}`);assert.equal(client.name,name);
       for(const key of['phone','email','address','city','state','pincode'])assert.equal(client[key],'');
-      assert.deepEqual(client.plots.map(plot=>plot.id),[id]);
+      assert.deepEqual(client.plots.map(plot=>plot.id),[pid(id)]);
     }
-    assert.ok(!portfolio.clients.some(client=>['41','42','43','45','47'].includes(client.id)));
+    assert.ok(!portfolio.clients.some(client=>['41','42','43','45','47'].map(cid).includes(client.id)));
     assert.ok(!/PRIVATE-DUPLICATE-ADDRESS|PRIVATE-CROSSSITE-ADDRESS|PRIVATE-FALLBACK-ADDRESS|PRIVATE-INACTIVE-ADDRESS/.test(JSON.stringify(portfolio)));
   });
   await t.test('commission access shares cash, bank, refunds, installment allocation and lazy financial histories',async()=>{
-    const{plot}=await service.plot(session,'21');
+    const{plot}=await service.plot(session,pid('21'));
     assert.equal(plot.number,'LEGACY-1');assert.equal(plot.area,150);
     assert.equal(plot.totalAmount,1000);assert.equal(plot.paidAmount,450);assert.equal(plot.balanceAmount,550);
     assert.deepEqual(plot.installments.map(row=>row.paidAmount),[200,250]);
@@ -285,16 +334,16 @@ test('commission-linked Accounts plots include approved related owners without l
     assert.ok((await service.portfolio(session)).clients.every(client=>client.plots.every(row=>!Object.hasOwn(row,'payments'))));
   });
   await t.test('changing or removing commission entitlement revokes access even with warm financial caches',async()=>{
-    await service.plot(session,'21');await service.portfolio(session);
+    await service.plot(session,pid('21'));await service.portfolio(session);
     await db.exec('UPDATE plot_commissions_v2 SET agent_id=102 WHERE plot_id=21');
-    await assert.rejects(service.plot(session,'21'),{statusCode:404});
-    assert.ok(!(await service.portfolio(session)).clients.flatMap(client=>client.plots).some(plot=>plot.id==='21'));
+    await assert.rejects(service.plot(session,pid('21')),{statusCode:404});
+    assert.ok(!(await service.portfolio(session)).clients.flatMap(client=>client.plots).some(plot=>plot.id===pid('21')));
     await db.exec('UPDATE plot_commissions_v2 SET agent_id=101 WHERE id=501');
-    assert.equal((await service.plot(session,'21')).plot.id,'21');
+    assert.equal((await service.plot(session,pid('21'))).plot.id,pid('21'));
     await db.exec('DELETE FROM plot_commissions_v2 WHERE id=501');
-    await assert.rejects(service.plot(session,'21'),{statusCode:404});
+    await assert.rejects(service.plot(session,pid('21')),{statusCode:404});
     await db.exec("UPDATE plot_commissions_v2 SET agent_id=101,status='Cancelled' WHERE id=520");
-    await assert.rejects(service.plot(session,'21'),{statusCode:404});
+    await assert.rejects(service.plot(session,pid('21')),{statusCode:404});
   });
 });
 

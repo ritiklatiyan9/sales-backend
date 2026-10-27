@@ -1,5 +1,6 @@
 import { createBrokerMobileAuthService } from './brokerMobileAuth.service.js';
 import { createMobileFinancialReader, projectMobilePlot } from './mobilePortal.service.js';
+import { createBrokerPresentation, isBrokerPropertyId } from './brokerPresentation.service.js';
 
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
@@ -14,10 +15,10 @@ const indiaToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolk
 // A member override has priority over the booking's user attribution. Even an
 // invalid/moved override fails closed rather than falling back to agent_user_id.
 const scopedPlotsSql = `WITH allowed_sites AS (
-    SELECT s.id FROM sites s WHERE s.id=ANY($3::integer[])
+    SELECT s.id,s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name FROM sites s WHERE s.id=ANY($3::integer[])
   )
   SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
-    m.id AS client_id,
+    a.private_site_name,a.private_org_name,m.id AS client_id,
     COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
     to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
     COALESCE(to_jsonb(p)->>'unit_type','plot') AS unit_type,
@@ -40,6 +41,7 @@ const scopedPlotsSql = `WITH allowed_sites AS (
 // The approved mobile entitlement includes those plots even when another broker
 // is the primary Booking By person. Names never grant plot access here.
 const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
+    s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name,
     owner.id AS client_id,COALESCE(to_jsonb(p)->>'buyer_name','') AS ledger_buyer_name,
     COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
     to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
@@ -47,7 +49,7 @@ const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_p
     COALESCE((to_jsonb(p)->>'interest_enabled')::boolean,false) AS interest_enabled,
     COALESCE((to_jsonb(p)->>'interest_rate')::numeric,0) AS interest_rate,
     COALESCE(to_jsonb(p)->>'interest_type','per_month') AS interest_type
-  FROM plots p
+  FROM plots p JOIN sites s ON s.id=p.site_id
   LEFT JOIN LATERAL (
     SELECT m.id FROM members m WHERE m.site_id=p.site_id AND ${active('m')}
       AND CASE WHEN p.buyer_member_id IS NOT NULL THEN m.id=p.buyer_member_id ELSE
@@ -64,7 +66,8 @@ const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_p
       AND ${brokerRole('bm')} AND ${active('bm')}
       AND lower(trim(COALESCE(pc.status,''))) IN ('pending','partial','completed'))`;
 
-const clientColumns = `m.id,m.full_name,m.phone,m.email,m.address,m.city,m.state,m.pincode`;
+const clientColumns = `m.id,m.full_name,m.phone,m.email,m.address,m.city,m.state,m.pincode,
+  s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name`;
 const safeClient = row => ({
   id: String(row.id), name: row.full_name || 'Client', phone: row.phone || '', email: row.email || '',
   address: row.address || '', city: row.city || '', state: row.state || '', pincode: row.pincode || '', plots: [],
@@ -74,11 +77,7 @@ const safeClient = row => ({
 const redactIdentityText = value => String(value || '')
   .replace(/\b[A-Z]{5}[0-9]{4}[A-Z]\b/gi, '[private ID]')
   .replace(/(?<![0-9])(?:[0-9][ -]?){11}[0-9](?![0-9])/g, '[private ID]');
-const safePlot = plot => ({
-  ...plot,
-  installments: plot.installments.map(item => ({ ...item, title: redactIdentityText(item.title) })),
-  payments: plot.payments.map(item => ({ ...item, reference: redactIdentityText(item.reference), mode: redactIdentityText(item.mode) })),
-});
+
 
 export function createBrokerMobileService(db, options = {}) {
   const { now = Date.now, includeCommissionPlots = true } = options;
@@ -86,6 +85,18 @@ export function createBrokerMobileService(db, options = {}) {
   // are shared with the client app; this instance has its own cache boundary.
   const financialsFor = createMobileFinancialReader(db, options);
   const auth = createBrokerMobileAuthService(db, options);
+  const propertyLookups = new Map();
+  const rememberProperties = (session, plots) => {
+    const presentation = createBrokerPresentation(session);
+    for (const [key, entry] of propertyLookups) if (entry.until <= now()) propertyLookups.delete(key);
+    for (const plot of plots) {
+      const key = `${session.account.id}:${presentation.propertyId(plot.id)}`;
+      propertyLookups.delete(key);
+      while (propertyLookups.size >= 4096) propertyLookups.delete(propertyLookups.keys().next().value);
+      propertyLookups.set(key, { rawId: plot.id, until: now() + 5 * 60 * 1000 });
+    }
+  };
+  const privateBrands = rows => rows.flatMap(row => [row.private_site_name, row.private_org_name]);
   const parameters = session => [session.userIds, session.brokerMemberIds, session.siteIds];
   async function scopedPlots(session, id) {
     const args = parameters(session);
@@ -113,7 +124,7 @@ export function createBrokerMobileService(db, options = {}) {
   }
   return {
     ...auth,
-    features: { commissionLinkedPlots: includeCommissionPlots },
+    features: { commissionLinkedPlots: includeCommissionPlots, confidentialPresentation: true },
     async portfolio(session, { forceFresh = false } = {}) {
       const plots = await scopedPlots(session);
       const args = parameters(session);
@@ -127,6 +138,8 @@ export function createBrokerMobileService(db, options = {}) {
           AND ${brokerRole('bm')} AND ${active('bm')}) ELSE m.referred_by_user_id=ANY($1::integer[]) END))
         ORDER BY lower(m.full_name),m.id LIMIT 1001`, args);
       if (rows.length > 1000) fail(503, 'Your portfolio is temporarily unavailable.');
+      const presentation = createBrokerPresentation(session, { brands: privateBrands([...plots, ...rows]) });
+      rememberProperties(session, plots);
       const clients = rows.map(safeClient);
       const byClient = new Map(clients.map(client => [client.id, client]));
       const financials = await financialsFor(plots.map(row => row.id), { forceFresh });
@@ -143,11 +156,18 @@ export function createBrokerMobileService(db, options = {}) {
           clients.push(client);byClient.set(client.id,client);
         }
         const data = financials.get(plot.id);
-        const { payments, ...detail } = safePlot(projectMobilePlot(plot, data.schedules, data.receipts, today));
+        const { payments, ...detail } = presentation.plot(projectMobilePlot(plot, data.schedules, data.receipts, today));
         client.plots.push(detail); projected.push(detail);
       }
       if(clients.length>1000)fail(503,'Your portfolio is temporarily unavailable.');
-      return { broker: session.user, clients, summary: {
+      const publicClients = clients.map(client => ({ ...presentation.client(client), plots: client.plots }));
+      const byCollection = new Map();
+      for (const client of publicClients) for (const plot of client.plots) {
+        const value = byCollection.get(plot.collectionId) || { id: plot.collectionId, label: plot.collectionLabel, plotCount: 0 };
+        value.plotCount++;
+        byCollection.set(plot.collectionId, value);
+      }
+      return { presentationVersion: 3, broker: session.user, clients: publicClients, collections: [...byCollection.values()].sort((a,b)=>a.label.localeCompare(b.label)), summary: {
         clientCount: clients.length, plotCount: projected.length,
         totalAmount: amount(projected.reduce((s,p) => s+p.totalAmount,0)), paidAmount: amount(projected.reduce((s,p) => s+p.paidAmount,0)),
         balanceAmount: amount(projected.reduce((s,p) => s+p.balanceAmount,0)), interestAmount: amount(projected.reduce((s,p) => s+p.interestAmount,0)),
@@ -157,9 +177,17 @@ export function createBrokerMobileService(db, options = {}) {
       }, updatedAt: [...financials.values()].map(row=>row.updatedAt).sort()[0] || new Date(now()).toISOString() };
     },
     async plot(session, id, { forceFresh = false } = {}) {
-      const [plot] = await scopedPlots(session, id);
+      if (!isBrokerPropertyId(id)) fail(404, 'Property unavailable.');
+      const lookupKey = `${session.account.id}:${id}`;
+      const entry = propertyLookups.get(lookupKey);
+      const candidates = await scopedPlots(session, entry?.until > now() ? entry.rawId : undefined);
+      const identities = createBrokerPresentation(session);
+      const plot = candidates.find(row => identities.propertyId(row.id) === id);
+      if (!plot) fail(404, 'Property unavailable.');
+      rememberProperties(session, candidates);
+      const presentation = createBrokerPresentation(session, { brands: privateBrands([plot]) });
       const data = (await financialsFor([plot.id], { forceFresh })).get(plot.id);
-      return { plot: safePlot(projectMobilePlot(plot, data.schedules, data.receipts, indiaToday())), updatedAt: data.updatedAt };
+      return { plot: presentation.plot(projectMobilePlot(plot, data.schedules, data.receipts, indiaToday())), updatedAt: data.updatedAt };
     },
   };
 }

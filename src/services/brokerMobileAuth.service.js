@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import { STAFF_AUTH_SELECT } from './staffIdentity.service.js';
 import { MOBILE_SESSION_DAYS, normalizeMobile } from './mobilePortal.service.js';
 import { mailerEnabled, sendBrokerPasswordResetEmail } from './mailer.service.js';
+import { createCompanyRedactor } from './brokerPresentation.service.js';
 
 const ISSUER='my-real-assets-broker-bookings';
 const AUDIENCE='my-real-assets-broker';
@@ -35,9 +36,10 @@ const codeHash=(tokenHash,code)=>createHmac('sha256',key('reset-code')).update(`
 const validPassword=value=>typeof value==='string'&&value.length>=8&&Buffer.byteLength(value,'utf8')<=72;
 const requirePassword=value=>{if(!validPassword(value))fail(400,'Use at least 8 characters and at most 72 UTF-8 bytes for your app password.');};
 const memberColumns=`m.id,m.site_id,m.full_name,m.phone,m.email,m.aadhar_no,s.organization_id,
+  s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name,
   ${activeSql('m')} AS broker_active,${brokerRole('m')} AS broker_role`;
 const resetMessage='If the registered details can receive a verification code, it will arrive shortly. Otherwise, contact your account administrator.';
-const emailHint=email=>{const [local,domain]=email.split('@');return `${local.slice(0,Math.min(2,local.length))}${'•'.repeat(Math.max(3,local.length-2))}@${domain}`;};
+const emailHint=email=>{const [local]=email.split('@');return `${local.slice(0,Math.min(2,local.length))}${'•'.repeat(Math.max(3,local.length-2))}@•••`;};
 
 export function createBrokerMobileAuthService(db,{
   now=Date.now,sendResetEmail=sendBrokerPasswordResetEmail,isResetMailerEnabled=mailerEnabled,
@@ -106,7 +108,9 @@ export function createBrokerMobileAuthService(db,{
     }
     const siteIds=[...new Set(sites)].sort((a,b)=>a-b);
     const scopeMembers=members.filter(m=>siteIds.includes(m.site_id));
-    const user={id:`broker:${account.id}`,name:members[0].full_name||'Partner',role:'broker'};
+    const redactor=createCompanyRedactor(members.flatMap(member=>[member.private_site_name,member.private_org_name]));
+    const name=redactor.text(members[0].full_name||'Partner').replace(/\[Private\]/g,'').trim().replace(/^[-–—|: ]+|[-–—|: ]+$/g,'').trim()||'Partner';
+    const user={id:`broker:${account.id}`,name,role:'broker'};
     const identity=createHmac('sha256',key('session-identity')).update(JSON.stringify([
       account.id,account.phone,account.identity_key,account.password_hash,account.password_changed,account.token_version,
       members.map(m=>[m.id,m.site_id,m.email||'']),siteIds,

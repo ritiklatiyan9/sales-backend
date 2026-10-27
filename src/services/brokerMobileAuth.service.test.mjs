@@ -31,6 +31,8 @@ function pgAdapter(raw) {
 async function fixture() {
   const raw = new PGlite();
   await raw.exec(`
+    CREATE TABLE organizations(id integer PRIMARY KEY,name text);
+    INSERT INTO organizations VALUES(1,'Private Organization Brand'),(2,'Other Organization Brand');
     CREATE TABLE sites(id integer PRIMARY KEY,name text,organization_id integer);
     CREATE TABLE members(id integer PRIMARY KEY,site_id integer,full_name text,phone text,email text,aadhar_no text,
       member_type text,member_types text[],status text DEFAULT 'ACTIVE',is_active boolean DEFAULT true);
@@ -225,6 +227,8 @@ test('independent broker credentials, recovery and revocation enforce exact live
     assert.ok(response.challengeId);
     assert.equal(response.expiresInSeconds, 300);
     assert.equal(response.resendAfterSeconds, 60);
+    assert.equal(response.emailHint, 'ow•••@•••');
+    assert.ok(!JSON.stringify(response).includes('example.test'));
     assert.ok(!JSON.stringify(response).includes('654321'));
     assert.equal(f.delivered.length, 1);
     assert.equal(f.delivered[0].to, 'owner@example.test');

@@ -42,7 +42,7 @@ export function createBrokerMobileRouter(service, {
     res.status(status).json({ message: status===503?'The service is temporarily unavailable. Please try again.':error.message });
   });
   router.use((_req,res,next)=>{res.set('Cache-Control','private, no-store');next();});
-  router.get('/status',(_req,res)=>res.json({service:'my-real-assets-broker',apiVersion:1,authVersion:2,portfolioVersion:2,commissionLinkedPlots:service.features?.commissionLinkedPlots??true,enabled:Boolean(isEnabled()),sessionDurationDays:MOBILE_SESSION_DAYS,passwordReset:'registered-email-otp',recoveryEmailEnabled:mailerEnabled()}));
+  router.get('/status',(_req,res)=>res.json({service:'my-real-assets-broker',apiVersion:1,authVersion:2,portfolioVersion:3,confidentialPresentation:true,commissionLinkedPlots:service.features?.commissionLinkedPlots??true,enabled:Boolean(isEnabled()),sessionDurationDays:MOBILE_SESSION_DAYS,passwordReset:'registered-email-otp',recoveryEmailEnabled:mailerEnabled()}));
   router.use((_req,res,next)=>{
     if(!isEnabled())return res.status(503).json({code:'MOBILE_PORTAL_DISABLED',message:'Partner access is temporarily unavailable.'});
     next();
