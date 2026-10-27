@@ -1,12 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
+import { createHmac } from 'node:crypto';
 import express from 'express';
 import { gunzipSync } from 'node:zlib';
 import { PGlite } from '@electric-sql/pglite';
 import { createMobilePortalService, normalizeMobile, projectMobilePlot } from './mobilePortal.service.js';
-import { createMobilePortalRouter, createMobileLoginLimiter } from '../routes/mobilePortal.routes.js';
+import { createMobilePortalRouter as createRouter, createMobileLoginLimiter, mobilePortalEnabled } from '../routes/mobilePortal.routes.js';
 import { postingPolicySql } from '../test/mobilePostingPolicy.fixture.mjs';
+
+// Synthetic test routers opt in explicitly; the default exported production router fails closed.
+const createMobilePortalRouter = (service, options = {}) => createRouter(service, { isEnabled: () => true, ...options });
 
 const credentials = { mobile: '9876500001', aadhaar: '234567890123', role: 'client' };
 const fixture = async () => {
@@ -80,6 +84,10 @@ test('mobile customer portal enforces identity and property boundaries with real
       assert.ok(!JSON.stringify(claims).includes(value));
     }
     await assert.rejects(service.getSession(jwt.sign({ id: 1, role: 'admin' }, 'some-staff-signing-key')), { statusCode: 401 });
+    const oldAccountsKey = createHmac('sha256', process.env.MOBILE_PORTAL_SECRET).update('my-real-assets/v1/access').digest();
+    const oldMobileToken = jwt.sign({ realm: 'mobile-client', identity: claims.identity }, oldAccountsKey,
+      { algorithm: 'HS256', issuer: 'my-real-assets', audience: 'my-real-assets-client', subject: claims.sub, expiresIn: '1h' });
+    await assert.rejects(service.getSession(oldMobileToken), { statusCode: 401 });
     await assert.rejects(service.login({ ...credentials, aadhaar: '999999999999' }), { statusCode: 401 });
     await assert.rejects(service.login({ ...credentials, role: 'broker' }), { statusCode: 401 });
   });
@@ -126,6 +134,21 @@ test('mobile customer portal enforces identity and property boundaries with real
     await db.query("UPDATE members SET aadhar_no='345678901234' WHERE id=1");
     await assert.rejects(service.getSession(login.token), { statusCode: 401 });
     await db.query('UPDATE members SET aadhar_no=$1 WHERE id=1', [credentials.aadhaar]);
+  });
+  await t.test('explicitly deactivated linked customer accounts revoke the whole matched identity', async () => {
+    await db.exec('INSERT INTO booking_client_accounts VALUES (10,false); INSERT INTO booking_client_members VALUES (10,2)');
+    await assert.rejects(service.login(credentials), { statusCode: 401 });
+    await assert.rejects(service.getSession(login.token), { statusCode: 401 });
+    await db.exec('UPDATE members SET is_active=false WHERE id=2');
+    await assert.rejects(service.login(credentials), { statusCode: 401 });
+    // A different Aadhaar sharing the same phone is not blocked by that account.
+    assert.ok((await service.login({ ...credentials, aadhaar: '345678901234' })).token);
+    await db.exec('UPDATE booking_client_accounts SET is_active=true WHERE id=10');
+    assert.ok((await service.login(credentials)).token);
+    await db.exec('UPDATE members SET is_active=false WHERE id=1');
+    await assert.rejects(service.login(credentials), { statusCode: 401 });
+    await assert.rejects(service.getSession(login.token), { statusCode: 401 });
+    await db.exec('UPDATE members SET is_active=true WHERE id IN (1,2)');
   });
   await t.test('all service operations are reads', () => assert.ok(queries.every(sql => /^SELECT\b/i.test(sql))));
 });
@@ -297,4 +320,36 @@ test('expanded responses negotiate gzip and preserve exact JSON, no-store and re
   const plain = await invoke('gzip;q=0, identity');
   assert.equal(plain.headers['Content-Encoding'], undefined);
   assert.deepEqual(plain.body, payload);
+});
+
+
+test('production mobile access requires its own opt-in; public status does not expose customer data', async () => {
+  assert.equal(mobilePortalEnabled({ NODE_ENV: 'production' }), false);
+  assert.equal(mobilePortalEnabled({ NODE_ENV: 'production', CLIENT_PORTAL_ENABLED: 'true' }), false);
+  assert.equal(mobilePortalEnabled({ NODE_ENV: 'production', MOBILE_PORTAL_ENABLED: 'true' }), true);
+  assert.equal(mobilePortalEnabled({ NODE_ENV: 'development' }), false);
+  assert.equal(mobilePortalEnabled({ MOBILE_PORTAL_ENABLED: 'true' }), true);
+  assert.equal(mobilePortalEnabled({ NODE_ENV: 'development', MOBILE_PORTAL_ENABLED: 'false' }), false);
+  let enabled = false;
+  let authCalls = 0;
+  const router = createMobilePortalRouter({ login: async () => { authCalls++; return {}; } }, { isEnabled: () => enabled });
+  const invoke = (method, url) => new Promise((resolve, reject) => {
+    const req = { method, url, headers: {}, get(name) { return this.headers[name.toLowerCase()]; } };
+    const res = { statusCode: 200, headers: {}, set(key, value) { this.headers[key] = value; return this; },
+      status(value) { this.statusCode = value; return this; },
+      json(body) { resolve({ status: this.statusCode, headers: this.headers, body }); } };
+    router.handle(req, res, error => reject(error || new Error('No route matched')));
+  });
+  assert.deepEqual((await invoke('GET', '/status')).body, { service: 'my-real-assets', apiVersion: 1, enabled: false });
+  assert.equal((await invoke('GET', '/plots')).status, 503);
+  assert.equal((await invoke('POST', '/auth/login')).status, 503);
+  assert.equal(authCalls, 0);
+  enabled = true;
+  const ready = await invoke('GET', '/status');
+  assert.equal(ready.status, 200);
+  assert.equal(ready.body.enabled, true);
+  assert.equal(ready.headers['Cache-Control'], 'private, no-store');
+  const health = await invoke('GET', '/health');
+  assert.deepEqual(health.body, { status: 'ok', service: 'my-real-assets', backend: 'bookings' });
+  assert.equal((await invoke('GET', '/plots')).status, 401);
 });

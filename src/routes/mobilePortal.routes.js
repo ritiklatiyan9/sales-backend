@@ -52,8 +52,7 @@ export function createMobileLoginLimiter({ now = Date.now, windowMs = 15 * 60 * 
 }
 
 export function mobilePortalEnabled(env = process.env) {
-  return env.MOBILE_PORTAL_ENABLED === 'true'
-    || (env.NODE_ENV !== 'production' && env.MOBILE_PORTAL_ENABLED !== 'false');
+  return env.MOBILE_PORTAL_ENABLED === 'true';
 }
 
 export function createMobilePortalRouter(service, {
@@ -66,6 +65,9 @@ export function createMobilePortalRouter(service, {
     res.status(status).json({ message: status === 503 ? 'The service is temporarily unavailable. Please try again.' : error.message });
   });
   router.use((_req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
+  router.get('/status', (_req, res) => res.json({
+    service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()),
+  }));
   // Mobile access is independent of the existing paused web client portal.
   // A production deployment opts in explicitly; disabled access never enters auth.
   router.use((_req, res, next) => {

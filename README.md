@@ -190,3 +190,10 @@ A successful frontend build does not mean the Booking API deployed successfully.
 5. Sign in again after secret rotation. Use `/clients` to preview a clearly marked fictional identity image before testing a real applicant. Preview reads a document without creating a client; do not press Save for a diagnostic record.
 
 Expected OCR setup, credential, credit and model errors now return safe messages and stable codes to the form, including on 503 responses. Unexpected server errors still stay generic and never return raw provider responses or keys. Production credential changes and redeployment are operator actions; local code/tests cannot certify the live environment before those steps complete.
+# My Real Assets mobile app
+
+This Bookings API also serves the Flutter client app under `/api/mobile`. Deploy
+the current revision and explicitly set `MOBILE_PORTAL_ENABLED=true`; this does not
+reopen the separate paused web client portal. Setup, readiness checks, identity
+rules and the preserved full Accounts payment policy are documented in
+[MY_REAL_ASSETS_API.md](MY_REAL_ASSETS_API.md).

@@ -41,13 +41,13 @@ const phoneSql = `CASE
   WHEN regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g') ~ '^0[6-9][0-9]{9}$' THEN right(regexp_replace(m.phone,'[^0-9]','','g'),10)
   WHEN regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g') ~ '^(0091|91)[6-9][0-9]{9}$' THEN right(regexp_replace(m.phone,'[^0-9]','','g'),10)
   ELSE '' END`;
-const memberSelect = `SELECT m.id,m.site_id,m.full_name,m.phone,m.aadhar_no
+const memberSelect = `SELECT m.id,m.site_id,m.full_name,m.phone,m.aadhar_no,
+  COALESCE(to_jsonb(m)->>'is_active','true') <> 'false' AS mobile_member_active,
+  EXISTS (SELECT 1 FROM booking_client_members bcm
+    JOIN booking_client_accounts bca ON bca.id=bcm.account_id
+    WHERE bcm.member_id=m.id AND bca.is_active=false) AS mobile_account_disabled
   FROM members m JOIN sites s ON s.id=m.site_id
-  WHERE 'CLIENT'=ANY(COALESCE(m.member_types,ARRAY[m.member_type]))
-    AND COALESCE(to_jsonb(m)->>'is_active','true') <> 'false'
-    AND NOT EXISTS (SELECT 1 FROM booking_client_members bcm
-      JOIN booking_client_accounts bca ON bca.id=bcm.account_id
-      WHERE bcm.member_id=m.id AND bca.is_active=false)`;
+  WHERE 'CLIENT'=ANY(COALESCE(m.member_types,ARRAY[m.member_type]))`;
 
 // Public customers require an explicit link. Staff-only name matching must
 // never turn a similarly named member into the owner of a property.
@@ -232,10 +232,15 @@ export function createMobilePortalService(db, {
   async function membersFor(mobile, digest) {
     const result = await db.query(`${memberSelect} AND right(regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g'),10)=$1 AND ${phoneSql}=$1 ORDER BY m.id LIMIT 1001`, [mobile]);
     if (result.rows.length > 1000) unauthorized();
-    return result.rows.filter(row => {
+    const matches = result.rows.filter(row => {
       const aadhaar = normalizeAadhaar(row.aadhar_no);
       return validAadhaar(aadhaar) && equalIdentity(identityKey(mobile, aadhaar), digest);
     });
+    // A disabled account linked to this exact identity cannot be bypassed by
+    // another registration at a different site. Shared-phone families remain
+    // separate because the HMAC identity comparison happens first.
+    if (matches.some(row => row.mobile_account_disabled)) unauthorized();
+    return matches.filter(row => row.mobile_member_active !== false);
   }
   async function getSession(token) {
     let claims;
@@ -245,7 +250,7 @@ export function createMobilePortalService(db, {
     if (claims.realm !== 'mobile-client' || !/^mra-client:[1-9]\d*$/.test(claims.sub || '')
       || !/^[a-f0-9]{64}$/.test(claims.identity || '')) unauthorized();
     const anchor = (await db.query(`${memberSelect} AND m.id=$1`, [Number(claims.sub.split(':')[1])])).rows[0];
-    if (!anchor) unauthorized();
+    if (!anchor || anchor.mobile_member_active === false || anchor.mobile_account_disabled) unauthorized();
     const mobile = normalizeMobile(anchor.phone);
     const aadhaar = normalizeAadhaar(anchor.aadhar_no);
     if (!mobile || !validAadhaar(aadhaar) || !equalIdentity(identityKey(mobile, aadhaar), claims.identity)) unauthorized();
