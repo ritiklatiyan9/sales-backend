@@ -37,6 +37,7 @@ export function verifyClientToken(token, type = 'access') {
 }
 
 const sourceSelect = `SELECT m.id AS member_id,m.site_id,m.full_name,m.phone,m.email,m.aadhar_no,m.pan_no,
+  COALESCE(to_jsonb(m)->>'is_active','true') <> 'false' AS member_active,
   k.id AS kyc_case_id,k.status AS kyc_status,s.name AS site_name,s.code AS site_code
   FROM members m JOIN sites s ON s.id=m.site_id
   JOIN LATERAL (SELECT id,status FROM kyc_cases k WHERE k.client_member_id=m.id AND k.site_id=m.site_id

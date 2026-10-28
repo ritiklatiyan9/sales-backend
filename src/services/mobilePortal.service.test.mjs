@@ -1,36 +1,42 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
 import { createHmac } from 'node:crypto';
 import express from 'express';
 import { gunzipSync } from 'node:zlib';
 import { PGlite } from '@electric-sql/pglite';
 import { createMobilePortalService, normalizeMobile, projectMobilePlot } from './mobilePortal.service.js';
-import { createMobilePortalRouter as createRouter, createMobileLoginLimiter, mobilePortalEnabled } from '../routes/mobilePortal.routes.js';
+import { clientIdentityKey } from './clientPortal.service.js';
+import { createMobilePortalRouter as createRouter, createMobileLoginLimiter, createMobilePasswordLimiter, mobilePortalEnabled } from '../routes/mobilePortal.routes.js';
 import { postingPolicySql } from '../test/mobilePostingPolicy.fixture.mjs';
 
 // Synthetic test routers opt in explicitly; the default exported production router fails closed.
 const createMobilePortalRouter = (service, options = {}) => createRouter(service, { isEnabled: () => true, ...options });
 
-const credentials = { mobile: '9876500001', aadhaar: '234567890123', role: 'client' };
+const credentials = { mobile: '9876500001', password: 'Owner-secret-password', role: 'client' };
+const aadhaar = '234567890123';
+process.env.CLIENT_PORTAL_IDENTITY_SECRET = 'isolated-stable-client-identity-secret';
 const fixture = async () => {
   const db = new PGlite();
   await db.exec(`
-    CREATE TABLE sites(id integer PRIMARY KEY,name text);
-    CREATE TABLE members(id integer PRIMARY KEY,site_id integer,full_name text,phone text,aadhar_no text,member_type text,member_types text[],is_active boolean DEFAULT true);
-    CREATE TABLE booking_client_accounts(id integer PRIMARY KEY,is_active boolean DEFAULT true);
+    CREATE TABLE sites(id integer PRIMARY KEY,name text,code text);
+    CREATE TABLE members(id integer PRIMARY KEY,site_id integer,full_name text,phone text,aadhar_no text,member_type text,member_types text[],is_active boolean DEFAULT true,email text,pan_no text);
+    CREATE TABLE kyc_cases(id integer PRIMARY KEY,client_member_id integer,site_id integer,status text);
+    CREATE TABLE booking_client_accounts(id serial PRIMARY KEY,phone text,identity_key text,password_hash text,password_changed boolean DEFAULT false,token_version integer DEFAULT 0,is_active boolean DEFAULT true,aadhaar_last4 text,updated_at timestamptz DEFAULT now(),UNIQUE(phone,identity_key));
     CREATE TABLE booking_client_members(account_id integer,member_id integer);
     CREATE TABLE plots(id integer PRIMARY KEY,site_id integer,plot_no text,plot_size numeric,sale_price numeric,booking_date date,status text,buyer_member_id integer,buyer_name text,full_payment_due boolean DEFAULT false,full_payment_due_date date);
     CREATE TABLE bookings(id integer PRIMARY KEY,site_id integer,plot_id integer,client_member_id integer,status text);
     CREATE TABLE plot_installments(id integer PRIMARY KEY,plot_id integer,installment_name text,amount numeric,due_date date,sort_order integer,status text DEFAULT 'pending');
     CREATE TABLE plot_payments(id integer PRIMARY KEY,site_id integer,plot_id integer,amount numeric,date date,payment_type text,status text,cheque_status text,reference text);
     CREATE TABLE plot_installment_payments(id integer PRIMARY KEY,plot_id integer,installment_id integer,amount numeric,payment_date date,payment_mode text,status text,cheque_status text,reference text);
-    INSERT INTO sites VALUES (1,'Oak Park'),(2,'Lake Estate');
+    INSERT INTO sites VALUES (1,'Oak Park','OAK'),(2,'Lake Estate','LAKE');
     INSERT INTO members(id,site_id,full_name,phone,aadhar_no,member_type) VALUES
       (1,1,'Example Owner','+91 9876500001','2345 6789 0123','CLIENT'),
       (2,2,'Example Owner','9876500001','234567890123','CLIENT'),
       (3,1,'Another Owner','9876500001','345678901234','CLIENT'),
       (4,1,'Example Owner','9876500002','456789012345','CLIENT');
+    INSERT INTO kyc_cases VALUES (1,1,1,'VERIFIED'),(2,2,2,'VERIFIED'),(3,3,1,'VERIFIED'),(4,4,1,'VERIFIED');
     INSERT INTO plots(id,site_id,plot_no,plot_size,sale_price,booking_date,status,buyer_member_id,buyer_name) VALUES
       (1,1,'A-01',100,500,'2026-01-01','BOOKED',1,'Example Owner'),
       (2,2,'B-02',200,200,'2026-01-01','BOOKED',NULL,'Example Owner'),
@@ -61,6 +67,9 @@ const fixture = async () => {
       (13,1,3,999,'2026-05-01','BANK','approved',NULL,'OTHER-PLOT');
     INSERT INTO plot_installment_payments VALUES (1,1,3,25,'2026-06-01','CASH','approved',NULL,'DIRECT-1');
   `);
+  await db.query('INSERT INTO booking_client_accounts(id,phone,identity_key,password_hash,password_changed) VALUES (1,$1,$2,$3,true)',
+    [credentials.mobile, clientIdentityKey(aadhaar), await bcrypt.hash(credentials.password, 4)]);
+  await db.exec('INSERT INTO booking_client_members VALUES (1,1),(1,2)');
   await db.exec(postingPolicySql);
   return db;
 };
@@ -78,10 +87,10 @@ test('mobile customer portal enforces identity and property boundaries with real
   await t.test('credentials are never returned or placed in JWT payloads; staff tokens are refused', async () => {
     assert.deepEqual(login.user, { id: 'client:1', name: 'Example Owner', role: 'client' });
     const claims = jwt.decode(login.token);
-    assert.equal(claims.exp - claims.iat, 30 * 24 * 60 * 60);
-    assert.equal(login.sessionDurationDays, 30);
+    assert.equal(claims.exp - claims.iat, 24 * 60 * 60);
+    assert.equal(login.sessionDurationDays, 1);
     assert.equal(Date.parse(login.expiresAt), claims.exp * 1000);
-    for (const value of [credentials.mobile, credentials.aadhaar, '2345 6789 0123']) {
+    for (const value of [credentials.mobile, credentials.password, aadhaar, '2345 6789 0123']) {
       assert.ok(!JSON.stringify(login).includes(value));
       assert.ok(!JSON.stringify(claims).includes(value));
     }
@@ -90,7 +99,12 @@ test('mobile customer portal enforces identity and property boundaries with real
     const oldMobileToken = jwt.sign({ realm: 'mobile-client', identity: claims.identity }, oldAccountsKey,
       { algorithm: 'HS256', issuer: 'my-real-assets', audience: 'my-real-assets-client', subject: claims.sub, expiresIn: '1h' });
     await assert.rejects(service.getSession(oldMobileToken), { statusCode: 401 });
-    await assert.rejects(service.login({ ...credentials, aadhaar: '999999999999' }), { statusCode: 401 });
+    const oldCurrentKey = createHmac('sha256', process.env.MOBILE_PORTAL_SECRET).update('bookings/my-real-assets/v1/access').digest();
+    const legacy = jwt.sign({ realm: 'mobile-client', identity: 'a'.repeat(64) }, oldCurrentKey,
+      { algorithm: 'HS256', issuer: 'my-real-assets-bookings', audience: 'my-real-assets-client', subject: 'mra-client:1', expiresIn: '30d' });
+    await assert.rejects(service.getSession(legacy), { statusCode: 401 });
+    await assert.rejects(service.login({ ...credentials, password: 'wrong-password' }), { statusCode: 401 });
+    await assert.rejects(service.login({ mobile: credentials.mobile, aadhaar, role: 'client' }), { statusCode: 401 });
     await assert.rejects(service.login({ ...credentials, role: 'broker' }), { statusCode: 401 });
   });
   await t.test('only explicit buyers or latest active booking owners across matched projects are visible', async () => {
@@ -133,26 +147,140 @@ test('mobile customer portal enforces identity and property boundaries with real
     assert.equal(plot.installments.reduce((sum, row) => sum + row.paidAmount, 0), 375);
   });
   await t.test('identity corrections revoke existing access immediately', async () => {
-    await db.query("UPDATE members SET aadhar_no='345678901234' WHERE id=1");
+    await db.query("UPDATE members SET aadhar_no='345678901234' WHERE id IN (1,2)");
     await assert.rejects(service.getSession(login.token), { statusCode: 401 });
-    await db.query('UPDATE members SET aadhar_no=$1 WHERE id=1', [credentials.aadhaar]);
+    await db.query('UPDATE members SET aadhar_no=$1 WHERE id IN (1,2)', [aadhaar]);
   });
-  await t.test('explicitly deactivated linked customer accounts revoke the whole matched identity', async () => {
-    await db.exec('INSERT INTO booking_client_accounts VALUES (10,false); INSERT INTO booking_client_members VALUES (10,2)');
+  await t.test('disabled accounts and members and lost KYC revoke access', async () => {
+    await db.exec('UPDATE booking_client_accounts SET is_active=false WHERE id=1');
     await assert.rejects(service.login(credentials), { statusCode: 401 });
     await assert.rejects(service.getSession(login.token), { statusCode: 401 });
-    await db.exec('UPDATE members SET is_active=false WHERE id=2');
-    await assert.rejects(service.login(credentials), { statusCode: 401 });
-    // A different Aadhaar sharing the same phone is not blocked by that account.
-    assert.ok((await service.login({ ...credentials, aadhaar: '345678901234' })).token);
-    await db.exec('UPDATE booking_client_accounts SET is_active=true WHERE id=10');
+    await db.exec('UPDATE booking_client_accounts SET is_active=true WHERE id=1');
     assert.ok((await service.login(credentials)).token);
-    await db.exec('UPDATE members SET is_active=false WHERE id=1');
+    await db.exec('UPDATE members SET is_active=false WHERE id IN (1,2)');
     await assert.rejects(service.login(credentials), { statusCode: 401 });
     await assert.rejects(service.getSession(login.token), { statusCode: 401 });
     await db.exec('UPDATE members SET is_active=true WHERE id IN (1,2)');
+    await db.exec("UPDATE kyc_cases SET status='OPEN' WHERE id IN (1,2)");
+    await assert.rejects(service.getSession(login.token), { statusCode: 401 });
+    await db.exec("UPDATE kyc_cases SET status='VERIFIED' WHERE id IN (1,2)");
+  });
+  await t.test('shared phone accounts stay separate and ambiguous passwords fail closed', async () => {
+    const secondPassword = 'Different-owner-password';
+    await db.query('INSERT INTO booking_client_accounts(id,phone,identity_key,password_hash,password_changed) VALUES (2,$1,$2,$3,true)',
+      [credentials.mobile, clientIdentityKey('345678901234'), await bcrypt.hash(secondPassword, 4)]);
+    await db.exec('INSERT INTO booking_client_members VALUES (2,3)');
+    const otherLogin = await service.login({ ...credentials, password: secondPassword });
+    const other = await service.getSession(otherLogin.token);
+    assert.deepEqual((await service.portfolio(other)).plots.map(row => row.id), ['4', '5']);
+    assert.deepEqual((await service.portfolio(await service.getSession(login.token))).plots.map(row => row.id), ['1', '2']);
+    await db.query('UPDATE booking_client_accounts SET password_hash=$1 WHERE id=2', [await bcrypt.hash(credentials.password, 4)]);
+    await assert.rejects(service.login(credentials), { statusCode: 401 });
+    await db.exec('UPDATE booking_client_accounts SET is_active=false WHERE id=2');
+    assert.ok((await service.login(credentials)).token);
+  });
+  await t.test('password version revokes old tokens; Aadhaar only permits password setup', async () => {
+    await db.exec('UPDATE booking_client_accounts SET token_version=token_version+1 WHERE id=1');
+    await assert.rejects(service.getSession(login.token), { statusCode: 401 });
+    const next = await service.login(credentials);
+    await db.exec('UPDATE booking_client_accounts SET password_changed=false WHERE id=1');
+    await assert.rejects(service.getSession(next.token), { statusCode: 401 });
+    await db.query('UPDATE booking_client_accounts SET password_hash=$1 WHERE id=1', [await bcrypt.hash(aadhaar, 4)]);
+    const initial = await service.login({ ...credentials, password: aadhaar });
+    assert.equal(initial.passwordChangeRequired, true);
+    assert.equal(jwt.decode(initial.token).exp - jwt.decode(initial.token).iat, 600);
+    const setup = await service.getSession(initial.token);
+    assert.equal(setup.setupRequired, true);
+    await assert.rejects(service.portfolio(setup), { statusCode: 403 });
+    await assert.rejects(service.plot(setup, '1'), { statusCode: 403 });
+    await db.query('UPDATE booking_client_accounts SET password_changed=true WHERE id=1');
+    await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
   });
   await t.test('all service operations are reads', () => assert.ok(queries.every(sql => /^SELECT\b/i.test(sql))));
+});
+
+test('password changes require the current secret and revoke all existing client sessions', async t => {
+  const previousMobile = process.env.MOBILE_PORTAL_SECRET;
+  const previousClient = process.env.CLIENT_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET = 'synthetic-test-only-mobile-portal-secret-32';
+  process.env.CLIENT_PORTAL_SECRET = 'synthetic-test-only-client-portal-secret-32';
+  const db = await fixture();
+  t.after(async () => {
+    await db.close();
+    if (previousMobile === undefined) delete process.env.MOBILE_PORTAL_SECRET; else process.env.MOBILE_PORTAL_SECRET = previousMobile;
+    if (previousClient === undefined) delete process.env.CLIENT_PORTAL_SECRET; else process.env.CLIENT_PORTAL_SECRET = previousClient;
+  });
+  const service = createMobilePortalService(db);
+  const first = await service.login(credentials);
+  const other = await service.login(credentials);
+  const session = await service.getSession(first.token);
+  await assert.rejects(service.changePassword(session, { currentPassword: 'incorrect', newPassword: 'An entirely different password' }), { statusCode: 403 });
+  await assert.rejects(service.changePassword(session, { currentPassword: credentials.password, newPassword: 'too short' }), { statusCode: 400 });
+  await assert.rejects(service.changePassword(session, { currentPassword: credentials.password, newPassword: aadhaar }), { statusCode: 400 });
+  await assert.rejects(service.changePassword(session, { currentPassword: credentials.password, newPassword: credentials.password }), { statusCode: 400 });
+  const changedPassword = 'An entirely different password';
+  assert.equal(await service.changePassword(session, { currentPassword: credentials.password, newPassword: changedPassword }), undefined);
+  await assert.rejects(service.getSession(first.token), { statusCode: 401 });
+  await assert.rejects(service.getSession(other.token), { statusCode: 401 });
+  await assert.rejects(service.login(credentials), { statusCode: 401 });
+  const next = await service.login({ ...credentials, password: changedPassword });
+  const nextSession = await service.getSession(next.token);
+  const competing = ['Third distinct password A', 'Third distinct password B'];
+  const changes = await Promise.allSettled(competing.map(newPassword => service.changePassword(nextSession, { currentPassword: changedPassword, newPassword })));
+  assert.equal(changes.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(changes.filter(result => result.status === 'rejected' && result.reason.statusCode === 401).length, 1);
+  await assert.rejects(service.getSession(next.token), { statusCode: 401 });
+  const winner = competing[changes.findIndex(result => result.status === 'fulfilled')];
+  const last = await service.login({ ...credentials, password: winner });
+  await service.logout(await service.getSession(last.token));
+  await assert.rejects(service.getSession(last.token), { statusCode: 401 });
+});
+
+test('first Aadhaar login creates a verified account with setup-only access', async t => {
+  const previousMobile = process.env.MOBILE_PORTAL_SECRET;
+  const previousClient = process.env.CLIENT_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET = 'synthetic-test-only-mobile-portal-secret-32';
+  process.env.CLIENT_PORTAL_SECRET = 'synthetic-test-only-client-portal-secret-32';
+  const db = await fixture();
+  t.after(async () => {
+    await db.close();
+    if (previousMobile === undefined) delete process.env.MOBILE_PORTAL_SECRET; else process.env.MOBILE_PORTAL_SECRET = previousMobile;
+    if (previousClient === undefined) delete process.env.CLIENT_PORTAL_SECRET; else process.env.CLIENT_PORTAL_SECRET = previousClient;
+  });
+  await db.exec("DELETE FROM booking_client_members; DELETE FROM booking_client_accounts; UPDATE kyc_cases SET status='OPEN' WHERE id IN (1,2)");
+  const query = (sql, values) => db.query(sql, values);
+  const service = createMobilePortalService({ query, connect: async () => ({ query, release() {} }) });
+  await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
+  await db.exec("UPDATE kyc_cases SET status='VERIFIED' WHERE id IN (1,2)");
+  const initial = await service.login({ ...credentials, password: aadhaar });
+  assert.equal(initial.passwordChangeRequired, true);
+  assert.equal(initial.sessionDurationDays, null);
+  assert.equal(jwt.decode(initial.token).exp - jwt.decode(initial.token).iat, 600);
+  const setup = await service.getSession(initial.token);
+  assert.equal(setup.setupRequired, true);
+  await assert.rejects(service.portfolio(setup), { statusCode: 403 });
+  await service.changePassword(setup, { currentPassword: aadhaar, newPassword: 'Distinct-chosen-password' });
+  await assert.rejects(service.getSession(initial.token), { statusCode: 401 });
+  await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
+  const chosen = await service.login({ ...credentials, password: 'Distinct-chosen-password' });
+  assert.equal(chosen.passwordChangeRequired, false);
+  assert.deepEqual((await service.portfolio(await service.getSession(chosen.token))).plots.map(row => row.id), ['1', '2']);
+});
+
+test('password change limiter isolates account attempts and eventually expires', () => {
+  let time = 1000;
+  const limiter = createMobilePasswordLimiter({ now: () => time, windowMs: 1000 });
+  const response = { statusCode: 200, set() { return this; }, status(value) { this.statusCode = value; return this; }, json() {} };
+  let allowed = 0;
+  const request = { ip: '127.0.0.1', mobileSession: { accountId: 1 } };
+  for (let i = 0; i < 11; i++) limiter(request, response, () => { allowed++; });
+  assert.equal(allowed, 10);
+  assert.equal(response.statusCode, 429);
+  limiter({ ...request, mobileSession: { accountId: 2 } }, response, () => { allowed++; });
+  assert.equal(allowed, 11);
+  time += 1001;
+  limiter(request, response, () => { allowed++; });
+  assert.equal(allowed, 12);
 });
 
 test('refunds in one receipt bucket cannot overstate installment funding', () => {
@@ -242,6 +370,31 @@ test('HTTP router refuses unauthenticated reads and hides database errors', asyn
   assert.ok(!JSON.stringify(failure.body).includes('secret'));
 });
 
+test('password and logout endpoints require auth and return no account or token data', async () => {
+  const received = [];
+  const router = createMobilePortalRouter({
+    getSession: async token => ['valid', 'setup'].includes(token) ? { accountId: 1, version: 2, setupRequired: token === 'setup' } : Promise.reject(Object.assign(new Error('Please sign in again.'), { statusCode: 401 })),
+    changePassword: async (session, body) => { received.push({ session, body }); },
+    logout: async session => { received.push({ session }); },
+  });
+  const invoke = (url, token, body, method = 'POST') => new Promise((resolve, reject) => {
+    const req = { method, url, path: url, body, ip: '127.0.0.1', headers: token ? { authorization: `Bearer ${token}` } : {}, get(name) { return this.headers[name.toLowerCase()]; } };
+    const res = { statusCode: 200, headers: {}, set(key, value) { this.headers[key] = value; return this; },
+      status(value) { this.statusCode = value; return this; }, json(value) { resolve({ status: this.statusCode, headers: this.headers, body: value }); } };
+    router.handle(req, res, error => reject(error || new Error('No route matched')));
+  });
+  assert.equal((await invoke('/auth/password', null, {})).status, 401);
+  assert.equal((await invoke('/auth/logout', 'invalid')).status, 401);
+  assert.equal((await invoke('/me', 'setup', null, 'GET')).status, 403);
+  assert.equal((await invoke('/plots', 'setup', null, 'GET')).status, 403);
+  assert.deepEqual((await invoke('/auth/password', 'setup', { currentPassword: 'synthetic', newPassword: 'new-secret-123' })).body, { ok: true });
+  const changed = await invoke('/auth/password', 'valid', { currentPassword: 'current-secret', newPassword: 'new-secret-123' });
+  assert.deepEqual(changed.body, { ok: true });
+  assert.equal(changed.headers['Cache-Control'], 'private, no-store');
+  assert.deepEqual((await invoke('/auth/logout', 'valid')).body, { ok: true });
+  assert.equal(received.length, 3);
+});
+
 test('batch portfolio reuses financial reads while ownership remains current and explicit refresh bypasses the cache', async t => {
   const db = await fixture();
   t.after(() => db.close());
@@ -256,11 +409,15 @@ test('batch portfolio reuses financial reads while ownership remains current and
   assert.ok(first.plots.every(row => row.projectName === 'Your Property'));
   assert.ok(!JSON.stringify(first).includes('Oak Park'));
   assert.ok(!JSON.stringify(first).includes('Lake Estate'));
+  assert.ok(first.plots.every(row => !Object.hasOwn(row, 'projectId')));
+  assert.ok(first.details.every(row => !Object.hasOwn(row.plot, 'projectId')));
   queries = 0;
   await service.portfolio(session, { includeDetails: true });
   assert.equal(queries, 1, 'financial cache never removes the ownership read');
   queries = 0;
-  assert.equal((await service.plot(session, '1')).plot.paidAmount, 350);
+  const detail = (await service.plot(session, '1')).plot;
+  assert.equal(detail.paidAmount, 350);
+  assert.ok(!Object.hasOwn(detail, 'projectId'));
   assert.equal(queries, 1, 'detail reuses the batched financial result');
   await db.query('UPDATE plots SET buyer_member_id=3 WHERE id=1');
   await assert.rejects(service.plot(session, '1'), { statusCode: 404 });
@@ -342,7 +499,7 @@ test('production mobile access requires its own opt-in; public status does not e
       json(body) { resolve({ status: this.statusCode, headers: this.headers, body }); } };
     router.handle(req, res, error => reject(error || new Error('No route matched')));
   });
-  assert.deepEqual((await invoke('GET', '/status')).body, { service: 'my-real-assets', apiVersion: 1, enabled: false, sessionDurationDays: 30 });
+  assert.deepEqual((await invoke('GET', '/status')).body, { service: 'my-real-assets', apiVersion: 1, enabled: false, sessionDurationDays: 1, authMode: 'client-password-v1' });
   assert.equal((await invoke('GET', '/plots')).status, 503);
   assert.equal((await invoke('POST', '/auth/login')).status, 503);
   assert.equal(authCalls, 0);

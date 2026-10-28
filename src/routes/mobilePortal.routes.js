@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { gzip } from 'node:zlib';
 import express from 'express';
 import pool from '../config/db.js';
-import { createMobilePortalService, normalizeMobile, MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
+import { createMobilePortalService, normalizeMobile, CLIENT_MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
 
 const gzipAsync = promisify(gzip);
 export async function sendPortfolioJson(req, res, payload) {
@@ -25,15 +25,15 @@ export async function sendPortfolioJson(req, res, payload) {
 
 // Bounded, process-local sign-in limiter. Do not trust X-Forwarded-For supplied
 // by a caller; req.ip honors only an explicitly configured Express proxy.
-export function createMobileLoginLimiter({ now = Date.now, windowMs = 15 * 60 * 1000, maxEntries = 10000 } = {}) {
+function credentialLimiter(identityFor, { now = Date.now, windowMs = 15 * 60 * 1000, maxEntries = 10000 } = {}) {
   const entries = new Map();
   return (req, res, next) => {
     const time = now();
     for (const [key, entry] of entries) if (entry.until <= time) entries.delete(key);
-    const mobile = normalizeMobile(req.body?.mobile) || 'invalid';
+    const identity = identityFor(req);
     const keys = [
       [createHash('sha256').update(`ip:${req.ip || req.socket?.remoteAddress || 'unknown'}`).digest('hex'), 40],
-      [createHash('sha256').update(`mobile:${mobile}`).digest('hex'), 10],
+      [createHash('sha256').update(`identity:${identity}`).digest('hex'), 10],
     ];
     for (const [key, maximum] of keys) {
       const entry = entries.get(key);
@@ -51,12 +51,22 @@ export function createMobileLoginLimiter({ now = Date.now, windowMs = 15 * 60 * 
   };
 }
 
+export function createMobileLoginLimiter(options = {}) {
+  return credentialLimiter(req => normalizeMobile(req.body?.mobile) || 'invalid', options);
+}
+
+// Password changes require the current secret and need their own guessing
+// limit even though the caller already holds a bearer token.
+export function createMobilePasswordLimiter(options = {}) {
+  return credentialLimiter(req => `account:${req.mobileSession.accountId}`, options);
+}
+
 export function mobilePortalEnabled(env = process.env) {
   return env.MOBILE_PORTAL_ENABLED === 'true';
 }
 
 export function createMobilePortalRouter(service, {
-  loginLimiter = createMobileLoginLimiter(), isEnabled = () => mobilePortalEnabled(),
+  loginLimiter = createMobileLoginLimiter(), passwordLimiter = createMobilePasswordLimiter(), isEnabled = () => mobilePortalEnabled(),
 } = {}) {
   const router = express.Router();
   const run = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(error => {
@@ -66,7 +76,8 @@ export function createMobilePortalRouter(service, {
   });
   router.use((_req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
   router.get('/status', (_req, res) => res.json({
-    service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()), sessionDurationDays: MOBILE_SESSION_DAYS,
+    service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()), sessionDurationDays: CLIENT_MOBILE_SESSION_DAYS,
+    authMode: 'client-password-v1',
   }));
   // Mobile access is independent of the existing paused web client portal.
   // A production deployment opts in explicitly; disabled access never enters auth.
@@ -84,8 +95,13 @@ export function createMobilePortalRouter(service, {
       return res.status(401).json({ message: 'Please sign in again.' });
     }
     req.mobileSession = await service.getSession(authorization.slice(7));
+    if (req.mobileSession.setupRequired && !(req.method === 'POST' && ['/auth/password', '/auth/logout'].includes(req.path))) {
+      return res.status(403).json({ code: 'PASSWORD_CHANGE_REQUIRED', message: 'Set a new password to continue.' });
+    }
     next();
   }));
+  router.post('/auth/logout', run(async (req, res) => { await service.logout(req.mobileSession); res.json({ ok: true }); }));
+  router.post('/auth/password', passwordLimiter, run(async (req, res) => { await service.changePassword(req.mobileSession, req.body); res.json({ ok: true }); }));
   router.get('/me', (req, res) => res.json({ user: req.mobileSession.user }));
   const forceFresh = req => /(?:^|,)\s*(?:no-cache|no-store|max-age=0)\s*(?:,|$)/i.test(req.get('Cache-Control') || '');
   router.get('/plots', run(async (req, res) => sendPortfolioJson(req, res, await service.portfolio(req.mobileSession, {

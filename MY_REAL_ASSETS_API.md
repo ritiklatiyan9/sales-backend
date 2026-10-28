@@ -15,6 +15,10 @@ No schema migrations, new npm packages, or accounting-server changes are needed.
 The API reads the shared Bookings/Accounts database. Before enabling, the database
 must already contain the canonical plot and installment tables, `buyer_member_id`,
 the Bookings private client-account link tables and `financial_transaction_posts`.
+Clients need active member records and verified KYC. On first use, their
+registered mobile number and Aadhaar can create a linked client account; they
+must then choose a password before accessing financial data. Unverified member
+records cannot enroll until KYC is verified.
 
 Set these server environment variables:
 
@@ -26,6 +30,8 @@ MOBILE_PORTAL_SECRET=<independent random value with at least 32 characters>
 The dedicated secret is recommended. If absent, a domain-separated key is derived
 from the existing strong `JWT_ACCESS_SECRET`; staff secrets need not be rotated.
 Never put signing secrets in Flutter, Vite variables, git, or client configuration.
+The existing stable `CLIENT_PORTAL_IDENTITY_SECRET` (or its configured client
+portal fallback secrets) must match the one used when client accounts were created.
 
 Mobile access defaults off unless explicitly enabled, in every environment. It is separate
 from `CLIENT_PORTAL_ENABLED`, so activating the app does not reopen the paused web
@@ -36,7 +42,7 @@ After deployment, anonymous readiness must return:
 
 ```text
 GET /api/mobile/status
-200 {"service":"my-real-assets","apiVersion":1,"enabled":true}
+200 {"service":"my-real-assets","apiVersion":1,"enabled":true,"sessionDurationDays":1,"authMode":"client-password-v1"}
 ```
 
 This status endpoint is available when disabled too, with `enabled:false`, so it
@@ -57,25 +63,42 @@ can still affect the first request and are independent of app/database caching.
 | --- | --- | --- |
 | GET | `/api/mobile/status` | Public service/version/enabled marker |
 | GET | `/api/mobile/health` | Public health when mobile access is enabled |
-| POST | `/api/mobile/auth/login` | `{mobile,aadhaar,role:"client"}` → `{token,user}` |
+| POST | `/api/mobile/auth/login` | `{mobile,password,role:"client"}` → `{token,user}` |
+| POST | `/api/mobile/auth/password` | Authenticated `{currentPassword,newPassword}` → `{ok:true}` and invalidates all client sessions |
+| POST | `/api/mobile/auth/logout` | Authenticated request → `{ok:true}` and invalidates all client sessions |
 | GET | `/api/mobile/me` | Scoped owner profile |
 | GET | `/api/mobile/plots?include=details` | Portfolio, totals and all plot details in one response |
 | GET | `/api/mobile/plots/:id` | One owned plot's plan, allocations and posted receipts |
 
-Mobile credentials remain the registered Indian mobile number and Aadhaar, as
-requested for this app. This is a separate mobile credential realm, not a change
-to web portal password-change behavior or staff login. Tokens expire after 30
-days and use issuer `my-real-assets-bookings`, a dedicated key derivation and
-`mobile-client` realm. Staff, older Accounts-mobile and web portal tokens cannot
-authenticate these endpoints. Neither raw mobile nor Aadhaar is included in the
-token or response. The app keeps the scoped token in device-secured encrypted
-storage for the session duration; financial caches remain memory-only.
+Mobile sign-in uses the registered Indian mobile number and password. When a
+verified client has no chosen password, Aadhaar works for initial setup only. The
+API issues a ten-minute setup token that may only change the password or sign
+out. The client must choose a password and sign in again. Once a password is
+chosen, Aadhaar cannot be used to sign in. Accounts must be linked to verified
+KYC and active members. A different account sharing a phone remains separate; if
+the same password matches more than one account, sign-in fails closed.
 
-Each request rechecks the current exact mobile/Aadhaar identity. Inactive members
-are denied. A deactivated private Bookings client account explicitly linked to a
-member revokes that matching identity across its sites. A different Aadhaar that
-shares the same phone remains separate. A web portal account or web registration
-is not required for an otherwise valid registered mobile-app client.
+**Enrollment risk:** a mobile number and Aadhaar are identifiers, not secret
+proof of identity. Anyone who knows both can claim an uninitialized account and
+choose its password. Database KYC confirms a record exists but does not verify
+the person entering it. A trusted activation procedure or verified independent
+factor is needed to remove this first-login takeover risk.
+
+Mobile tokens expire after one day and use a dedicated signing realm. Each read
+rechecks the client account's token version and current verified ownership. Client
+portal password changes, logout, account deactivation, or revoked KYC invalidate
+mobile access. Tokens from the former Aadhaar-only mobile API are rejected after
+this backend is deployed. Staff and web portal tokens cannot authenticate mobile
+endpoints. Passwords and Aadhaar are never returned or put into mobile tokens.
+Mobile password changes require the current password, a different new password
+of at least 12 characters and at most 72 UTF-8 bytes, and are rate-limited. Both
+password change and successful online mobile sign-out revoke every mobile and web
+client portal session for that account, because both share the account's token
+version. An offline sign-out can clear the device but cannot revoke a server token.
+The app keeps its scoped token in device-secured storage; financial caches remain
+memory-only. The existing web client portal has separate availability controls;
+this change does not enable it. Mobile enrollment creates an account only when
+the verified KYC and identity checks pass.
 
 Plot ownership requires its explicit buyer member or latest noncancelled booking
 client in the same site. Buyer-name matching never grants access. Legacy name-only
@@ -94,7 +117,8 @@ the plan. The shared `financial_transaction_posts` database policy is authoritat
 
 Agreement value and remaining principal stay separate from estimated overdue
 interest, using the same configured interest period/rate as the Accounts tracker.
-The app does not collect payments or create/change any records.
+The app does not collect payments or change accounting records. First login and
+password management create or update client authentication records.
 
 The optimized normalized-phone lookup uses the existing expression index. One
 expanded request replaces per-plot N+1 calls. Financial rows use a bounded 5-second
@@ -119,6 +143,11 @@ identity boundaries, account deactivation, domain separation, cash/refunds,
 allocation math, batching/cache revocation, explicit refresh, gzip and production
 enablement. No real client's Aadhaar is used to run the tests.
 
-## Persistent mobile sessions
+## Deployment compatibility
 
-Login returns `expiresAt` and `sessionDurationDays:30` alongside the access token. The public status reports `sessionDurationDays:30` so deployment checks can verify the duration. Clients store only the scoped token and minimal profile in device-secured encrypted storage; Aadhaar is never stored. Signature, expiry, current identity, inactive/deactivated status and ownership remain server-validated on authenticated reads. Signing-key rotation revokes saved sessions. Existing one-hour tokens retain their original expiry; sign in once after this update to receive a 30-day session.
+Deploy the backend and updated app together. Older mobile builds use Aadhaar and
+will be unable to sign in, and previously issued mobile tokens will be rejected.
+Confirm the public `authMode` marker before distributing the app; the old API is
+still vulnerable to anyone who knows the registered mobile number and Aadhaar.
+The per-process sign-in limiter needs an equivalent shared gateway limit when
+running multiple workers or instances.

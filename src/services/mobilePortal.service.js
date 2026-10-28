@@ -1,10 +1,13 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { allocateInstallmentPayments } from './mobileInstallmentAllocation.service.js';
+import { createClientPortalService, verifyClientToken } from './clientPortal.service.js';
 
 const ISSUER = 'my-real-assets-bookings';
 const AUDIENCE = 'my-real-assets-client';
+// Broker mobile uses the existing 30-day duration independently.
 export const MOBILE_SESSION_DAYS = 30;
+export const CLIENT_MOBILE_SESSION_DAYS = 1;
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const unauthorized = () => fail(401, 'Please sign in again.');
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
@@ -21,34 +24,12 @@ export const normalizeMobile = value => {
   const local = /^(?:0091|91|0)?([6-9]\d{9})$/.exec(digits);
   return local?.[1] || '';
 };
-const normalizeAadhaar = value => typeof value === 'string' && value.length <= 24 ? value.replace(/[\s-]/g, '') : '';
-const validAadhaar = value => /^[2-9]\d{11}$/.test(value);
 const rootSecret = () => {
   const root = process.env.MOBILE_PORTAL_SECRET || process.env.JWT_ACCESS_SECRET;
   if (!root || root.length < 32) fail(503, 'Sign-in is temporarily unavailable.');
   return root;
 };
 const privateKey = purpose => createHmac('sha256', rootSecret()).update(`bookings/my-real-assets/v1/${purpose}`).digest();
-const identityKey = (mobile, aadhaar) => createHmac('sha256', privateKey('identity')).update(`${mobile}:${aadhaar}`).digest('hex');
-const equalIdentity = (left, right) => typeof left === 'string' && typeof right === 'string'
-  && /^[a-f0-9]{64}$/.test(left) && /^[a-f0-9]{64}$/.test(right)
-  && timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
-
-// Canonical Indian phone forms from the shared Bookings/Accounts member directory.
-// Explicitly disabled linked customer accounts remain disabled in the mobile realm;
-// clients without a web portal account can still use their registered identity.
-const phoneSql = `CASE
-  WHEN length(regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g'))=10 THEN regexp_replace(m.phone,'[^0-9]','','g')
-  WHEN regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g') ~ '^0[6-9][0-9]{9}$' THEN right(regexp_replace(m.phone,'[^0-9]','','g'),10)
-  WHEN regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g') ~ '^(0091|91)[6-9][0-9]{9}$' THEN right(regexp_replace(m.phone,'[^0-9]','','g'),10)
-  ELSE '' END`;
-const memberSelect = `SELECT m.id,m.site_id,m.full_name,m.phone,m.aadhar_no,
-  COALESCE(to_jsonb(m)->>'is_active','true') <> 'false' AS mobile_member_active,
-  EXISTS (SELECT 1 FROM booking_client_members bcm
-    JOIN booking_client_accounts bca ON bca.id=bcm.account_id
-    WHERE bcm.member_id=m.id AND bca.is_active=false) AS mobile_account_disabled
-  FROM members m JOIN sites s ON s.id=m.site_id
-  WHERE 'CLIENT'=ANY(COALESCE(m.member_types,ARRAY[m.member_type]))`;
 
 // Public customers require an explicit link. Staff-only name matching must
 // never turn a similarly named member into the owner of a property.
@@ -235,37 +216,37 @@ export function createMobileFinancialReader(db, {
 export function createMobilePortalService(db, options = {}) {
   const { now = Date.now } = options;
   const financialsFor = createMobileFinancialReader(db, options);
+  const clientPortal = createClientPortalService(db);
   const userFor = members => ({ id: `client:${members[0].id}`, name: members[0].full_name || 'Property owner', role: 'client' });
-  async function membersFor(mobile, digest) {
-    const result = await db.query(`${memberSelect} AND right(regexp_replace(COALESCE(m.phone,''),'[^0-9]','','g'),10)=$1 AND ${phoneSql}=$1 ORDER BY m.id LIMIT 1001`, [mobile]);
-    if (result.rows.length > 1000) unauthorized();
-    const matches = result.rows.filter(row => {
-      const aadhaar = normalizeAadhaar(row.aadhar_no);
-      return validAadhaar(aadhaar) && equalIdentity(identityKey(mobile, aadhaar), digest);
-    });
-    // A disabled account linked to this exact identity cannot be bypassed by
-    // another registration at a different site. Shared-phone families remain
-    // separate because the HMAC identity comparison happens first.
-    if (matches.some(row => row.mobile_account_disabled)) unauthorized();
-    return matches.filter(row => row.mobile_member_active !== false);
+  async function getClientSession(accountId, version, { setup = false } = {}) {
+    try {
+      const session = await clientPortal.getSession({ accountId, version });
+      if (session.account.password_changed === setup || !session.members.some(row => row.member_active !== false)) unauthorized();
+      return session;
+    }
+    catch (error) { if (error.status === 401) unauthorized(); throw error; }
+  }
+  async function accountSession(accountId, version, { setup = false } = {}) {
+    const session = await getClientSession(accountId, version, { setup });
+    // Setup sessions may only change a password or sign out, never read data.
+    const members = session.members.filter(row => row.member_active !== false)
+      .map(row => ({ id: row.member_id, site_id: row.site_id, full_name: row.full_name }));
+    if (!members.length) unauthorized();
+    return { members, user: userFor(members), accountId, version, setupRequired: setup };
   }
   async function getSession(token) {
     let claims;
     try {
       claims = jwt.verify(token, privateKey('access'), { algorithms: ['HS256'], issuer: ISSUER, audience: AUDIENCE });
     } catch { unauthorized(); }
-    if (claims.realm !== 'mobile-client' || !/^mra-client:[1-9]\d*$/.test(claims.sub || '')
-      || !/^[a-f0-9]{64}$/.test(claims.identity || '')) unauthorized();
-    const anchor = (await db.query(`${memberSelect} AND m.id=$1`, [Number(claims.sub.split(':')[1])])).rows[0];
-    if (!anchor || anchor.mobile_member_active === false || anchor.mobile_account_disabled) unauthorized();
-    const mobile = normalizeMobile(anchor.phone);
-    const aadhaar = normalizeAadhaar(anchor.aadhar_no);
-    if (!mobile || !validAadhaar(aadhaar) || !equalIdentity(identityKey(mobile, aadhaar), claims.identity)) unauthorized();
-    const members = await membersFor(mobile, claims.identity);
-    if (!members.length) unauthorized();
-    return { members, user: userFor(members) };
+    if (!['mobile-client-password-v2', 'mobile-client-password-setup-v1'].includes(claims.realm) || !/^mra-client-account:[1-9]\d*$/.test(claims.sub || '')
+      || !Number.isSafeInteger(claims.version)) unauthorized();
+    const accountId = Number(claims.sub.split(':')[1]);
+    if (!Number.isSafeInteger(accountId)) unauthorized();
+    return accountSession(accountId, claims.version, { setup: claims.realm === 'mobile-client-password-setup-v1' });
   }
   async function loadPlots(session, plotId = null, options = {}) {
+    if (session.setupRequired) fail(403, 'Set a new password to continue.');
     const parameters = [session.members.map(row => row.id), [...new Set(session.members.map(row => row.site_id))]];
     if (plotId !== null) {
       if (!/^[1-9]\d*$/.test(String(plotId)) || !Number.isSafeInteger(Number(plotId)) || Number(plotId) > 2147483647) fail(404, 'Property unavailable.');
@@ -289,7 +270,9 @@ export function createMobilePortalService(db, options = {}) {
     const today = todayInIndia();
     const details = plots.map(plot => {
       const data = financials.get(plot.id);
-      return projectMobilePlot(plot, data.schedules, data.receipts, today);
+      // Site IDs are needed internally by broker presentation, not by owner apps.
+      const { projectId: _projectId, ...ownerView } = projectMobilePlot(plot, data.schedules, data.receipts, today);
+      return ownerView;
     });
     const updatedAt = [...financials.values()].map(row => row.updatedAt).sort()[0] || new Date(now()).toISOString();
     return { details, updatedAt };
@@ -298,23 +281,70 @@ export function createMobilePortalService(db, options = {}) {
     getSession,
     async login(body) {
       if (!body || typeof body !== 'object' || Array.isArray(body) || (body.role !== undefined && body.role !== 'client')) {
-        fail(401, 'Mobile number or Aadhaar did not match.');
+        fail(401, 'Mobile number or password did not match.');
       }
       const mobile = normalizeMobile(body.mobile);
-      const aadhaar = normalizeAadhaar(body.aadhaar);
-      if (!mobile || !validAadhaar(aadhaar)) fail(401, 'Mobile number or Aadhaar did not match.');
-      const digest = identityKey(mobile, aadhaar);
-      const members = await membersFor(mobile, digest);
-      if (!members.length) fail(401, 'Mobile number or Aadhaar did not match.');
-      const token = jwt.sign({ realm: 'mobile-client', identity: digest }, privateKey('access'), {
-        algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-client:${members[0].id}`, expiresIn: `${MOBILE_SESSION_DAYS}d`,
+      const password = body.password;
+      if (!mobile || typeof password !== 'string' || !password || Buffer.byteLength(password, 'utf8') > 72) {
+        fail(401, 'Mobile number or password did not match.');
+      }
+      let match = await clientPortal.authenticate(mobile, password, { dryRun: true });
+      if (!match) fail(401, 'Mobile number or password did not match.');
+      if (!match.account) {
+        // Existing verified-KYC enrollment creates the private account; this
+        // is restricted to first-time identity credentials and carries a risk
+        // of account takeover if someone knows both identifiers.
+        const enrolled = await clientPortal.authenticate(mobile, password);
+        if (!enrolled?.accessToken) fail(401, 'Mobile number or password did not match.');
+        match = await clientPortal.getSession(verifyClientToken(enrolled.accessToken));
+      }
+      const setup = !match.account.password_changed;
+      if (!setup && match.members.some(row => String(row.aadhar_no || '').replace(/[\s-]/g, '') === password.replace(/[\s-]/g, ''))) {
+        fail(401, 'Mobile number or password did not match.');
+      }
+      const session = await accountSession(match.account.id, match.account.token_version, { setup });
+      const token = jwt.sign({ realm: setup ? 'mobile-client-password-setup-v1' : 'mobile-client-password-v2', version: match.account.token_version }, privateKey('access'), {
+        algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-client-account:${match.account.id}`, expiresIn: setup ? '10m' : `${CLIENT_MOBILE_SESSION_DAYS}d`,
       });
       return {
         token,
         expiresAt: new Date(jwt.decode(token).exp * 1000).toISOString(),
-        sessionDurationDays: MOBILE_SESSION_DAYS,
-        user: userFor(members),
+        sessionDurationDays: setup ? null : CLIENT_MOBILE_SESSION_DAYS,
+        passwordChangeRequired: setup,
+        user: session.user,
       };
+    },
+    async logout(session) {
+      // This version is shared with the web portal: sign-out revokes all
+      // currently issued client sessions for this account, on every device.
+      const current = await getClientSession(session.accountId, session.version, { setup: session.setupRequired });
+      await clientPortal.logout(current);
+    },
+    async changePassword(session, body) {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).some(key => !['currentPassword', 'newPassword'].includes(key))) {
+        fail(400, 'Enter your current and new password.');
+      }
+      const { currentPassword, newPassword } = body;
+      if (typeof currentPassword !== 'string' || !currentPassword || Buffer.byteLength(currentPassword, 'utf8') > 72
+        || typeof newPassword !== 'string' || newPassword.length < 12 || Buffer.byteLength(newPassword, 'utf8') > 72
+        || newPassword === currentPassword) {
+        fail(400, 'Choose a different password of at least 12 characters and at most 72 UTF-8 bytes.');
+      }
+      const current = await getClientSession(session.accountId, session.version, { setup: session.setupRequired });
+      if (current.members.some(row => String(row.aadhar_no || '').replace(/[\s-]/g, '') === newPassword.replace(/[\s-]/g, ''))) {
+        fail(400, 'Choose a different password of at least 12 characters and at most 72 UTF-8 bytes.');
+      }
+      try {
+        // Optimistic token_version guard inside updateProfile makes concurrent
+        // changes safe and invalidates existing web and mobile tokens.
+        await clientPortal.updateProfile(current, { current_password: currentPassword, new_password: newPassword });
+      } catch (error) {
+        if (error.status === 403) fail(403, 'Your current password is incorrect.');
+        if (error.status === 400) fail(400, 'Choose a different password of at least 12 characters and at most 72 UTF-8 bytes.');
+        if (error.status === 401) unauthorized();
+        throw error;
+      }
     },
     async portfolio(session, { includeDetails = false, forceFresh = false } = {}) {
       const { details, updatedAt } = await loadPlots(session, null, { forceFresh });
