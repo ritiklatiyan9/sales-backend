@@ -151,3 +151,51 @@ Confirm the public `authMode` marker before distributing the app; the old API is
 still vulnerable to anyone who knows the registered mobile number and Aadhaar.
 The per-process sign-in limiter needs an equivalent shared gateway limit when
 running multiple workers or instances.
+
+## Firebase notifications (requires deployment and migration)
+
+Run `npm run migrate:mobile-push` on the shared Bookings/Accounts Postgres database
+before deploying the backend. It adds mobile device registrations, a durable event
+outbox and transactional triggers on both `plot_payments` and
+`plot_installment_payments`; no historic transactions are backfilled. The trigger
+uses the same `financial_transaction_posts` function as the mobile portfolio, so
+uncleared cheques and unapproved refunds are not presented as posted payments.
+An outbox failure does not reject an otherwise valid financial write: the
+trigger emits a PostgreSQL warning and that notification may be missed. Monitor
+database logs for `My Real Assets push capture failed`; this fallback is not a
+substitute for verifying the Accounts database role can write the outbox.
+
+Set `MRA_FCM_ENABLED=true` and configure the service account for the same Firebase
+project as the mobile app. For a Render secret file, set
+`MRA_FCM_SERVICE_ACCOUNT_FILE=/etc/secrets/my-real-assets-fcm.json` to its absolute
+server-side path. Alternatively use `MRA_FCM_SERVICE_ACCOUNT_B64` or
+`MRA_FCM_SERVICE_ACCOUNT_JSON` for the server-only credential. The file setting
+takes precedence and an invalid or unreadable file disables the sender rather
+than falling back to another credential. The existing Google sign-in
+Firebase credential may target a different project and is not reused. Grant the
+service account the Firebase Cloud Messaging permissions; never bundle the key in
+the app. Restart the Bookings service after configuring these values. Verify the
+super-admin-only `GET /mobile-notifications/status`: `schemaReady`, `enabled`, and
+`firebaseConfigured` must all be true and `workerMode` must be `in-process`.
+The counts contain no device identifiers. `failedDeliveries` counts entries
+that exhausted eight attempts. The worker processes up to 100 queued events and
+100 deliveries per polling cycle; sustained volume requires monitoring and
+potentially a dedicated worker. Old events are removed after 30 days.
+
+Authenticated `POST /api/mobile/device-tokens` accepts `{token,platform}` and
+`DELETE /api/mobile/device-tokens` accepts `{token}`. Registrations are tied to
+account and credential version rather than the one-day access token lifetime;
+sign-out/password changes invalidate old versions. Ownership, active account,
+verified identity, and current posted status are checked again before delivery.
+Notifications contain no amounts, names, or property identifiers. The app can
+open the relevant activity view after a tap. FCM does not guarantee delivery;
+invalid device tokens are removed. Retries are bounded, and a crash after FCM
+accepts a message but before the database records success may cause a duplicate.
+
+The in-process worker polls every minute while Bookings is running and queues
+one reminder at three days before and on the due date in Asia/Kolkata, only while
+an installment remains unpaid. If hosting sleeps or is offline, notifications
+are delayed; an always-on Bookings instance is required for reliable reminders.
+The worker skips stale events and does not replay reminders missed while offline.
+The free host must not be treated as an accurate scheduler. No customer data is
+sent in the push text; opening the app requires the normal session.

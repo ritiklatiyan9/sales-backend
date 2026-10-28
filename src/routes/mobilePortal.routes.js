@@ -4,6 +4,7 @@ import { gzip } from 'node:zlib';
 import express from 'express';
 import pool from '../config/db.js';
 import { createMobilePortalService, normalizeMobile, CLIENT_MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
+import { createMobilePushDevices } from '../services/mobilePush.service.js';
 
 const gzipAsync = promisify(gzip);
 export async function sendPortfolioJson(req, res, payload) {
@@ -60,6 +61,9 @@ export function createMobileLoginLimiter(options = {}) {
 export function createMobilePasswordLimiter(options = {}) {
   return credentialLimiter(req => `account:${req.mobileSession.accountId}`, options);
 }
+export function createMobilePushLimiter(options = {}) {
+  return credentialLimiter(req => `push:${req.mobileSession.accountId}`, options);
+}
 
 export function mobilePortalEnabled(env = process.env) {
   return env.MOBILE_PORTAL_ENABLED === 'true';
@@ -67,6 +71,7 @@ export function mobilePortalEnabled(env = process.env) {
 
 export function createMobilePortalRouter(service, {
   loginLimiter = createMobileLoginLimiter(), passwordLimiter = createMobilePasswordLimiter(), isEnabled = () => mobilePortalEnabled(),
+  pushDevices = createMobilePushDevices(pool), pushLimiter = createMobilePushLimiter(),
 } = {}) {
   const router = express.Router();
   const run = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(error => {
@@ -102,6 +107,8 @@ export function createMobilePortalRouter(service, {
   }));
   router.post('/auth/logout', run(async (req, res) => { await service.logout(req.mobileSession); res.json({ ok: true }); }));
   router.post('/auth/password', passwordLimiter, run(async (req, res) => { await service.changePassword(req.mobileSession, req.body); res.json({ ok: true }); }));
+  router.post('/device-tokens', pushLimiter, run(async (req, res) => { await pushDevices.register(req.mobileSession, req.body); res.json({ ok: true }); }));
+  router.delete('/device-tokens', pushLimiter, run(async (req, res) => { await pushDevices.unregister(req.mobileSession, req.body); res.json({ ok: true }); }));
   router.get('/me', (req, res) => res.json({ user: req.mobileSession.user }));
   const forceFresh = req => /(?:^|,)\s*(?:no-cache|no-store|max-age=0)\s*(?:,|$)/i.test(req.get('Cache-Control') || '');
   router.get('/plots', run(async (req, res) => sendPortfolioJson(req, res, await service.portfolio(req.mobileSession, {

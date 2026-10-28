@@ -6,6 +6,7 @@ import { initSocket } from './config/socket.js';
 import { recoverOcrQueue } from './queue/ocrQueue.js';
 import { validateProductionSecurity } from './security/production.js';
 import { startWhatsAppWorker } from './services/whatsapp.service.js';
+import { startMobilePushWorker } from './services/mobilePush.service.js';
 
 validateProductionSecurity();
 
@@ -19,6 +20,7 @@ async function start() {
     await connectDB();
     await recoverOcrQueue(pool);
     startWhatsAppWorker();
+    startMobilePushWorker(pool);
     server.listen(PORT, () => console.log(`[booking-api] running on port ${PORT}`));
   } catch (err) {
     console.error('[booking-api] Failed to connect to DB:', err.code || 'CONNECTION_ERROR');
