@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { allocateInstallmentPayments } from './mobileInstallmentAllocation.service.js';
-import { createClientPortalService, verifyClientToken } from './clientPortal.service.js';
+import { createClientPortalService } from './clientPortal.service.js';
 
 const ISSUER = 'my-real-assets-bookings';
 const AUDIENCE = 'my-real-assets-client';
@@ -288,16 +288,10 @@ export function createMobilePortalService(db, options = {}) {
       if (!mobile || typeof password !== 'string' || !password || Buffer.byteLength(password, 'utf8') > 72) {
         fail(401, 'Mobile number or password did not match.');
       }
-      let match = await clientPortal.authenticate(mobile, password, { dryRun: true });
-      if (!match) fail(401, 'Mobile number or password did not match.');
-      if (!match.account) {
-        // Existing verified-KYC enrollment creates the private account; this
-        // is restricted to first-time identity credentials and carries a risk
-        // of account takeover if someone knows both identifiers.
-        const enrolled = await clientPortal.authenticate(mobile, password);
-        if (!enrolled?.accessToken) fail(401, 'Mobile number or password did not match.');
-        match = await clientPortal.getSession(verifyClientToken(enrolled.accessToken));
-      }
+      // The office provisions accounts. A verified identity alone must never
+      // create an account through the mobile sign-in endpoint.
+      const match = await clientPortal.authenticate(mobile, password, { dryRun: true });
+      if (!match?.account) fail(401, 'Mobile number or password did not match.');
       const setup = !match.account.password_changed;
       if (!setup && match.members.some(row => String(row.aadhar_no || '').replace(/[\s-]/g, '') === password.replace(/[\s-]/g, ''))) {
         fail(401, 'Mobile number or password did not match.');

@@ -236,7 +236,7 @@ test('password changes require the current secret and revoke all existing client
   await assert.rejects(service.getSession(last.token), { statusCode: 401 });
 });
 
-test('first Aadhaar login creates a verified account with setup-only access', async t => {
+test('first sign-in cannot create an account even for verified identities', async t => {
   const previousMobile = process.env.MOBILE_PORTAL_SECRET;
   const previousClient = process.env.CLIENT_PORTAL_SECRET;
   process.env.MOBILE_PORTAL_SECRET = 'synthetic-test-only-mobile-portal-secret-32';
@@ -252,19 +252,9 @@ test('first Aadhaar login creates a verified account with setup-only access', as
   const service = createMobilePortalService({ query, connect: async () => ({ query, release() {} }) });
   await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
   await db.exec("UPDATE kyc_cases SET status='VERIFIED' WHERE id IN (1,2)");
-  const initial = await service.login({ ...credentials, password: aadhaar });
-  assert.equal(initial.passwordChangeRequired, true);
-  assert.equal(initial.sessionDurationDays, null);
-  assert.equal(jwt.decode(initial.token).exp - jwt.decode(initial.token).iat, 600);
-  const setup = await service.getSession(initial.token);
-  assert.equal(setup.setupRequired, true);
-  await assert.rejects(service.portfolio(setup), { statusCode: 403 });
-  await service.changePassword(setup, { currentPassword: aadhaar, newPassword: 'Distinct-chosen-password' });
-  await assert.rejects(service.getSession(initial.token), { statusCode: 401 });
   await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
-  const chosen = await service.login({ ...credentials, password: 'Distinct-chosen-password' });
-  assert.equal(chosen.passwordChangeRequired, false);
-  assert.deepEqual((await service.portfolio(await service.getSession(chosen.token))).plots.map(row => row.id), ['1', '2']);
+  assert.equal(Number((await db.query('SELECT count(*) AS n FROM booking_client_accounts')).rows[0].n), 0);
+  assert.equal(Number((await db.query('SELECT count(*) AS n FROM booking_client_members')).rows[0].n), 0);
 });
 
 test('password change limiter isolates account attempts and eventually expires', () => {
