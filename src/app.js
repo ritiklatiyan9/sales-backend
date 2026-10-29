@@ -43,6 +43,9 @@ if (process.env.NODE_ENV !== 'production') {
   app.use('/uploads', express.static(path.join(process.cwd(), 'src', 'uploads'), { dotfiles: 'deny', index: false }));
 }
 
+// Public app privacy page, available without a customer session.
+app.use('/my-real-assets', express.static(path.join(process.cwd(), 'public', 'my-real-assets'), { dotfiles: 'deny', index: false }));
+
 // API routes
 app.use('/', indexRoutes);
 
