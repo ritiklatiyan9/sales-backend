@@ -27,6 +27,12 @@ const corsOptions = {
   exposedHeaders: ['Retry-After'], // the client honours a 429's wait instead of retrying blind
   maxAge: 7200,
 };
+// The Accounts client screen can provision access, but only this endpoint
+// accepts its browser origin; every request still needs staff authentication.
+app.use('/api/mobile/admin/accounts', cors({
+  origin: (origin, callback) => callback(null, origin === 'https://dgdefence.com' || origin === 'https://www.dgdefence.com'),
+  methods: ['POST'], allowedHeaders: ['Authorization', 'Content-Type'], maxAge: 600,
+}));
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 

@@ -5,6 +5,8 @@ import express from 'express';
 import pool from '../config/db.js';
 import { createMobilePortalService, normalizeMobile, CLIENT_MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
 import { createMobilePushDevices } from '../services/mobilePush.service.js';
+import staffAuthMiddleware from '../middlewares/auth.middleware.js';
+import { createMobileAccountProvisioner } from '../services/mobileAccountProvision.service.js';
 
 const gzipAsync = promisify(gzip);
 export async function sendPortfolioJson(req, res, payload) {
@@ -72,14 +74,21 @@ export function mobilePortalEnabled(env = process.env) {
 export function createMobilePortalRouter(service, {
   loginLimiter = createMobileLoginLimiter(), passwordLimiter = createMobilePasswordLimiter(), isEnabled = () => mobilePortalEnabled(),
   pushDevices = createMobilePushDevices(pool), pushLimiter = createMobilePushLimiter(),
+  staffAuth = staffAuthMiddleware, accountProvisioner = createMobileAccountProvisioner(pool),
 } = {}) {
   const router = express.Router();
   const run = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(error => {
-    const status = [400, 401, 403, 404, 429, 503].includes(error.statusCode) ? error.statusCode : 503;
+    const status = [400, 401, 403, 404, 409, 429, 503].includes(error.statusCode) ? error.statusCode : 503;
     // Never send SQL, identity fields, credentials or signing failures.
     res.status(status).json({ message: status === 503 ? 'The service is temporarily unavailable. Please try again.' : error.message });
   });
   router.use((_req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
+  // Office-only account provisioning. Never return the Aadhaar or password hash.
+  router.post('/admin/accounts', staffAuth, run(async (req, res) => {
+    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can create app access.' });
+    const result = await accountProvisioner.provision({ memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actorId: Number(req.user.id), actorVersion: req.user.version });
+    return res.json(result);
+  }));
   router.get('/status', (_req, res) => res.json({
     service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()), sessionDurationDays: CLIENT_MOBILE_SESSION_DAYS,
     authMode: 'client-password-v1',
