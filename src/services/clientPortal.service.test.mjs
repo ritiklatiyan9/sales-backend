@@ -7,7 +7,7 @@ import pool from '../config/db.js';
 import { migrateStaffIdentity } from '../migrations/029_staff_identity.js';
 import { migrateKycLoginIdentity } from '../migrations/032_kyc_login_identity.js';
 import { migrateClientPortal } from '../migrations/033_client_portal.js';
-import { createClientPortalService, verifyClientToken, clientPortalSession } from './clientPortal.service.js';
+import { createClientPortalService, verifyClientToken, clientPortalSession, clientIdentityKey } from './clientPortal.service.js';
 
 process.env.JWT_ACCESS_SECRET = 'isolated-shared-access-secret';
 process.env.JWT_REFRESH_SECRET = 'isolated-shared-refresh-secret';
@@ -92,9 +92,13 @@ test('client portal credentials and records remain isolated from every staff and
         for (const identifier of ['staff@example.test','9876500000']) assert.equal((await call(login,{body:{identifier,password:'Admin-password-1'}})).status,200);
       } finally { process.env.CLIENT_PORTAL_ENABLED='true'; }
     });
-    await t.test('first phone+Aadhaar sign-in provisions only separate private account and exact same-person sites',async () => {
+    await t.test('Aadhaar cannot enroll an account; existing password accounts remain isolated',async () => {
       const staffBefore=(await query('SELECT count(*)::int AS n FROM users')).rows[0].n;
-      clientLogin=await call(login,{body:{identifier:'+91 98765 11111',password:'2345-6789-0123'}});
+      assert.equal((await call(login,{body:{identifier:'+91 98765 11111',password:'2345-6789-0123'}})).status,401);
+      assert.equal((await query('SELECT count(*)::int AS n FROM booking_client_accounts')).rows[0].n,0);
+      await query(`INSERT INTO booking_client_accounts(phone,identity_key,password_hash,aadhaar_last4,password_changed) VALUES($1,$2,$3,$4,true)`,['9876511111',clientIdentityKey('234567890123'),await bcrypt.hash('Initial-client-password',4),'0123']);
+      await query('INSERT INTO booking_client_members(account_id,member_id) VALUES(1,4591),(1,4592)');
+      clientLogin=await call(login,{body:{identifier:'+91 98765 11111',password:'Initial-client-password'}});
       assert.equal(clientLogin.status,200,JSON.stringify(clientLogin.data));
       assert.equal(clientLogin.data.realm,'client');
       assert.equal(clientLogin.data.user.role,'client');
@@ -139,8 +143,11 @@ test('client portal credentials and records remain isolated from every staff and
       assert.equal(later.bookings.total,2);
       assert.equal(later.bookings.items.length,0);
     });
-    await t.test('shared mobile resolves exact Aadhaar; unverified, non-client and wrong identities cannot sign in',async () => {
-      const other=await service.authenticate('9876511111','345678901234');
+    await t.test('shared phone accounts remain separate and Aadhaar cannot enroll',async () => {
+      assert.equal(await service.authenticate('9876511111','345678901234'),null);
+      await query(`INSERT INTO booking_client_accounts(phone,identity_key,password_hash,aadhaar_last4,password_changed) VALUES($1,$2,$3,$4,true)`,['9876511111',clientIdentityKey('345678901234'),await bcrypt.hash('Other-client-password',4),'1234']);
+      await query('INSERT INTO booking_client_members(account_id,member_id) VALUES(2,4593)');
+      const other=await service.authenticate('9876511111','Other-client-password');
       assert.equal(other.user.name,'Other Client');
       assert.notEqual(other.user.id,clientLogin.data.user.id);
       assert.equal(await service.authenticate('9876511111','999999999999'),null);
@@ -152,7 +159,8 @@ test('client portal credentials and records remain isolated from every staff and
       const collisionHash=await bcrypt.hash('789012345678',4);
       await query('UPDATE users SET password=$1 WHERE id=1',[collisionHash]);
       const result=await call(login,{body:{identifier:'9876500000',password:'789012345678'}});
-      assert.equal(result.status,401);
+      assert.equal(result.status,200);
+      assert.notEqual(result.data.realm,'client');
       assert.equal((await query("SELECT count(*)::int AS n FROM booking_client_accounts WHERE phone='9876500000'")).rows[0].n,0);
       assert.equal((await call(login,{body:{identifier:'staff@example.test',password:'789012345678'}})).status,200);
     });
@@ -160,7 +168,10 @@ test('client portal credentials and records remain isolated from every staff and
       const session=await service.getSession(verifyClientToken(clientLogin.data.accessToken));
       await assert.rejects(service.updateProfile(session,{role:'admin'}),/Only your password/);
       await assert.rejects(service.updateProfile(session,{current_password:'wrong',new_password:'New-password-2'}),/current password/);
-      const changed=await service.updateProfile(session,{current_password:'234567890123',new_password:'New-password-2'});
+      await assert.rejects(service.updateProfile(session,{current_password:'Initial-client-password',new_password:'Other-client-password'}),/Choose a different password/);
+      assert.ok(await service.authenticate('9876511111','Initial-client-password'));
+      assert.ok(await service.authenticate('9876511111','Other-client-password'));
+      const changed=await service.updateProfile(session,{current_password:'Initial-client-password',new_password:'New-password-2'});
       assert.equal(changed.user.phone_aadhaar_enabled,false);
       await assert.rejects(service.getSession(verifyClientToken(clientLogin.data.accessToken)),/Session expired/);
       await assert.rejects(service.refresh(clientLogin.data.refreshToken),/Session expired/);
@@ -182,7 +193,7 @@ test('client portal credentials and records remain isolated from every staff and
       await assert.rejects(service.getSession(verifyClientToken(current.accessToken)),/Session expired/);
       assert.equal(await service.authenticate('9876511111','New-password-2'),null);
       const countBefore=(await query('SELECT count(*)::int AS n FROM booking_client_accounts')).rows[0].n;
-      const other=await service.authenticate('9876511111','345678901234');
+      const other=await service.authenticate('9876511111','Other-client-password');
       assert.equal(other.user.name,'Other Client');
       assert.deepEqual((await service.getSession(verifyClientToken(other.accessToken))).members.map(member=>member.member_id),[4593]);
       assert.equal((await query('SELECT count(*)::int AS n FROM booking_client_accounts')).rows[0].n,countBefore);

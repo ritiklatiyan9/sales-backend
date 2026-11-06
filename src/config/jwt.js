@@ -1,7 +1,8 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
 
-// Same secrets + token shape as the accounting backend → tokens are interchangeable.
+// Shared signing keys support Booking's Account; each backend enforces the app
+// claim and current per-app database permissions before accepting a session.
 const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 

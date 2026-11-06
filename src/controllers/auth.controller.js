@@ -14,15 +14,16 @@ import { createStaffIdentityService, matchesStaffPassword, normalizeLoginIdentif
 import { clientPortal } from './clientPortal.controller.js';
 import { clientPortalEnabled } from '../services/clientPortalAvailability.js';
 import { myModulePermissions } from './admin.controller.js';
+import { canSignInToBooking, isBookingToken } from '../services/bookingAppAccess.js';
 
 const googleClient = new OAuth2Client();
 const staffIdentity = createStaffIdentityService(pool);
 
-/** Mint the shared-shape token pair for an authenticated user (same as password login). */
+/** Mint a Booking session; the Accounts API admits it only to Booking's Account. */
 const issueTokens = async (user) => {
   const version = user.token_version;
-  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version });
-  const refreshToken = signRefreshToken({ id: user.id, version });
+  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version, app: 'booking' });
+  const refreshToken = signRefreshToken({ id: user.id, version, app: 'booking' });
   await userModel.setRefreshToken(user.id, await hashRefreshToken(refreshToken));
   return { accessToken, refreshToken };
 };
@@ -44,17 +45,17 @@ const maskEmail = (email) => {
 /**
  * Second sign-in step: park the login as a pending challenge and email a 6-digit
  * code. No JWTs leave the server until /auth/verify-otp succeeds. One active
- * challenge per user (a fresh login supersedes the previous one).
+ * Booking challenge per user, without invalidating a separate Accounts login.
  */
 const startOtpChallenge = async (user, res) => {
   const otp = String(crypto.randomInt(100000, 1000000));
   const pendingToken = crypto.randomBytes(24).toString('hex');
   const otpHash = await bcrypt.hash(otp, 10);
 
-  await pool.query('DELETE FROM login_otps WHERE user_id = $1', [user.id]);
+  await pool.query("DELETE FROM login_otps WHERE user_id = $1 AND app_context = 'booking'", [user.id]);
   await pool.query(
-    `INSERT INTO login_otps (user_id, pending_token, otp_hash, expires_at)
-     VALUES ($1, $2, $3, now() + ($4 || ' minutes')::interval)`,
+    `INSERT INTO login_otps (user_id, pending_token, otp_hash, expires_at, app_context)
+     VALUES ($1, $2, $3, now() + ($4 || ' minutes')::interval, 'booking')`,
     [user.id, pendingToken, otpHash, OTP_TTL_MINUTES]
   );
 
@@ -78,13 +79,13 @@ const startOtpChallenge = async (user, res) => {
 /** An enabled second factor fails closed when its mail transport is unavailable. */
 const needsOtp = (user) => LOGIN_OTP_ENABLED && isAdminRole(user.role);
 
-// Per-app switch from Accounts' User ID Management (users.can_login_booking).
-const BOOKING_LOGIN_DENIED = 'This ID is not allowed to sign in to Defence Garden Booking. Contact your admin.';
+// Both switches are managed centrally in Accounts' User ID Management.
+const BOOKING_LOGIN_DENIED = 'This ID is not allowed to sign in to Booking or Booking\'s Account. Contact your admin.';
 
 /**
  * POST /auth/login
- * Authenticates against the SHARED accounting `users` table and mints the same JWT
- * shape — so a token works on both the booking-api and the accounting backend.
+ * Authenticates against the shared users table. Accountancy-only IDs can sign in
+ * here and are redirected by the frontend; Booking business APIs remain closed.
  */
 export const login = asyncHandler(async (req, res) => {
   const { password } = req.body;
@@ -112,7 +113,7 @@ export const login = asyncHandler(async (req, res) => {
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
-  if (user.can_login_booking === false) {
+  if (!canSignInToBooking(user)) {
     return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
   }
 
@@ -140,7 +141,7 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
     [String(pending_token)]
   );
   const challenge = rows[0];
-  if (!challenge || challenge.consumed_at) {
+  if (!challenge || challenge.consumed_at || challenge.app_context !== 'booking') {
     return res.status(401).json({ message: 'This sign-in attempt is no longer valid. Please sign in again.' });
   }
   if (new Date(challenge.expires_at) < new Date()) {
@@ -173,7 +174,7 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
     await pool.query('DELETE FROM login_otps WHERE id = $1', [challenge.id]);
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
-  if (user.can_login_booking === false) {
+  if (!canSignInToBooking(user)) {
     await pool.query('DELETE FROM login_otps WHERE id = $1', [challenge.id]);
     return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
   }
@@ -197,7 +198,7 @@ export const resendLoginOtp = asyncHandler(async (req, res) => {
     [String(pending_token)]
   );
   const challenge = rows[0];
-  if (!challenge || challenge.consumed_at || new Date(challenge.expires_at) < new Date()) {
+  if (!challenge || challenge.consumed_at || challenge.app_context !== 'booking' || new Date(challenge.expires_at) < new Date()) {
     return res.status(401).json({ message: 'This sign-in attempt is no longer valid. Please sign in again.' });
   }
   const sinceLastSend = (Date.now() - new Date(challenge.last_sent_at).getTime()) / 1000;
@@ -209,6 +210,7 @@ export const resendLoginOtp = asyncHandler(async (req, res) => {
   if (!user || !user.is_active) {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
+  if (!canSignInToBooking(user)) return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
 
   const otp = String(crypto.randomInt(100000, 1000000));
   const otpHash = await bcrypt.hash(otp, 10);
@@ -291,7 +293,7 @@ export const googleLogin = asyncHandler(async (req, res) => {
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
-  if (user.can_login_booking === false) {
+  if (!canSignInToBooking(user)) {
     return res.status(403).json({ message: BOOKING_LOGIN_DENIED });
   }
 
@@ -325,15 +327,19 @@ export const refresh = asyncHandler(async (req, res) => {
   } catch {
     return res.status(401).json({ message: 'Invalid refresh token' });
   }
+  if (!isBookingToken(decoded) || !Number.isSafeInteger(decoded.id) || decoded.id <= 0
+      || !Number.isSafeInteger(decoded.version) || !Number.isFinite(decoded.exp)) {
+    return res.status(401).json({ message: 'Invalid refresh token' });
+  }
 
   const user = await userModel.findById(decoded.id);
-  if (!user || user.is_active === false || user.can_login_booking === false || user.token_version !== decoded.version) {
+  if (!user || user.is_active === false || !canSignInToBooking(user) || user.token_version !== decoded.version) {
     return res.status(401).json({ message: 'Invalid refresh token' });
   }
 
   const version = user.token_version;
-  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version });
-  const newRefreshToken = signRefreshToken({ id: user.id, version });
+  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version, app: 'booking' });
+  const newRefreshToken = signRefreshToken({ id: user.id, version, app: 'booking' });
 
   res.json({ accessToken, refreshToken: newRefreshToken });
 });

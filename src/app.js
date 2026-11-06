@@ -49,7 +49,8 @@ if (process.env.NODE_ENV !== 'production') {
   app.use('/uploads', express.static(path.join(process.cwd(), 'src', 'uploads'), { dotfiles: 'deny', index: false }));
 }
 
-// Public app privacy page, available without a customer session.
+// The My Real Assets privacy and deletion pages must be publicly readable,
+// including by app-store reviewers, without exposing the rest of the API.
 app.use('/my-real-assets', express.static(path.join(process.cwd(), 'public', 'my-real-assets'), { dotfiles: 'deny', index: false }));
 
 // API routes

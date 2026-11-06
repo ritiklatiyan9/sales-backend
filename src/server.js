@@ -7,6 +7,7 @@ import { recoverOcrQueue } from './queue/ocrQueue.js';
 import { validateProductionSecurity } from './security/production.js';
 import { startWhatsAppWorker } from './services/whatsapp.service.js';
 import { startMobilePushWorker } from './services/mobilePush.service.js';
+import { migrateBookingAccountsLoginAccess } from './migrations/047_booking_accounts_login_access.js';
 
 validateProductionSecurity();
 
@@ -18,6 +19,7 @@ initSocket(server);   // socket.io (OCR events emitted in-process; no Redis rela
 async function start() {
   try {
     await connectDB();
+    await migrateBookingAccountsLoginAccess(pool);
     await recoverOcrQueue(pool);
     startWhatsAppWorker();
     startMobilePushWorker(pool);

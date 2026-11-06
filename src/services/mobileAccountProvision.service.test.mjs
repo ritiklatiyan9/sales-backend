@@ -39,7 +39,8 @@ test('office provisioning binds only verified matching clients and never resets 
   assert.equal(await bcrypt.compare('234567890123', account.password_hash), true);
   assert.deepEqual((await query('SELECT member_id FROM booking_client_members ORDER BY member_id')).rows.map(x => x.member_id), [1,2]);
   const portal = createClientPortalService(db);
-  const match = await portal.authenticate('9876500001','234567890123',{dryRun:true});
+  assert.equal(await portal.authenticate('9876500001','234567890123',{dryRun:true}), null, 'initial credentials never authenticate the web portal');
+  const match = await portal.authenticate('9876500001','234567890123',{dryRun:true,allowPasswordSetup:true});
   assert.equal(match.account.id, account.id);
   await assert.rejects(service.provision({memberId:2, identityVerified:true,...actor}), {statusCode:409});
   assert.equal(Number((await query('SELECT count(*) AS n FROM booking_client_accounts')).rows[0].n), 1);

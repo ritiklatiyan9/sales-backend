@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { allocateInstallmentPayments } from './mobileInstallmentAllocation.service.js';
 import { createClientPortalService } from './clientPortal.service.js';
+import { createClientInvitationService } from './clientInvitation.service.js';
 
 const ISSUER = 'my-real-assets-bookings';
 const AUDIENCE = 'my-real-assets-client';
@@ -220,7 +221,7 @@ export function createMobilePortalService(db, options = {}) {
   const userFor = members => ({ id: `client:${members[0].id}`, name: members[0].full_name || 'Property owner', role: 'client' });
   async function getClientSession(accountId, version, { setup = false } = {}) {
     try {
-      const session = await clientPortal.getSession({ accountId, version });
+      const session = await clientPortal.getSession({ accountId, version }, db, { allowPasswordSetup: setup });
       if (session.account.password_changed === setup || !session.members.some(row => row.member_active !== false)) unauthorized();
       return session;
     }
@@ -288,9 +289,7 @@ export function createMobilePortalService(db, options = {}) {
       if (!mobile || typeof password !== 'string' || !password || Buffer.byteLength(password, 'utf8') > 72) {
         fail(401, 'Mobile number or password did not match.');
       }
-      // The office provisions accounts. A verified identity alone must never
-      // create an account through the mobile sign-in endpoint.
-      const match = await clientPortal.authenticate(mobile, password, { dryRun: true });
+      const match = await clientPortal.authenticate(mobile, password, { dryRun: true, allowPasswordSetup: true });
       if (!match?.account) fail(401, 'Mobile number or password did not match.');
       const setup = !match.account.password_changed;
       if (!setup && match.members.some(row => String(row.aadhar_no || '').replace(/[\s-]/g, '') === password.replace(/[\s-]/g, ''))) {
@@ -307,6 +306,10 @@ export function createMobilePortalService(db, options = {}) {
         passwordChangeRequired: setup,
         user: session.user,
       };
+    },
+    async activate(body) {
+      await createClientInvitationService(db).activate(body);
+      return this.login({ mobile: body.mobile, password: body.newPassword, role: 'client' });
     },
     async logout(session) {
       // This version is shared with the web portal: sign-out revokes all

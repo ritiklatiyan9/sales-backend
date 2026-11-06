@@ -8,7 +8,7 @@ import jwt from 'jsonwebtoken';
 process.env.JWT_ACCESS_SECRET = 'isolated-booking-access-key-for-security-tests';
 process.env.JWT_REFRESH_SECRET = 'isolated-booking-refresh-key-for-security-tests';
 const { currentStaffSession } = await import('../services/staffSession.js');
-const { verifyLoginOtp } = await import('../controllers/auth.controller.js');
+const { login, refresh, verifyLoginOtp } = await import('../controllers/auth.controller.js');
 const { default: pool } = await import('../config/db.js');
 const { default: userModel } = await import('../models/User.model.js');
 const { signAccessToken } = await import('../config/jwt.js');
@@ -20,6 +20,31 @@ test('sessions use the current database role, reject revoked/inactive accounts a
   for(const row of [{...user,is_active:false},{...user,can_login_booking:false},{...user,token_version:2},{...user,role:'client'}]) await assert.rejects(currentStaffSession(token,{query:async()=>({rows:[row]})}));
   const wrongAlgorithm=jwt.sign({id:2,version:1},process.env.JWT_ACCESS_SECRET,{algorithm:'HS384',expiresIn:'5m'});
   await assert.rejects(currentStaffSession(wrongAlgorithm,{query:async()=>({rows:[user]})}));
+});
+test('Accounts access can be off while Booking login, session and refresh remain available', async () => {
+  const password = 'booking-password';
+  let current = { ...user, role: 'sub_admin', password: await bcrypt.hash(password, 4), can_login_accounts: false, can_login_booking: true };
+  const original = { findByLoginIdentifier: userModel.findByLoginIdentifier, findById: userModel.findById, setRefreshToken: userModel.setRefreshToken };
+  userModel.findByLoginIdentifier = async () => current;
+  userModel.findById = async () => current;
+  userModel.setRefreshToken = async () => {};
+  const request = (handler, body) => new Promise(resolve => {
+    const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(data) { resolve({ status: this.statusCode, data }); return this; } };
+    handler({ body }, res, error => resolve({ status: error.status || 500, data: { message: error.message } }));
+  });
+  try {
+    const signedIn = await request(login, { identifier: current.email, password });
+    assert.equal(signedIn.status, 200);
+    assert.ok(signedIn.data.accessToken && signedIn.data.refreshToken);
+    assert.equal((await currentStaffSession(signedIn.data.accessToken, { query: async () => ({ rows: [current] }) })).id, current.id);
+    assert.equal((await request(refresh, { refreshToken: signedIn.data.refreshToken })).status, 200);
+    current = { ...current, can_login_booking: false };
+    assert.equal((await request(login, { identifier: current.email, password })).status, 403);
+    assert.equal((await request(refresh, { refreshToken: signedIn.data.refreshToken })).status, 401);
+    await assert.rejects(currentStaffSession(signedIn.data.accessToken, { query: async () => ({ rows: [current] }) }));
+  } finally {
+    Object.assign(userModel, original);
+  }
 });
 test('sessions carry a per-request booking grants snapshot that hasPermission reads with unchanged semantics', async () => {
   const { hasPermission } = await import('../services/permissions.service.js');
@@ -89,8 +114,9 @@ test('GET /auth/me carries exactly the GET /admin/my-permissions payload', async
     const expected = { is_admin: false, permissions: {
       booking_clients: { can_read: true, can_write: true, can_update: true, can_delete: true },
       booking_item_draws_new: { can_read: false, can_write: false, can_update: false, can_delete: false } } };
-    assert.deepEqual(me.data.module_permissions, expected);
-    assert.deepEqual((await reply(getMyPermissions, session)).data, expected, 'snapshot path');
+    const appFlags = { can_login_booking: true, can_login_booking_accounts: false };
+    assert.deepEqual(me.data.module_permissions, { ...expected, ...appFlags });
+    assert.deepEqual((await reply(getMyPermissions, session)).data, { ...expected, ...appFlags }, 'snapshot path');
     assert.deepEqual((await reply(getMyPermissions, { id: 2, role: 'sub_admin' })).data, expected, 'query path');
     assert.equal((await reply(getMe, { id: 9, role: 'sub_admin', grants: {} })).status, 404);
   } finally { pool.query = savedQuery; await db.close(); }
@@ -107,7 +133,7 @@ test('OTP parallel guesses are capped and a correct code can only mint one sessi
   userModel.findById=async()=>user;
   userModel.setRefreshToken=async()=>{issued++;};
   try {
-    await db.exec('CREATE TABLE login_otps (id SERIAL PRIMARY KEY,user_id INTEGER,pending_token TEXT,otp_hash TEXT,attempts INTEGER DEFAULT 0,expires_at TIMESTAMPTZ,consumed_at TIMESTAMPTZ,last_sent_at TIMESTAMPTZ DEFAULT now())');
+    await db.exec("CREATE TABLE login_otps (id SERIAL PRIMARY KEY,user_id INTEGER,pending_token TEXT,otp_hash TEXT,attempts INTEGER DEFAULT 0,expires_at TIMESTAMPTZ,consumed_at TIMESTAMPTZ,last_sent_at TIMESTAMPTZ DEFAULT now(),app_context TEXT DEFAULT 'booking')");
     const pending='a'.repeat(48),hash=await bcrypt.hash('123456',4);
     const add=()=>db.query("INSERT INTO login_otps(user_id,pending_token,otp_hash,expires_at) VALUES(2,$1,$2,now()+interval '5 minutes')",[pending,hash]);
     await add();

@@ -1,5 +1,10 @@
 # Neutral broker-only gateway
 
+For a dedicated domain deployment, prefer the direct broker-only entry point
+`npm run start:broker-only`; see `MY_REAL_PARTNERS_DOMAIN_SETUP.md`. It reuses
+Bookings services without the gateway hop or its aggregate upstream IP budget.
+The gateway below remains an optional alternative, not the installed app target.
+
 Run a separate service with `node src/brokerGateway.server.js`. It imports only
 Node built-ins and requires Node 22 or newer. Its only upstream is the configured
 `BROKER_UPSTREAM_ORIGIN` HTTPS origin (defaults to the existing Bookings server).

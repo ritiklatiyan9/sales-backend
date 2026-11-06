@@ -163,7 +163,10 @@ export async function myModulePermissions(user, db = pool) {
       can_read: p.can_read, can_write: p.can_write, can_update: p.can_update, can_delete: p.can_delete,
     };
   }
-  return { is_admin: isFullAdmin(user), permissions };
+  return { is_admin: isFullAdmin(user), permissions,
+    ...(typeof user.can_login_booking === 'boolean' ? { can_login_booking: user.can_login_booking } : {}),
+    ...(typeof user.can_login_booking_accounts === 'boolean' ? { can_login_booking_accounts: user.can_login_booking_accounts } : {}),
+  };
 }
 
 /**

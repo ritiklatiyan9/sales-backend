@@ -7,6 +7,7 @@ import { createMobilePortalService, normalizeMobile, CLIENT_MOBILE_SESSION_DAYS 
 import { createMobilePushDevices } from '../services/mobilePush.service.js';
 import staffAuthMiddleware from '../middlewares/auth.middleware.js';
 import { createMobileAccountProvisioner } from '../services/mobileAccountProvision.service.js';
+import { createClientInvitationService } from '../services/clientInvitation.service.js';
 
 const gzipAsync = promisify(gzip);
 export async function sendPortfolioJson(req, res, payload) {
@@ -75,6 +76,7 @@ export function createMobilePortalRouter(service, {
   loginLimiter = createMobileLoginLimiter(), passwordLimiter = createMobilePasswordLimiter(), isEnabled = () => mobilePortalEnabled(),
   pushDevices = createMobilePushDevices(pool), pushLimiter = createMobilePushLimiter(),
   staffAuth = staffAuthMiddleware, accountProvisioner = createMobileAccountProvisioner(pool),
+  invitationService = createClientInvitationService(pool),
 } = {}) {
   const router = express.Router();
   const run = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(error => {
@@ -89,6 +91,13 @@ export function createMobilePortalRouter(service, {
     const result = await accountProvisioner.provision({ memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actorId: Number(req.user.id), actorVersion: req.user.version });
     return res.json(result);
   }));
+  // Only a super-admin may issue a code, after confirming the customer in person.
+  router.post('/admin/invitations', staffAuth, run(async (req, res) => {
+    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator may issue invitations.' });
+    const memberId = Number(req.body?.memberId);
+    const issuedBy = Number(req.user.id);
+    return res.json(await invitationService.issue({ memberId, issuedBy, identityVerified: req.body?.identityVerified }));
+  }));
   router.get('/status', (_req, res) => res.json({
     service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()), sessionDurationDays: CLIENT_MOBILE_SESSION_DAYS,
     authMode: 'client-password-v1',
@@ -102,6 +111,7 @@ export function createMobilePortalRouter(service, {
     next();
   });
   router.get('/health', (_req, res) => res.json({ status: 'ok', service: 'my-real-assets', backend: 'bookings' }));
+  router.post('/auth/activate', loginLimiter, run(async (req, res) => res.json(await service.activate(req.body))));
   router.post('/auth/login', loginLimiter, run(async (req, res) => res.json(await service.login(req.body))));
   router.use(run(async (req, res, next) => {
     const authorization = req.get('Authorization');

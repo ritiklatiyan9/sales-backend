@@ -8,6 +8,8 @@ import { gunzipSync } from 'node:zlib';
 import { PGlite } from '@electric-sql/pglite';
 import { createMobilePortalService, normalizeMobile, projectMobilePlot } from './mobilePortal.service.js';
 import { clientIdentityKey } from './clientPortal.service.js';
+import { createClientInvitationService } from './clientInvitation.service.js';
+import { migrateClientInvitations } from '../migrations/046_client_invitations.js';
 import { createMobilePortalRouter as createRouter, createMobileLoginLimiter, createMobilePasswordLimiter, mobilePortalEnabled } from '../routes/mobilePortal.routes.js';
 import { postingPolicySql } from '../test/mobilePostingPolicy.fixture.mjs';
 
@@ -19,6 +21,7 @@ const aadhaar = '234567890123';
 process.env.CLIENT_PORTAL_IDENTITY_SECRET = 'isolated-stable-client-identity-secret';
 const fixture = async () => {
   const db = new PGlite();
+  db.connect = async () => ({ query: (...args) => db.query(...args), release() {} });
   await db.exec(`
     CREATE TABLE sites(id integer PRIMARY KEY,name text,code text);
     CREATE TABLE members(id integer PRIMARY KEY,site_id integer,full_name text,phone text,aadhar_no text,member_type text,member_types text[],is_active boolean DEFAULT true,email text,pan_no text);
@@ -236,25 +239,25 @@ test('password changes require the current secret and revoke all existing client
   await assert.rejects(service.getSession(last.token), { statusCode: 401 });
 });
 
-test('first sign-in cannot create an account even for verified identities', async t => {
+test('first access requires an office invitation and a chosen password', async t => {
   const previousMobile = process.env.MOBILE_PORTAL_SECRET;
-  const previousClient = process.env.CLIENT_PORTAL_SECRET;
   process.env.MOBILE_PORTAL_SECRET = 'synthetic-test-only-mobile-portal-secret-32';
-  process.env.CLIENT_PORTAL_SECRET = 'synthetic-test-only-client-portal-secret-32';
-  const db = await fixture();
-  t.after(async () => {
-    await db.close();
-    if (previousMobile === undefined) delete process.env.MOBILE_PORTAL_SECRET; else process.env.MOBILE_PORTAL_SECRET = previousMobile;
-    if (previousClient === undefined) delete process.env.CLIENT_PORTAL_SECRET; else process.env.CLIENT_PORTAL_SECRET = previousClient;
-  });
-  await db.exec("DELETE FROM booking_client_members; DELETE FROM booking_client_accounts; UPDATE kyc_cases SET status='OPEN' WHERE id IN (1,2)");
-  const query = (sql, values) => db.query(sql, values);
-  const service = createMobilePortalService({ query, connect: async () => ({ query, release() {} }) });
+  const raw = await fixture();
+  t.after(async () => { await raw.close(); if (previousMobile === undefined) delete process.env.MOBILE_PORTAL_SECRET; else process.env.MOBILE_PORTAL_SECRET = previousMobile; });
+  await raw.exec('DELETE FROM booking_client_members; DELETE FROM booking_client_accounts;');
+  const query = (sql, values) => raw.query(sql, values);
+  const db = { query, connect: async () => ({ query, release() {} }) };
+  await migrateClientInvitations(db);
+  const service = createMobilePortalService(db);
   await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
-  await db.exec("UPDATE kyc_cases SET status='VERIFIED' WHERE id IN (1,2)");
+  const invite = await createClientInvitationService(db).issue({ memberId:1, issuedBy:1, identityVerified:true });
+  const initial = await service.activate({ mobile:credentials.mobile, code:invite.code, newPassword:'Distinct-chosen-password' });
+  assert.equal(initial.passwordChangeRequired, false);
+  assert.equal(initial.sessionDurationDays, 1);
+  await assert.rejects(service.activate({ mobile:credentials.mobile, code:invite.code, newPassword:'Distinct-chosen-password' }), { statusCode: 401 });
   await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
-  assert.equal(Number((await db.query('SELECT count(*) AS n FROM booking_client_accounts')).rows[0].n), 0);
-  assert.equal(Number((await db.query('SELECT count(*) AS n FROM booking_client_members')).rows[0].n), 0);
+  const chosen = await service.login({ ...credentials, password:'Distinct-chosen-password' });
+  assert.deepEqual((await service.portfolio(await service.getSession(chosen.token))).plots.map(row => row.id), ['1', '2']);
 });
 
 test('password change limiter isolates account attempts and eventually expires', () => {
@@ -501,4 +504,50 @@ test('production mobile access requires its own opt-in; public status does not e
   const health = await invoke('GET', '/health');
   assert.deepEqual(health.body, { status: 'ok', service: 'my-real-assets', backend: 'bookings' });
   assert.equal((await invoke('GET', '/plots')).status, 401);
+});
+
+test('only authenticated super administrators can issue invitations and activation is rate-limited', async () => {
+  let calls = 0;
+  let role = 'admin';
+  const service = { activate: async body => ({ activated: Boolean(body.code) }) };
+  const router = createMobilePortalRouter(service, {
+    staffAuth: (req,_res,next) => { req.user = { id: 5, role }; next(); },
+    invitationService: { issue: async body => { calls++; assert.equal(body.identityVerified,true); return { code:'one-time', expiresAt:'2026-01-01T00:00:00Z' }; } },
+  });
+  const invoke = (url, body) => new Promise((resolve,reject) => {
+    const req = { method:'POST', url, body, ip:'127.0.0.1', headers:{}, get(name) { return this.headers[name.toLowerCase()]; } };
+    const res = { statusCode:200, headers:{}, set(k,v) { this.headers[k]=v; return this; }, status(v) { this.statusCode=v; return this; }, json(v) { resolve({status:this.statusCode,body:v,headers:this.headers}); } };
+    router.handle(req,res,error => reject(error || new Error('No route matched')));
+  });
+  assert.equal((await invoke('/admin/invitations',{memberId:1,identityVerified:true})).status,403);
+  assert.equal(calls,0);
+  role = 'super_admin';
+  const issued = await invoke('/admin/invitations',{memberId:1,identityVerified:true});
+  assert.equal(issued.status,200);
+  assert.equal(issued.body.code,'one-time');
+  assert.equal(issued.headers['Cache-Control'],'private, no-store');
+  assert.equal(calls,1);
+  for (let i=0;i<10;i++) assert.equal((await invoke('/auth/activate',{mobile:'9876500001',code:'test'})).status,200);
+  assert.equal((await invoke('/auth/activate',{mobile:'9876500001',code:'test'})).status,429);
+});
+
+test('first sign-in cannot create an account even for verified identities', async t => {
+  const previousMobile = process.env.MOBILE_PORTAL_SECRET;
+  const previousClient = process.env.CLIENT_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET = 'synthetic-test-only-mobile-portal-secret-32';
+  process.env.CLIENT_PORTAL_SECRET = 'synthetic-test-only-client-portal-secret-32';
+  const db = await fixture();
+  t.after(async () => {
+    await db.close();
+    if (previousMobile === undefined) delete process.env.MOBILE_PORTAL_SECRET; else process.env.MOBILE_PORTAL_SECRET = previousMobile;
+    if (previousClient === undefined) delete process.env.CLIENT_PORTAL_SECRET; else process.env.CLIENT_PORTAL_SECRET = previousClient;
+  });
+  await db.exec("DELETE FROM booking_client_members; DELETE FROM booking_client_accounts; UPDATE kyc_cases SET status='OPEN' WHERE id IN (1,2)");
+  const query = (sql, values) => db.query(sql, values);
+  const service = createMobilePortalService({ query, connect: async () => ({ query, release() {} }) });
+  await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
+  await db.exec("UPDATE kyc_cases SET status='VERIFIED' WHERE id IN (1,2)");
+  await assert.rejects(service.login({ ...credentials, password: aadhaar }), { statusCode: 401 });
+  assert.equal(Number((await db.query('SELECT count(*) AS n FROM booking_client_accounts')).rows[0].n), 0);
+  assert.equal(Number((await db.query('SELECT count(*) AS n FROM booking_client_members')).rows[0].n), 0);
 });

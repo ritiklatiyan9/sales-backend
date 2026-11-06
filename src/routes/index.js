@@ -3,6 +3,7 @@ import authRoutes from './auth.routes.js';
 import clientPortalRoutes from './clientPortal.routes.js';
 import mobilePortalRoutes from './mobilePortal.routes.js';
 import mobileNotificationsRoutes from './mobileNotifications.routes.js';
+import mobileAccountDeletionRoutes from './mobileAccountDeletion.routes.js';
 import brokerMobileRoutes from './brokerMobile.routes.js';
 import bookingRoutes from './booking.routes.js';
 import lookupRoutes from './lookups.routes.js';
@@ -35,6 +36,7 @@ router.get('/health', (req, res) => res.json({ status: 'ok', service: 'booking-a
 router.use('/api/mobile', mobilePortalRoutes);
 router.use('/api/broker-mobile', brokerMobileRoutes);
 router.use('/mobile-notifications', mobileNotificationsRoutes);
+router.use('/mobile-account-deletion', mobileAccountDeletionRoutes);
 
 // PUBLIC (no auth) — resolves a printed QR against the live row so anyone scanning
 // the form/slip can confirm it is genuine on the website.

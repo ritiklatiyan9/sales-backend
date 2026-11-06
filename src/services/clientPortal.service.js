@@ -3,6 +3,7 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { normalizeStaffPhone } from './staffIdentity.service.js';
 import { memberPhoneSql } from './clientRegistry.service.js';
+import { lockClientPasswordPhone, passwordUsedByAnotherAccount } from './clientPasswordUniqueness.js';
 
 const ISSUER = 'booking-client-portal';
 const AUDIENCE = 'booking-client-portal';
@@ -73,15 +74,15 @@ export function createClientPortalService(db) {
     return result.rows.filter(member => normalizeStaffPhone(member.phone || '') === account.phone
       && validAadhaar(cleanAadhaar(member.aadhar_no)) && clientIdentityKey(cleanAadhaar(member.aadhar_no)) === account.identity_key);
   }
-  async function getSession(claims, connection = db) {
+  async function getSession(claims, connection = db, { allowPasswordSetup = false } = {}) {
     const { rows } = await connection.query('SELECT * FROM booking_client_accounts WHERE id=$1', [claims.accountId]);
     const account = rows[0];
-    if (!account?.is_active || account.token_version !== claims.version) expired();
+    if (!account?.is_active || (!account.password_changed && !allowPasswordSetup) || account.token_version !== claims.version) expired();
     const members = await ownedMembers(account, connection);
     if (!members.length) expired();
     return { account, members };
   }
-  async function authenticate(identifier, password, { dryRun = false } = {}) {
+  async function authenticate(identifier, password, { dryRun = false, allowPasswordSetup = false } = {}) {
     const phone = normalizeStaffPhone(identifier);
     if (!phone || typeof password !== 'string' || !password || Buffer.byteLength(password, 'utf8') > 256) return null;
     let accounts;
@@ -93,55 +94,17 @@ export function createClientPortalService(db) {
     }
     if (accounts.length > 20) return null;
     const matches = [];
-    const aadhaar = cleanAadhaar(password);
     for (const account of accounts) {
-      if (!account.is_active) continue;
-      if ((!account.password_changed || Buffer.byteLength(password,'utf8') <= 72)
-        && await bcrypt.compare(account.password_changed ? password : aadhaar, account.password_hash)) {
+      // Only the mobile setup flow may match an existing office-provisioned
+      // account. This never enrolls an identity or issues a web session.
+      if (!account.is_active || (!account.password_changed && !(allowPasswordSetup && dryRun))) continue;
+      if (Buffer.byteLength(password, 'utf8') <= 72 && await bcrypt.compare(account.password_changed ? password : cleanAadhaar(password), account.password_hash)) {
         const members = await ownedMembers(account);
         if (members.length) matches.push({ account, members });
       }
     }
-    if (matches.length > 1) return null;
-    if (matches.length === 1) return dryRun ? matches[0] : { ...clientPortalSession(matches[0]), ...issueClientTokens(matches[0].account) };
-    if (!validAadhaar(aadhaar)) return null;
-    const identityKey = clientIdentityKey(aadhaar);
-    // A new KYC edit or an old Aadhaar must never reset a chosen password/deactivated account.
-    if (accounts.some(account => account.identity_key === identityKey)) return null;
-    const candidates = await db.query(`${sourceSelect} WHERE ${memberPhoneSql()}=$1 AND ${clientRole} ORDER BY m.id LIMIT 1001`, [phone]);
-    if (candidates.rows.length > 1000) return null;
-    const members = candidates.rows.filter(member => cleanAadhaar(member.aadhar_no) === aadhaar);
-    if (!members.length) return null;
-    if (dryRun) return { members };
-    const connection = await db.connect();
-    try {
-      await connection.query('BEGIN');
-      await connection.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`booking-client:${phone}:${identityKey}`]);
-      const duplicate = await connection.query('SELECT id FROM booking_client_accounts WHERE phone=$1 AND identity_key=$2', [phone, identityKey]);
-      if (duplicate.rows.length) { await connection.query('ROLLBACK'); return authenticate(identifier, password); }
-      // Recheck the exact identity under row locks before creating its private credential.
-      const confirmed = await connection.query(`SELECT m.id FROM members m WHERE m.id=ANY($1::integer[])
-        AND ${memberPhoneSql()}=$2 AND regexp_replace(COALESCE(m.aadhar_no,''),'[[:space:]-]','','g')=$3
-        AND ${clientRole} AND EXISTS (SELECT 1 FROM kyc_cases k WHERE k.client_member_id=m.id AND k.site_id=m.site_id AND k.status='VERIFIED')
-        ORDER BY m.id FOR SHARE OF m`, [members.map(member => member.member_id), phone, aadhaar]);
-      if (!confirmed.rows.length) { await connection.query('ROLLBACK'); return null; }
-      // A later KYC correction cannot reassign someone else's existing credential.
-      const claimed = await connection.query('SELECT member_id FROM booking_client_members WHERE member_id=ANY($1::integer[]) LIMIT 1', [confirmed.rows.map(member => member.id)]);
-      if (claimed.rows.length) { await connection.query('ROLLBACK'); return null; }
-      const inserted = await connection.query(`INSERT INTO booking_client_accounts(phone,identity_key,password_hash,aadhaar_last4)
-        VALUES ($1,$2,$3,$4) RETURNING *`, [phone, identityKey, await bcrypt.hash(aadhaar, 12), aadhaar.slice(-4)]);
-      const account = inserted.rows[0];
-      for (const member of confirmed.rows) await connection.query('INSERT INTO booking_client_members(account_id,member_id) VALUES ($1,$2)', [account.id, member.id]);
-      const fresh = { account, members: await ownedMembers(account, connection) };
-      if (!fresh.members.length) invalid();
-      await connection.query('COMMIT');
-      return { ...clientPortalSession(fresh), ...issueClientTokens(account) };
-    } catch (error) {
-      await connection.query('ROLLBACK');
-      if (error.code === '23505') return null;
-      throw error;
-    }
-    finally { connection.release(); }
+    if (matches.length !== 1) return null;
+    return dryRun ? matches[0] : { ...clientPortalSession(matches[0]), ...issueClientTokens(matches[0].account) };
   }
 
   return {
@@ -157,11 +120,24 @@ export function createClientPortalService(db) {
       if (typeof next !== 'string' || next.length < 8 || Buffer.byteLength(next,'utf8') > 72) fail(400, 'New password must have at least 8 characters and at most 72 UTF-8 bytes');
       const account = session.account;
       if (!(await bcrypt.compare(account.password_changed ? current : cleanAadhaar(current), account.password_hash))) fail(403, 'Your current password is incorrect');
-      const result = await db.query(`UPDATE booking_client_accounts SET password_hash=$1,password_changed=true,
-        token_version=token_version+1,updated_at=now() WHERE id=$2 AND token_version=$3 AND is_active=true RETURNING *`,
-      [await bcrypt.hash(next,12), account.id, account.token_version]);
-      if (!result.rows.length) expired();
-      return { ...clientPortalSession({ ...session, account: result.rows[0] }), ...issueClientTokens(result.rows[0]), session_changed: true };
+      const hash = await bcrypt.hash(next,12);
+      const connection = await db.connect();
+      try {
+        await connection.query('BEGIN');
+        await lockClientPasswordPhone(connection, account.phone);
+        if (await passwordUsedByAnotherAccount(connection, account.phone, next, account.id)) {
+          fail(400, 'Choose a different password.');
+        }
+        const result = await connection.query(`UPDATE booking_client_accounts SET password_hash=$1,password_changed=true,
+          token_version=token_version+1,updated_at=now() WHERE id=$2 AND token_version=$3 AND is_active=true RETURNING *`,
+        [hash, account.id, account.token_version]);
+        if (!result.rows.length) expired();
+        await connection.query('COMMIT');
+        return { ...clientPortalSession({ ...session, account: result.rows[0] }), ...issueClientTokens(result.rows[0]), session_changed: true };
+      } catch (error) {
+        await connection.query('ROLLBACK');
+        throw error;
+      } finally { connection.release(); }
     },
     async logout(session) {
       await db.query('UPDATE booking_client_accounts SET token_version=token_version+1,updated_at=now() WHERE id=$1 AND token_version=$2', [session.account.id, session.account.token_version]);
