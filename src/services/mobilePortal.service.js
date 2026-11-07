@@ -32,14 +32,25 @@ const rootSecret = () => {
 };
 const privateKey = purpose => createHmac('sha256', rootSecret()).update(`bookings/my-real-assets/v1/${purpose}`).digest();
 
-// Public customers require an explicit link. Staff-only name matching must
-// never turn a similarly named member into the owner of a property.
-const ownershipSql = `p.site_id=ANY($2::integer[]) AND COALESCE(
-  (SELECT m.id FROM members m WHERE m.id=p.buyer_member_id AND m.site_id=p.site_id),
-  (SELECT b.client_member_id FROM bookings b JOIN members m ON m.id=b.client_member_id AND m.site_id=b.site_id
-    WHERE b.plot_id=p.id AND b.site_id=p.site_id AND lower(COALESCE(b.status,'')) NOT LIKE 'cancel%'
-    ORDER BY b.id DESC LIMIT 1)
-) = ANY($1::integer[])`;
+export const PLOT_ACCESS_UNAVAILABLE = 'This plot is no longer available in your account. Please contact the Admin Office for assistance.';
+
+// An explicit buyer link is authoritative, including an invalid link (fail
+// closed). Without one, inspect the latest booking, never an older booking
+// revived by filtering out a newer cancelled or unassigned booking.
+export const mobileCurrentOwnerSql = `CASE WHEN p.buyer_member_id IS NOT NULL THEN
+  (SELECT m.id FROM members m WHERE m.id=p.buyer_member_id AND m.site_id=p.site_id)
+  ELSE (SELECT CASE WHEN lower(trim(COALESCE(b.status,''))) NOT LIKE 'cancel%'
+      AND EXISTS (SELECT 1 FROM members m WHERE m.id=b.client_member_id AND m.site_id=b.site_id)
+      THEN b.client_member_id END
+    FROM bookings b WHERE b.plot_id=p.id AND b.site_id=p.site_id ORDER BY b.id DESC LIMIT 1)
+  END`;
+// RESALE is the retired purchase row. The resale workflow creates a new plot
+// row for the next buyer, with its own current status and financial records.
+export const mobileVisibleStatusSql = `upper(trim(COALESCE(p.status,''))) NOT IN ('AVAILABLE','COMPANY','CANCELLED','CANCELED','RESALE')`;
+const relatedPlotSql = `p.site_id=ANY($2::integer[]) AND (
+  (SELECT m.id FROM members m WHERE m.id=p.buyer_member_id AND m.site_id=p.site_id)=ANY($1::integer[])
+  OR EXISTS (SELECT 1 FROM bookings b JOIN members m ON m.id=b.client_member_id AND m.site_id=b.site_id
+    WHERE b.plot_id=p.id AND b.site_id=p.site_id AND b.client_member_id=ANY($1::integer[])))`;
 
 // Sign-encoded refunds are debits and require approval. Pending ordinary
 // credits follow the Accounts credit-first policy; uncleared cheques never post.
@@ -141,15 +152,15 @@ export function createMobileFinancialReader(db, {
     if (entry) financeCacheBytes -= entry.bytes;
     financeCache.delete(id);
   }
-  function cachedFinance(id) {
+  function cachedFinance(id, scope) {
     const entry = financeCache.get(id);
     if (!entry) return null;
-    if (entry.until <= now()) { removeCached(id); return null; }
+    if (entry.until <= now() || entry.scope !== scope) { removeCached(id); return null; }
     financeCache.delete(id);
     financeCache.set(id, entry);
     return entry.value;
   }
-  function rememberFinance(id, value) {
+  function rememberFinance(id, value, scope) {
     if (!ttlMs) return;
     const bytes = Buffer.byteLength(JSON.stringify(value));
     if (bytes > financeCacheMaxBytes) return;
@@ -158,7 +169,7 @@ export function createMobileFinancialReader(db, {
     while (financeCache.size && (financeCache.size >= financeCacheMaxEntries || financeCacheBytes + bytes > financeCacheMaxBytes)) {
       removeCached(financeCache.keys().next().value);
     }
-    financeCache.set(id, { value, bytes, until: now() + ttlMs });
+    financeCache.set(id, { value, bytes, scope, until: now() + ttlMs });
     financeCacheBytes += bytes;
   }
   async function queryFinancials(ids) {
@@ -184,27 +195,29 @@ export function createMobileFinancialReader(db, {
     for (const row of receipts.rows) grouped.get(row.plot_id)?.receipts.push(row);
     return grouped;
   }
-  async function financialsFor(ids, { forceFresh = false } = {}) {
+  async function financialsFor(ids, { forceFresh = false, cacheScopes = new Map() } = {}) {
     const values = new Map();
     const waiting = new Map();
     const missing = [];
     for (const id of ids) {
-      const cached = forceFresh ? null : cachedFinance(id);
+      const scope = cacheScopes.get(id);
+      const cached = forceFresh ? null : cachedFinance(id, scope);
       if (cached) values.set(id, cached);
-      else if (!forceFresh && financePending.has(id)) waiting.set(id, financePending.get(id).promise);
+      else if (!forceFresh && financePending.has(id) && financePending.get(id).scope === scope) waiting.set(id, financePending.get(id).promise);
       else missing.push(id);
     }
     if (missing.length) {
       const token = Symbol('financial-read');
       const batch = queryFinancials(missing);
       for (const id of missing) {
+        const scope = cacheScopes.get(id);
         const promise = batch.then(grouped => {
           const value = grouped.get(id);
           // A newer explicit refresh wins even if an older request finishes last.
-          if (financePending.get(id)?.token === token) rememberFinance(id, value);
+          if (financePending.get(id)?.token === token) rememberFinance(id, value, scope);
           return value;
         }).finally(() => { if (financePending.get(id)?.token === token) financePending.delete(id); });
-        financePending.set(id, { token, promise });
+        financePending.set(id, { token, promise, scope });
         waiting.set(id, promise);
       }
     }
@@ -250,24 +263,41 @@ export function createMobilePortalService(db, options = {}) {
     if (session.setupRequired) fail(403, 'Set a new password to continue.');
     const parameters = [session.members.map(row => row.id), [...new Set(session.members.map(row => row.site_id))]];
     if (plotId !== null) {
-      if (!/^[1-9]\d*$/.test(String(plotId)) || !Number.isSafeInteger(Number(plotId)) || Number(plotId) > 2147483647) fail(404, 'Property unavailable.');
+      if (!/^[1-9]\d*$/.test(String(plotId)) || !Number.isSafeInteger(Number(plotId)) || Number(plotId) > 2147483647) fail(404, PLOT_ACCESS_UNAVAILABLE);
       parameters.push(Number(plotId));
     }
-    const { rows: plots } = await db.query(`SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
+    const { rows: related } = await db.query(`SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
+      ${mobileCurrentOwnerSql} AS access_member_id,
+      to_jsonb(p)->>'updated_at' AS access_updated_at,
+      COALESCE((${mobileCurrentOwnerSql})=ANY($1::integer[]) AND ${mobileVisibleStatusSql},false) AS can_view,
       COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
       to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
       COALESCE(to_jsonb(p)->>'unit_type','plot') AS unit_type,
       COALESCE((to_jsonb(p)->>'interest_enabled')::boolean,false) AS interest_enabled,
       COALESCE((to_jsonb(p)->>'interest_rate')::numeric,0) AS interest_rate,
       COALESCE(to_jsonb(p)->>'interest_type','per_month') AS interest_type
-      FROM plots p WHERE ${ownershipSql}
+      FROM plots p WHERE ${relatedPlotSql}
       AND upper(trim(COALESCE(p.status,''))) NOT IN ('AVAILABLE','COMPANY')
       ${plotId !== null ? 'AND p.id=$3' : ''} ORDER BY p.site_id,p.plot_no,p.id LIMIT 1001`, parameters);
-    if (plots.length > 1000) fail(503, 'Your portfolio is temporarily unavailable.');
-    if (plotId !== null && !plots.length) fail(404, 'Property unavailable.');
-    if (!plots.length) return { details: [], updatedAt: new Date(now()).toISOString() };
+    if (related.length > 1000) fail(503, 'Your portfolio is temporarily unavailable.');
+    let plots = related.filter(row => row.can_view);
+    let accessNotice = related.some(row => !row.can_view) ? PLOT_ACCESS_UNAVAILABLE : undefined;
+    if (plotId !== null && !plots.length) fail(404, PLOT_ACCESS_UNAVAILABLE);
+    if (!plots.length) return { details: [], updatedAt: new Date(now()).toISOString(), accessNotice };
     const ids = plots.map(row => row.id);
-    const financials = await financialsFor(ids, options);
+    const cacheScopes = new Map(plots.map(row => [row.id, JSON.stringify([row.access_member_id, row.status, row.access_updated_at])]));
+    const financials = await financialsFor(ids, { ...options, cacheScopes });
+    // Financial reads may be slow or already in flight. Do not release an old
+    // snapshot if cancellation, reassignment or a plot edit committed meanwhile.
+    const { rows: current } = await db.query(`SELECT p.id,p.status,
+      ${mobileCurrentOwnerSql} AS access_member_id,to_jsonb(p)->>'updated_at' AS access_updated_at
+      FROM plots p WHERE p.site_id=ANY($2::integer[]) AND p.id=ANY($3::integer[])
+      AND (${mobileCurrentOwnerSql})=ANY($1::integer[]) AND ${mobileVisibleStatusSql}`,
+    [parameters[0], parameters[1], ids]);
+    const currentScopes = new Map(current.map(row => [row.id, JSON.stringify([row.access_member_id, row.status, row.access_updated_at])]));
+    plots = plots.filter(row => currentScopes.get(row.id) === cacheScopes.get(row.id));
+    if (plots.length !== ids.length) accessNotice = PLOT_ACCESS_UNAVAILABLE;
+    if (plotId !== null && !plots.length) fail(404, PLOT_ACCESS_UNAVAILABLE);
     const today = todayInIndia();
     const details = plots.map(plot => {
       const data = financials.get(plot.id);
@@ -275,8 +305,8 @@ export function createMobilePortalService(db, options = {}) {
       const { projectId: _projectId, ...ownerView } = projectMobilePlot(plot, data.schedules, data.receipts, today);
       return ownerView;
     });
-    const updatedAt = [...financials.values()].map(row => row.updatedAt).sort()[0] || new Date(now()).toISOString();
-    return { details, updatedAt };
+    const updatedAt = plots.map(row => financials.get(row.id).updatedAt).sort()[0] || new Date(now()).toISOString();
+    return { details, updatedAt, accessNotice };
   }
   return {
     getSession,
@@ -344,7 +374,7 @@ export function createMobilePortalService(db, options = {}) {
       }
     },
     async portfolio(session, { includeDetails = false, forceFresh = false } = {}) {
-      const { details, updatedAt } = await loadPlots(session, null, { forceFresh });
+      const { details, updatedAt, accessNotice } = await loadPlots(session, null, { forceFresh });
       const plots = details.map(({ paymentPlan, installments, payments, ...plot }) => plot);
       return { plots, summary: {
         plotCount: plots.length, totalAmount: amount(plots.reduce((sum, row) => sum + row.totalAmount, 0)),
@@ -353,7 +383,7 @@ export function createMobilePortalService(db, options = {}) {
         interestAmount: amount(plots.reduce((sum, row) => sum + row.interestAmount, 0)),
         totalDueAmount: amount(plots.reduce((sum, row) => sum + row.totalDueAmount, 0)),
         upcomingCount: details.reduce((sum, row) => sum + row.installments.filter(item => item.balanceAmount > 0).length, 0),
-      }, updatedAt, ...(includeDetails ? { details: details.map(plot => ({ plot, updatedAt })) } : {}) };
+      }, updatedAt, ...(accessNotice ? { accessNotice } : {}), ...(includeDetails ? { details: details.map(plot => ({ plot, updatedAt })) } : {}) };
     },
     async plot(session, id, { forceFresh = false } = {}) {
       const { details, updatedAt } = await loadPlots(session, id, { forceFresh });

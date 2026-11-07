@@ -196,25 +196,28 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
 
     // Load the accounting plot.
     const plotRes = await db.query(
-      `SELECT id, site_id, plot_no, status, buyer_name, booking_by, plot_size, plot_rate,
+      `SELECT id, site_id, plot_no, status, buyer_member_id, buyer_name, booking_by, plot_size, plot_rate,
               commission_rate, plot_commission
          FROM plots WHERE id = $1`,
       [parseInt(booking.plot_id)]
     );
     const plot = plotRes.rows[0];
     if (!plot) return { ok: false, reason: 'plot_not_found' };
+    if (Number(plot.site_id) !== Number(booking.site_id)) return { ok: false, reason: 'plot_site_mismatch' };
 
     // Resolve the buyer (client) name.
     const clientRes = await db.query(
-      `SELECT full_name FROM members WHERE id = $1`,
-      [parseInt(booking.client_member_id)]
+      `SELECT full_name FROM members WHERE id = $1 AND site_id = $2`,
+      [parseInt(booking.client_member_id), parseInt(plot.site_id)]
     );
     const buyerName = clientRes.rows[0]?.full_name || null;
     if (!buyerName) return { ok: false, reason: 'client_not_found' };
 
     // Guard: don't overwrite a plot already committed to a DIFFERENT buyer.
     const existingBuyer = (plot.buyer_name || '').trim();
-    const isDifferentBuyer = existingBuyer && existingBuyer.toUpperCase() !== buyerName.trim().toUpperCase();
+    const isDifferentBuyer = plot.buyer_member_id != null
+      ? Number(plot.buyer_member_id) !== Number(booking.client_member_id)
+      : existingBuyer && existingBuyer.toUpperCase() !== buyerName.trim().toUpperCase();
     if (isDifferentBuyer && PROTECTED_STATUSES.has(String(plot.status || '').toUpperCase())) {
       return { ok: false, reason: 'plot_committed_to_other_buyer', plot_no: plot.plot_no, current_buyer: existingBuyer, current_status: plot.status };
     }
@@ -227,6 +230,7 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
       `UPDATE plots
           SET status       = 'BOOKED',
               buyer_name   = $1,
+              buyer_member_id = $5,
               booking_by   = COALESCE($2, booking_by),
               booking_date = COALESCE(booking_date, $3),
               updated_at   = NOW()
@@ -236,6 +240,7 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
         bookingByName ? bookingByName.trim().toUpperCase() : null,
         booking.booking_date || null,
         parseInt(plot.id),
+        parseInt(booking.client_member_id),
       ]
     );
 

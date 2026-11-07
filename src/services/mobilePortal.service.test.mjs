@@ -396,7 +396,7 @@ test('batch portfolio reuses financial reads while ownership remains current and
   const service = createMobilePortalService({ query: (sql, args) => { queries++; return db.query(sql, args); } }, { now: () => time });
   const session = { members: [{ id: 1, site_id: 1 }, { id: 2, site_id: 2 }] };
   const first = await service.portfolio(session, { includeDetails: true });
-  assert.equal(queries, 3, 'one ownership query plus two batched financial queries, regardless of plot count');
+  assert.equal(queries, 4, 'ownership checked before and after two batched financial queries, regardless of plot count');
   assert.equal(first.details.length, first.plots.length);
   assert.deepEqual(first.details.map(row => row.plot.id), first.plots.map(row => row.id));
   assert.ok(first.plots.every(row => row.projectName === 'Your Property'));
@@ -406,12 +406,12 @@ test('batch portfolio reuses financial reads while ownership remains current and
   assert.ok(first.details.every(row => !Object.hasOwn(row.plot, 'projectId')));
   queries = 0;
   await service.portfolio(session, { includeDetails: true });
-  assert.equal(queries, 1, 'financial cache never removes the ownership read');
+  assert.equal(queries, 2, 'financial cache never removes the ownership checks');
   queries = 0;
   const detail = (await service.plot(session, '1')).plot;
   assert.equal(detail.paidAmount, 350);
   assert.ok(!Object.hasOwn(detail, 'projectId'));
-  assert.equal(queries, 1, 'detail reuses the batched financial result');
+  assert.equal(queries, 2, 'detail reuses financials while rechecking current access');
   await db.query('UPDATE plots SET buyer_member_id=3 WHERE id=1');
   await assert.rejects(service.plot(session, '1'), { statusCode: 404 });
   await db.query('UPDATE plots SET buyer_member_id=1 WHERE id=1');
@@ -420,7 +420,7 @@ test('batch portfolio reuses financial reads while ownership remains current and
   queries = 0;
   const fresh = await service.plot(session, '1', { forceFresh: true });
   assert.equal(fresh.plot.paidAmount, 375);
-  assert.equal(queries, 3);
+  assert.equal(queries, 4);
   await db.query("INSERT INTO plot_payments VALUES (21,1,1,25,'2026-10-27','CASH','approved',NULL,'NEWER-RECEIPT')");
   time += 5001;
   assert.equal((await service.plot(session, '1')).plot.paidAmount, 400, 'financial snapshots expire after five seconds');
@@ -436,7 +436,7 @@ test('simultaneous portfolio reads share one financial batch', async t => {
     service.portfolio(session, { includeDetails: true }),
     service.portfolio(session, { includeDetails: true }),
   ]);
-  assert.equal(queries, 4, 'two independent ownership checks share just two financial queries');
+  assert.equal(queries, 6, 'two requests check access before and after sharing two financial queries');
   assert.deepEqual(a, b);
 });
 

@@ -80,10 +80,11 @@
     "migrate:mobile-push": "node src/migrations/045_mobile_push.js",
     "migrate:client-invitations": "node src/migrations/046_client_invitations.js",
     "test:client-invitations": "node --test src/services/clientInvitation.service.test.mjs",
-    "test:mobile-push": "node --test src/services/mobilePush.service.test.mjs",
+    "test:mobile-push": "node --test src/services/mobilePush.service.test.mjs scripts/check-mobile-fcm.test.mjs",
+    "check:mobile-fcm": "node scripts/check-mobile-fcm.mjs",
     "migrate:broker-mobile": "node src/migrations/043_broker_mobile_indexes.js",
     "test:broker-mobile": "node --test src/services/brokerMobile.service.test.mjs src/services/brokerMobileAuth.service.test.mjs src/services/brokerPresentation.service.test.mjs src/services/brokerResetEmail.service.test.mjs",
-    "test:mobile-portal": "node --test src/services/mobilePortal.service.test.mjs src/services/mobileInstallmentAllocation.service.test.mjs",
+    "test:mobile-portal": "node --test src/services/mobilePortal.service.test.mjs src/services/mobilePlotAccess.test.mjs src/services/plotBookingSync.test.mjs src/services/mobileInstallmentAllocation.service.test.mjs",
     "test:broker-gateway": "node --test src/brokerGateway.server.test.mjs",
     "start:broker-only": "node src/brokerOnly.server.js",
     "test:broker-only": "node --test src/brokerOnly.app.test.mjs"

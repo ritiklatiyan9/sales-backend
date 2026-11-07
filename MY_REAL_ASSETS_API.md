@@ -100,10 +100,21 @@ memory-only. The existing web client portal has separate availability controls;
 this change does not enable it. Mobile enrollment creates an account only when
 the verified KYC and identity checks pass.
 
-Plot ownership requires its explicit buyer member or latest noncancelled booking
-client in the same site. Buyer-name matching never grants access. Legacy name-only
-records need a correct member link in the existing software before appearing.
+Plot ownership requires its explicit buyer member or, if no explicit link exists,
+the latest booking's client in the same site. An invalid explicit link or a
+cancelled latest booking fails closed; an older booking never restores access.
+Buyer-name matching never grants access. Legacy name-only records need a correct
+member link in the existing software before appearing. Booked, Registry and
+Under Cancellation remain visible to the current client. Cancelled (including
+Canceled) and Resale rows are inaccessible to clients even when an old buyer link
+remains. The resale workflow retains that retired row and creates a separate
+purchase row for the new client; only their current linked row is visible.
 Available/company inventory and another owner's receipts remain inaccessible.
+Unavailable plots are omitted from lists, expanded details and totals. A
+portfolio with withheld prior associations includes an optional `accessNotice`.
+Direct inaccessible or unknown plot requests return 404 with the same message:
+“This plot is no longer available in your account. Please contact the Admin
+Office for assistance.” Staff/admin plot routes keep their existing access.
 All public project/site labels say **Your Property**, not the source site's name.
 
 ## Financial and performance behavior
@@ -122,8 +133,11 @@ password management create or update client authentication records.
 
 The optimized normalized-phone lookup uses the existing expression index. One
 expanded request replaces per-plot N+1 calls. Financial rows use a bounded 5-second
-process cache, with current ownership checked before every lookup. Concurrent
-financial reads deduplicate. `Cache-Control:no-cache` on reads bypasses this cache
+process cache, with current status and ownership checked before every lookup and
+rechecked after financial reads before releasing a response.
+Financial snapshots are scoped to the owner, status and plot update revision so
+they cannot be reused after reassignment. Concurrent financial reads deduplicate.
+`Cache-Control:no-cache` on reads bypasses this cache
 for explicit refresh. JSON larger than 2 KiB uses asynchronous gzip level 1 when
 negotiated. Browser/proxy responses remain `private,no-store`; no credentials or
 entire customer responses are globally cached. Sign-in is limited per IP and
@@ -165,8 +179,17 @@ trigger emits a PostgreSQL warning and that notification may be missed. Monitor
 database logs for `My Real Assets push capture failed`; this fallback is not a
 substitute for verifying the Accounts database role can write the outbox.
 
-Set `MRA_FCM_ENABLED=true` and configure the service account for the same Firebase
-project as the mobile app. For a Render secret file, set
+In Firebase Console, select **myrealassets-380f8 → Project settings → Cloud
+Messaging** and enable **Firebase Cloud Messaging API (V1)** in Google Cloud.
+This API was verified enabled on 7 November 2026. The existing dedicated sender,
+`my-real-assets-fcm-sender@myrealassets-380f8.iam.gserviceaccount.com`, has the
+**Firebase Cloud Messaging API Admin** role (`roles/firebasecloudmessaging.admin`)
+and an existing key. Reuse its configured backend credential where available.
+Keep general Firebase administrator and Google sign-in credentials separate.
+
+Set `MRA_FCM_ENABLED=true`, `MRA_FCM_PROJECT_ID=myrealassets-380f8` and configure the
+service account for that same project as the Android app. A mismatched project
+disables the sender. For a Render secret file, set
 `MRA_FCM_SERVICE_ACCOUNT_FILE=/etc/secrets/my-real-assets-fcm.json` to its absolute
 server-side path. Alternatively use `MRA_FCM_SERVICE_ACCOUNT_B64` or
 `MRA_FCM_SERVICE_ACCOUNT_JSON` for the server-only credential. The file setting
@@ -192,10 +215,41 @@ open the relevant activity view after a tap. FCM does not guarantee delivery;
 invalid device tokens are removed. Retries are bounded, and a crash after FCM
 accepts a message but before the database records success may cause a duplicate.
 
-The in-process worker polls every minute while Bookings is running and queues
-one reminder at three days before and on the due date in Asia/Kolkata, only while
-an installment remains unpaid. If hosting sleeps or is offline, notifications
-are delayed; an always-on Bookings instance is required for reliable reminders.
-The worker skips stale events and does not replay reminders missed while offline.
-The free host must not be treated as an accurate scheduler. No customer data is
-sent in the push text; opening the app requires the normal session.
+The in-process worker polls the queue every minute and rescans installment
+reminders every five minutes while Bookings is running. It queues one reminder
+three days before, one day before and on the due date in Asia/Kolkata, only while
+an installment remains unpaid. A newly registered phone can receive the current
+day's reminder even when that reminder was scanned earlier. Database delivery
+records deduplicate repeated scans and multiple workers; a crash after FCM
+accepts a message can still cause a duplicate.
+
+Installment notifications use the high-importance `installment_reminders`
+Android channel and expire at the end of the India reminder day. Normal payment
+activity keeps its existing channel. These are notification messages so Android
+can display them while the app is backgrounded or terminated. The phone must
+have opened the app at least once, registered its token and allowed notifications.
+Android force-stop from Settings blocks delivery until the app is reopened.
+The app shows the reminder modal after opening/resuming and loading current
+authorized data; it does not launch a modal over other apps. No financial details
+are included in the push text. Paid, cancelled, resale, reassigned and disabled
+accounts are checked again before delivery or showing financial details.
+
+If hosting sleeps or is offline, notifications are delayed; an always-on
+Bookings instance is required for reliable reminders. The worker skips stale
+events and does not replay reminders missed while offline. The free host must
+not be treated as an accurate scheduler.
+
+From this backend directory, verify configuration without sending a message:
+
+```sh
+node scripts/check-mobile-fcm.mjs
+```
+
+For the optional FCM API validation, follow the script's `--help` instructions
+using a private device-token file. It uses FCM dry-run validation, never real
+delivery. A successful dry run still requires a separate phone test: sign in,
+allow notifications, leave the app in the background, receive a reminder, then
+tap it and verify the freshly loaded modal. Repeat after removing the app from
+Recents. Do not use Android's Force stop for this test. iOS additionally needs
+its own Firebase app configuration, APNs key and Push Notifications capability;
+the current configured target is Android.

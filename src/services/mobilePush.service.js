@@ -4,7 +4,7 @@ import { isAbsolute } from 'node:path';
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getMessaging } from 'firebase-admin/messaging';
 import { createClientPortalService } from './clientPortal.service.js';
-import { createMobilePortalService } from './mobilePortal.service.js';
+import { createMobilePortalService, mobileCurrentOwnerSql, mobileVisibleStatusSql } from './mobilePortal.service.js';
 
 const error = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const tokenHash = token => createHash('sha256').update(token).digest('hex');
@@ -55,34 +55,68 @@ export function readMobilePushServiceAccount(env = process.env) {
   return serviceAccount;
 }
 
+export function validateMobilePushProject(serviceAccount, env = process.env) {
+  const projectId = String(env.MRA_FCM_PROJECT_ID || 'myrealassets-380f8').trim();
+  if (!projectId || serviceAccount?.project_id !== projectId) throw new Error('Firebase project mismatch');
+  return projectId;
+}
+
 let messaging = null;
 export function mobileMessaging() {
   if (messaging) return messaging;
   try {
     const serviceAccount = readMobilePushServiceAccount();
     if (!serviceAccount) return null;
-    const app = getApps().find(item => item.name === 'mra-fcm') || initializeApp({credential: cert(serviceAccount)}, 'mra-fcm');
+    const projectId = validateMobilePushProject(serviceAccount);
+    const app = getApps().find(item => item.name === 'mra-fcm') || initializeApp({credential: cert(serviceAccount),projectId}, 'mra-fcm');
+    if (app.options.projectId !== projectId) throw new Error('Firebase project mismatch');
     messaging = getMessaging(app);
     return messaging;
-  } catch { console.error('[mra-push] Firebase credentials are invalid'); return null; }
+  } catch { console.error('[mra-push] Firebase credentials are invalid or target a different project'); return null; }
 }
 export const pushEnabled = () => process.env.MRA_FCM_ENABLED === 'true';
-export const pushMessage = type => ({
-  notification: {
-    title: 'My Real Assets',
-    body: type === 'payment_update' ? 'Your payment activity has changed. Open the app to review it.'
-      : type === 'refund' ? 'A refund has been recorded. Open the app to view your activity.'
-      : type === 'installment' ? 'An installment is coming due. Open the app to view your plan.'
-      : 'A payment has been recorded. Open the app to view your activity.',
-  },
-  data: { type: type === 'payment_update' ? 'payment' : type },
-  android: { priority: 'high', notification: { channelId: 'property_activity' } },
-  apns: { payload: { aps: { sound: 'default' } } },
-});
+const todayIndia = (now = Date.now()) => new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now));
+export const INSTALLMENT_REMINDER_OFFSETS = Object.freeze([3, 1, 0]);
+export const REMINDER_SCAN_INTERVAL_MS = 5 * 60_000;
+export function pushMessage(type, { reminderOffset, now = Date.now() } = {}) {
+  const reminder = type === 'installment';
+  // The OS displays this notification even when the Flutter process is closed.
+  // A generic replacement tag avoids a stack of private installment messages.
+  // Expire at midnight in India so a delayed alert cannot claim "due today"
+  // after its reminder day. Current account data is loaded only inside the app.
+  const expiresAt = Date.parse(`${todayIndia(now)}T23:59:59+05:30`);
+  const ttl = Math.max(0, expiresAt - now);
+  return {
+    notification: {
+      title: reminder ? 'Installment reminder' : 'My Real Assets',
+      body: type === 'payment_update' ? 'Your payment activity has changed. Open the app to review it.'
+        : type === 'refund' ? 'A refund has been recorded. Open the app to view your activity.'
+        : reminder ? reminderOffset === 0 ? 'An installment is due today. Open the app to view your plan.'
+          : reminderOffset === 1 ? 'An installment is due tomorrow. Open the app to view your plan.'
+          : 'An installment is coming due. Open the app to view your plan.'
+        : 'A payment has been recorded. Open the app to view your activity.',
+    },
+    data: { type: type === 'payment_update' ? 'payment' : type },
+    android: {
+      priority: 'high',
+      ...(reminder ? { ttl, collapseKey: 'installment_reminders' } : {}),
+      notification: {
+        channelId: reminder ? 'installment_reminders' : 'property_activity',
+        ...(reminder ? { tag: 'installment_reminder', priority: 'high', sound: 'default' } : {}),
+      },
+    },
+    apns: {
+      headers: {
+        'apns-push-type': 'alert', 'apns-priority': '10',
+        ...(reminder ? { 'apns-expiration': String(Math.floor(expiresAt / 1000)) } : {}),
+      },
+      payload: { aps: { sound: 'default' } },
+    },
+  };
+}
 
-const todayIndia = () => new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 const dayDiff = (date, today) => Math.round((Date.parse(`${date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86400000);
-export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
+export function createMobilePushWorker(db, { send, today = todayIndia, now = Date.now } = {}) {
   const clientPortal = createClientPortalService(db);
   const portal = createMobilePortalService(db, {financeCacheMs:0});
   async function accountPortfolio(accountId, version) {
@@ -104,9 +138,16 @@ export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
         for (const detail of portfolio?.details || []) {
           for (const inst of detail.plot.installments || []) {
             const offset = dayDiff(inst.dueDate, date);
-            if (inst.balanceAmount > 0 && inst.dueDate && (offset === 3 || offset === 0)) {
+            if (inst.balanceAmount > 0 && inst.dueDate && INSTALLMENT_REMINDER_OFFSETS.includes(offset)) {
               await db.query(`INSERT INTO booking_mobile_push_events(plot_id,source,source_id,kind,account_id,reminder_date,reminder_offset)
-                VALUES($1,'installment',$2,'installment',$3,$4,$5) ON CONFLICT DO NOTHING`,
+                VALUES($1,'installment',$2,'installment',$3,$4,$5)
+                ON CONFLICT(account_id,plot_id,source_id,reminder_date,reminder_offset) WHERE kind='installment'
+                DO UPDATE SET expanded_at=NULL
+                WHERE booking_mobile_push_events.expanded_at IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM booking_mobile_push_devices d JOIN booking_client_accounts a ON a.id=d.account_id
+                  WHERE d.account_id=booking_mobile_push_events.account_id AND a.is_active AND a.token_version=d.account_version
+                  AND NOT EXISTS (SELECT 1 FROM booking_mobile_push_deliveries delivery
+                    WHERE delivery.event_id=booking_mobile_push_events.id AND delivery.token_hash=d.token_hash))`,
                 [detail.plot.id,inst.id,account.account_id,inst.dueDate,offset]);
             }
           }
@@ -123,15 +164,13 @@ export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
     const e=rows[0]; if(!e) return false;
     await db.query(`INSERT INTO booking_mobile_push_deliveries(event_id,token_hash)
       SELECT $1,d.token_hash FROM booking_mobile_push_devices d JOIN booking_client_accounts a ON a.id=d.account_id
-      WHERE a.is_active AND a.token_version=d.account_version AND d.registered_at <= $2
+      WHERE a.is_active AND a.token_version=d.account_version AND (d.registered_at <= $2 OR $5='installment')
         AND ($3::integer IS NULL OR d.account_id=$3)
         AND EXISTS (SELECT 1 FROM booking_client_members cm JOIN members m ON m.id=cm.member_id JOIN plots p ON p.id=$4 AND p.site_id=m.site_id
           WHERE cm.account_id=d.account_id AND COALESCE(to_jsonb(m)->>'is_active','true')<>'false'
-          AND upper(trim(COALESCE(p.status,''))) NOT IN ('AVAILABLE','COMPANY')
-          AND COALESCE((SELECT m2.id FROM members m2 WHERE m2.id=p.buyer_member_id AND m2.site_id=p.site_id),
-            (SELECT b.client_member_id FROM bookings b JOIN members m3 ON m3.id=b.client_member_id AND m3.site_id=b.site_id
-             WHERE b.plot_id=p.id AND b.site_id=p.site_id AND lower(COALESCE(b.status,'')) NOT LIKE 'cancel%' ORDER BY b.id DESC LIMIT 1))=m.id)
-      ON CONFLICT DO NOTHING`, [e.id,e.created_at,e.account_id,e.plot_id]);
+          AND ${mobileVisibleStatusSql}
+          AND (${mobileCurrentOwnerSql})=m.id)
+      ON CONFLICT DO NOTHING`, [e.id,e.created_at,e.account_id,e.plot_id,e.kind]);
     await db.query('UPDATE booking_mobile_push_events SET expanded_at=now(),lease_until=NULL WHERE id=$1',[e.id]);
     return true;
   }
@@ -143,7 +182,8 @@ export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
     const delivery=rows[0]; if(!delivery) return false;
     const result = await db.query(`SELECT e.*,e.reminder_date::text AS reminder_date,d.token,d.account_id AS device_account_id,d.account_version,d.token_hash
       FROM booking_mobile_push_events e JOIN booking_mobile_push_devices d ON d.token_hash=$2
-      WHERE e.id=$1 AND d.registered_at<=e.created_at`, [delivery.event_id, delivery.token_hash]);
+      WHERE e.id=$1 AND ((e.kind='installment' AND e.account_id=d.account_id)
+        OR (e.kind<>'installment' AND d.registered_at<=e.created_at))`, [delivery.event_id, delivery.token_hash]);
     const row=result.rows[0];
     if (!row) {
       await db.query("UPDATE booking_mobile_push_deliveries SET state='skipped',lease_until=NULL WHERE event_id=$1 AND token_hash=$2", [delivery.event_id,delivery.token_hash]);
@@ -152,7 +192,7 @@ export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
     try {
       const portfolio = await accountPortfolio(row.device_account_id,row.account_version);
       const plot = portfolio?.details?.find(x => String(x.plot.id) === String(row.plot_id))?.plot;
-      let valid = Boolean(plot) && Date.now() - new Date(row.created_at).getTime() < 48*3600*1000;
+      let valid = Boolean(plot) && now() - new Date(row.created_at).getTime() < 48*3600*1000;
       if (row.kind === 'installment') {
         const inst = plot?.installments?.find(i => String(i.id) === row.source_id && i.dueDate === String(row.reminder_date).slice(0,10));
         valid = valid && Boolean(inst && inst.balanceAmount > 0 && dayDiff(inst.dueDate,today()) === row.reminder_offset);
@@ -160,7 +200,7 @@ export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
         const source = row.source === 'plot_payments' ? 'payment' : 'installment';
         valid = valid && Boolean(plot?.payments?.some(p => p.id === `${source}:${row.source_id}` && (row.kind === 'refund' ? p.amount < 0 : p.amount > 0)));
       }
-      if (valid) await send({...pushMessage(row.kind),token:row.token});
+      if (valid) await send({...pushMessage(row.kind, { reminderOffset: row.reminder_offset, now: now() }),token:row.token});
       await db.query("UPDATE booking_mobile_push_deliveries SET state=$3,lease_until=NULL WHERE event_id=$1 AND token_hash=$2",[row.id,row.token_hash,valid?'sent':'skipped']);
     } catch (e) {
       if (['messaging/registration-token-not-registered','messaging/invalid-registration-token'].includes(e.code)) {
@@ -175,6 +215,37 @@ export function createMobilePushWorker(db, { send, today = todayIndia } = {}) {
   }
   return {enqueueReminders,expandOne,dispatchOne};
 }
+
+// A reminder scan is periodic, rather than once per process/day: clients may
+// register a device, receive a new plan, or get a due-date correction later.
+// Database reminder/delivery keys make repeated scans safe across instances.
+export function createMobilePushCycle(db, worker, { now = Date.now, today = todayIndia } = {}) {
+  let lastCleanupDay = '';
+  let lastReminderDay = '';
+  let lastReminderScan = Number.NEGATIVE_INFINITY;
+  return async () => {
+    const date = today();
+    let scanError;
+    if (lastCleanupDay !== date) {
+      await db.query(`DELETE FROM booking_mobile_push_devices d USING booking_client_accounts a
+        WHERE a.id=d.account_id AND (NOT a.is_active OR a.token_version<>d.account_version)`);
+      await db.query("DELETE FROM booking_mobile_push_events WHERE created_at < now()-interval '30 days'");
+      lastCleanupDay = date;
+    }
+    if (lastReminderDay !== date || now() - lastReminderScan >= REMINDER_SCAN_INTERVAL_MS) {
+      try {
+        await worker.enqueueReminders();
+        lastReminderDay = date;
+        lastReminderScan = now();
+      } catch (error) { scanError = error; }
+    }
+    for(let i=0;i<100 && await worker.expandOne();i++);
+    for(let i=0;i<100 && await worker.dispatchOne();i++);
+    // A broken account/plan must not block already queued deliveries for
+    // everyone else. Report the incomplete scan and retry it on the next poll.
+    if (scanError) throw scanError;
+  };
+}
 let started = false;
 export function startMobilePushWorker(db) {
   if(started || !pushEnabled()) return;
@@ -182,18 +253,10 @@ export function startMobilePushWorker(db) {
   if (!messenger) {console.error('[mra-push] Enabled without valid Firebase credentials; worker disabled'); return;}
   started=true;
   const worker=createMobilePushWorker(db,{send: message=>messenger.send(message)});
-  let lastReminderDay='';
+  const cycle=createMobilePushCycle(db,worker);
   const tick=async()=>{
     try {
-      const date=todayIndia();
-      if(lastReminderDay!==date) {
-        await db.query(`DELETE FROM booking_mobile_push_devices d USING booking_client_accounts a
-          WHERE a.id=d.account_id AND (NOT a.is_active OR a.token_version<>d.account_version)`);
-        await db.query("DELETE FROM booking_mobile_push_events WHERE created_at < now()-interval '30 days'");
-        await worker.enqueueReminders(); lastReminderDay=date;
-      }
-      for(let i=0;i<100 && await worker.expandOne();i++);
-      for(let i=0;i<100 && await worker.dispatchOne();i++);
+      await cycle();
     } catch(e) {console.error('[mra-push] Worker error:',e.code||'ERROR');}
     finally {setTimeout(tick,60_000).unref();}
   };
