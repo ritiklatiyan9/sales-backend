@@ -10,13 +10,15 @@ const postPaths = new Set([
   '/api/broker-mobile/auth/password-reset/request',
   '/api/broker-mobile/auth/password-reset/confirm',
   '/api/broker-mobile/auth/password/change',
+  '/api/broker-mobile/auth/logout',
+  '/api/broker-mobile/device-tokens',
 ]);
 const getPaths = new Set([
   '/api/broker-mobile/status', '/api/broker-mobile/me', '/api/broker-mobile/portfolio',
 ]);
 
 function permitted(method, path) {
-  return method === 'POST' ? postPaths.has(path)
+  return method === 'DELETE' ? path==='/api/broker-mobile/device-tokens' : method === 'POST' ? postPaths.has(path)
     : method === 'GET' && (getPaths.has(path) || /^\/api\/broker-mobile\/plots\/pr_[a-f0-9]{32}$/.test(path));
 }
 
@@ -92,7 +94,7 @@ export function createBrokerGateway({
         headers['Cache-Control'] = 'no-cache';
       }
       let body;
-      if (req.method === 'POST') {
+      if (['POST','DELETE'].includes(req.method)) {
         if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) return reply(415, 'Send a JSON request.');
         if (Number(req.headers['content-length']) > maximumRequestBytes) return reply(413, 'Request too large.');
         body = await readBody(req, maximumRequestBytes);

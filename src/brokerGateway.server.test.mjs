@@ -61,3 +61,17 @@ test('gateway origin validation forbids HTTP, userinfo and path overrides', () =
     assert.throws(() => createBrokerGateway({ upstreamOrigin }), /HTTPS origin/);
   }
 });
+test('gateway forwards broker device registration, JSON deletion and explicit logout only on their approved paths',async t=>{
+  const f=await fixture(t);
+  const headers={'Content-Type':'application/json',Authorization:'Bearer synthetic.token.value'};
+  const body=JSON.stringify({token:'synthetic_partner_token_1234567890'});
+  for(const [method,path] of [['POST','/api/broker-mobile/device-tokens'],['DELETE','/api/broker-mobile/device-tokens'],['POST','/api/broker-mobile/auth/logout']]) {
+    assert.equal((await f.request(path,{method,headers,body})).status,200);
+    assert.equal(f.calls.at(-1).init.method,method);assert.equal(f.calls.at(-1).init.body,body);
+    assert.equal(f.calls.at(-1).init.headers.Authorization,headers.Authorization);
+  }
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'DELETE',headers,body:'[]'})).status,400);
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'DELETE',body:'{}'})).status,415);
+  assert.equal((await f.request('/api/broker-mobile/auth/logout',{method:'DELETE',headers,body})).status,404);
+  assert.equal(f.calls.length,3);
+});

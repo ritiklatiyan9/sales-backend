@@ -10,7 +10,7 @@ remains separate.
 ## Mobile sign-in and recovery
 
 - `GET /status`: public `{service:"my-real-assets-broker",apiVersion:1,authVersion:2,
-  portfolioVersion:2,commissionLinkedPlots:true,enabled:true,sessionDurationDays:30,passwordReset:"registered-email-otp",
+  portfolioVersion:3,commissionLinkedPlots:true,installmentNotifications:true,enabled:true,sessionDurationDays:30,passwordReset:"registered-email-otp",
   recoveryEmailEnabled:true}`. The email flag reports transport configuration;
   it does not send a test message or guarantee delivery to every address.
 - `POST /auth/login`: `{mobile,password}`. Initial app password is the broker's
@@ -38,6 +38,10 @@ remains separate.
   Returns `{success:true}` and revokes all app sessions, including the current
   device. A wrong current password returns 400 without treating the session as
   expired.
+- Authenticated `POST /auth/logout`: `{}` returns `{success:true}` and increments
+  the broker credential version, revoking all its app sessions and notification
+  registrations. Call it on explicit sign-out, never on app close or ordinary
+  session expiry. Offline local sign-out still clears the device's local state.
 
 New app passwords require at least eight characters, at most 72 UTF-8 bytes, and
 must differ from the registered Aadhaar number. After a custom password is set,
@@ -59,6 +63,17 @@ All authenticated requests require `Authorization: Bearer <token>`.
   are omitted from this response.
 - `GET /plots/:id`: `{plot,updatedAt}`, adding the full payment history for that
   currently assigned plot. Invalid/unassigned IDs receive a generic 404.
+
+Each plot includes `installmentRemindersEligible`. The app must require explicit
+`true` before showing an installment reminder or scheduling a local backup;
+missing/false is ineligible. This narrower notification rule does not change
+historical portfolio visibility. It requires a currently entitled plot in
+Booked, Sold, Registry/Registered or Under Cancellation status and an exact,
+active same-site CLIENT association: the explicit buyer pointer, otherwise the
+latest noncancelled current booking. Cancelled, Canceled, Resale, available,
+company, unassigned, ambiguous and guessed ledger-name owners cannot remind.
+The same scope is checked again after financial reads. A current booking client
+takes priority over an overlapping commission row with a stale buyer label.
 
 `summary` contains `clientCount,plotCount,totalAmount,paidAmount,balanceAmount,
 interestAmount,totalDueAmount,upcomingCount,overdueCount`. Currency amounts,
@@ -141,7 +156,68 @@ npm run migrate:broker-mobile
 ```
 
 This index uses `CREATE INDEX CONCURRENTLY`; source deployment alone does not
-apply it. Neither portfolio reads nor app startup perform schema migrations.
+apply it. Portfolio reads never perform schema migrations. The additive partner
+notification migration described below runs at service startup.
+
+## Installment notifications
+
+Authenticated device endpoints use the broker JWT realm and return `{ok:true}`:
+
+- `POST /device-tokens`: `{token,platform:"android"}` (or `"ios"`). Validates the
+  exact current broker account, credential version, identity and authority again
+  under the account lock. At most 20 devices may be registered per broker. The
+  newest registration owns a token when the app changes signed-in accounts.
+- `DELETE /device-tokens`: `{token}` removes only that current broker's matching
+  registration. It cannot delete a different broker's or the client app's token.
+
+Migration `048_broker_mobile_push.js` creates separate broker device, reminder
+event and delivery tables. Main and standalone broker startup run it
+idempotently before starting the worker; it can also be applied explicitly with
+`npm run migrate:broker-mobile-push`. It does not change ledger rows, add financial
+triggers, or reuse client notification tables. The existing broker auth
+migration remains a prerequisite for a new installation.
+
+The sender reuses the existing My Real Assets Firebase project
+`myrealassets-380f8`, its Firebase Admin initialization and server-only FCM service
+account configured through `MRA_FCM_ENABLED=true` and
+`MRA_FCM_SERVICE_ACCOUNT_FILE` (or the existing JSON/base64 alternative). No new
+private key is required. Register the separate Android package
+`app.myrealassets.broker` in that project and use its own generated Firebase app
+configuration. Never copy the client app's package configuration or embed server
+credentials in the app. Android sends are restricted to the broker package and
+use channel `partner_installment_reminders`.
+
+The worker polls its durable queue every minute and rescans current portfolios
+every five minutes. It reminds at three days, one day and due day in India time,
+once per installment/device/day, including devices registered after an earlier
+scan. Each send reloads current scoped financial data and checks the captured
+client association, plan, due date, positive balance, account version and exact
+live identity/staff/KYC/site grants. Password changes, sign-out, disablement,
+unassignment, cancellation, resale, paid/replaced plans and broker reassignment
+fail closed. A registered device may continue background notifications after its
+30-day JWT expires only while that exact authority remains current; reopening
+the app still requires an unexpired authenticated session.
+
+FCM contains only `{type:"installment"}` and a generic client-installment alert.
+It includes no client name, property ID, amount or saved plan. The OS displays
+the notification when Flutter is closed; opening it reloads current account data
+before the app shows a reminder popup. Alerts expire at the end of their India
+reminder day. Invalid, revoked and wrong-package FCM tokens are removed only from
+the broker registry. Delivery retries are bounded and old outbox rows are pruned.
+
+The existing Free hosting plan sleeps when idle, so in-process scans are delayed
+while the backend is asleep. The Android app's generic scheduled local reminders
+provide a limited backup based on its latest authorized refresh; opening the
+alert always checks current access. An offline backup cannot learn a later
+payment or reassignment until the next refresh. No billing change is required
+or performed. Server push and local notification timing remain subject to OS
+notification permissions, device power controls and connectivity.
+
+```sh
+npm run test:broker-mobile-push
+npm run test:broker-only
+npm run test:broker-gateway
+```
 
 The portfolio reads booking and commission scope in parallel, then uses batched financial reads; concurrent financial misses
 share work, cache entries/bytes are bounded, and histories load on opening one

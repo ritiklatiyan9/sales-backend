@@ -228,8 +228,8 @@ test('broker mobile SQL enforces per-plot scope, privacy and current access',asy
   });
   await t.test('financial reads batch, cache and refresh without per-client queries',async()=>{
     const first=queries.length;await service.portfolio(session);
-    assert.equal(queries.length-first,3,'warm finance cache leaves Bookings/commission scope and client-scope SQL only');
-    const second=queries.length;await service.portfolio(session,{forceFresh:true});assert.equal(queries.length-second,5);
+    assert.equal(queries.length-first,5,'warm finance cache retains batched scope/client SQL and the post-read reminder-authority guard');
+    const second=queries.length;await service.portfolio(session,{forceFresh:true});assert.equal(queries.length-second,7);
     assert.ok(!queries.some(q=>/^(?:UPDATE|DELETE FROM|INSERT INTO) (?:plots|members|bookings|plot_payments|plot_installments)\b/.test(q)));
   });
 });

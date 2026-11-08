@@ -12,7 +12,9 @@ async function fixture(t, overrides = {}) {
     login: async body => { calls.push(['login', body]); return { token: 'fictional.token', user: { name: 'Partner' } }; },
     ...overrides,
   };
-  const server = createBrokerOnlyApp({ service, routerOptions: { isEnabled: () => true } }).listen(0, '127.0.0.1');
+  const server = createBrokerOnlyApp({ service, routerOptions: { isEnabled: () => true,
+    pushDevices:{register:async(session,body)=>calls.push(['register',session,body]),unregister:async(session,body)=>calls.push(['unregister',session,body])},
+  } }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
   return { calls, request: (path, init) => fetch(`http://127.0.0.1:${server.address().port}${path}`, init) };
@@ -62,4 +64,16 @@ test('standalone errors never expose database or signing diagnostics', async t =
   const response = await f.request('/api/broker-mobile/portfolio', { headers: { Authorization: 'Bearer fictional.token' } });
   assert.equal(response.status, 503);
   assert.ok(!/company|database|password/i.test(await response.text()));
+});
+test('standalone permits only authenticated JSON device registration/unregistration and logout',async t=>{
+  const f=await fixture(t,{logout:async session=>{assert.equal(session.account.id,1);return {success:true};}});
+  const body=JSON.stringify({token:'synthetic_partner_token_1234567890',platform:'android'});
+  const headers={'Content-Type':'application/json',Authorization:'Bearer fictional.token'};
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'POST',headers,body})).status,200);
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'DELETE',headers,body:JSON.stringify({token:'synthetic_partner_token_1234567890'})})).status,200);
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'DELETE',headers:{Authorization:headers.Authorization},body:'{}'})).status,415);
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'DELETE',headers,body:'[]'})).status,400);
+  assert.equal((await f.request('/api/broker-mobile/device-tokens',{method:'GET',headers})).status,404);
+  assert.deepEqual(await(await f.request('/api/broker-mobile/auth/logout',{method:'POST',headers,body:'{}'})).json(),{success:true});
+  assert.deepEqual(f.calls.filter(c=>c[0]==='register'||c[0]==='unregister').map(c=>c[0]),['register','unregister']);
 });

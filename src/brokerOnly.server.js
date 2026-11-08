@@ -3,6 +3,8 @@ import http from 'node:http';
 import { createBrokerOnlyApp } from './brokerOnly.app.js';
 import pool, { connectDB } from './config/db.js';
 import { validateProductionSecurity } from './security/production.js';
+import { migrateBrokerMobilePush } from './migrations/048_broker_mobile_push.js';
+import { startBrokerMobilePushWorker } from './services/brokerMobilePush.service.js';
 
 // Keep existing Bookings signing/identity values to preserve credentials,
 // saved sessions and private collection references. Never regenerate on migration.
@@ -20,6 +22,8 @@ server.keepAliveTimeout = 60000;
 
 try {
   await connectDB();
+  await migrateBrokerMobilePush(pool);
+  startBrokerMobilePushWorker(pool);
   server.listen(Number(process.env.PORT) || 8001, '0.0.0.0', () => console.log('My Real Partners API ready.'));
 } catch {
   console.error('My Real Partners API could not start.');

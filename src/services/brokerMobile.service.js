@@ -1,5 +1,5 @@
 import { createBrokerMobileAuthService } from './brokerMobileAuth.service.js';
-import { createMobileFinancialReader, projectMobilePlot } from './mobilePortal.service.js';
+import { createMobileFinancialReader, projectMobilePlot, mobileCurrentOwnerSql } from './mobilePortal.service.js';
 import { createBrokerPresentation, isBrokerPropertyId } from './brokerPresentation.service.js';
 
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
@@ -8,6 +8,11 @@ const active = alias => `(COALESCE(to_jsonb(${alias})->>'is_active','true') <> '
   AND upper(trim(COALESCE(to_jsonb(${alias})->>'status','ACTIVE'))) NOT IN ('INACTIVE','BLOCKED','DISABLED','DEACTIVATED','DELETED','SUSPENDED'))`;
 const brokerRole = alias => `'BROKER'=ANY(COALESCE(${alias}.member_types,ARRAY[${alias}.member_type]))`;
 const clientRole = alias => `'CLIENT'=ANY(COALESCE(${alias}.member_types,ARRAY[${alias}.member_type]))`;
+// Exact buyer pointer first, otherwise the latest current booking; never infer
+// notification authority from a ledger buyer name or an older booking.
+const reminderEligibilitySql = `upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED','UNDER CANCELLATION')
+  AND EXISTS(SELECT 1 FROM members reminder_client WHERE reminder_client.id=(${mobileCurrentOwnerSql})
+    AND reminder_client.site_id=p.site_id AND ${clientRole('reminder_client')} AND ${active('reminder_client')})`;
 const indiaToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 
 // Current booking attribution is one explicit authority. Staff-created records,
@@ -19,6 +24,7 @@ const scopedPlotsSql = `WITH allowed_sites AS (
   )
   SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
     a.private_site_name,a.private_org_name,m.id AS client_id,
+    (${reminderEligibilitySql}) AS installment_reminders_eligible,
     COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
     to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
     COALESCE(to_jsonb(p)->>'unit_type','plot') AS unit_type,
@@ -43,6 +49,7 @@ const scopedPlotsSql = `WITH allowed_sites AS (
 const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
     s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name,
     owner.id AS client_id,COALESCE(to_jsonb(p)->>'buyer_name','') AS ledger_buyer_name,
+    ((${reminderEligibilitySql}) AND owner.id=(${mobileCurrentOwnerSql})) AS installment_reminders_eligible,
     COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
     to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
     COALESCE(to_jsonb(p)->>'unit_type','plot') AS unit_type,
@@ -98,26 +105,36 @@ export function createBrokerMobileService(db, options = {}) {
   };
   const privateBrands = rows => rows.flatMap(row => [row.private_site_name, row.private_org_name]);
   const parameters = session => [session.userIds, session.brokerMemberIds, session.siteIds];
-  async function scopedPlots(session, id) {
+  async function scopedPlots(session, id, { remindersOnly = false } = {}) {
     const args = parameters(session);
     if (id !== undefined) {
       if (!/^[1-9]\d*$/.test(String(id)) || !Number.isSafeInteger(Number(id)) || Number(id)>2147483647) fail(404, 'Property unavailable.');
       args.push(Number(id));
     }
-    const querySuffix=`${id !== undefined ? 'AND p.id=$4' : ''} ORDER BY p.site_id,p.plot_no,p.id LIMIT 1001`;
+    // Notification entitlement requires an explicit current client. Historical
+    // commission labels and cancelled/resale plots remain governed by the
+    // existing portfolio rules, but must never produce a payment reminder.
+    const reminderScope=remindersOnly?`AND (${reminderEligibilitySql})`:'';
+    const querySuffix=`${id !== undefined ? 'AND p.id=$4' : ''} ${reminderScope} ORDER BY p.site_id,p.plot_no,p.id LIMIT 1001`;
     const reads=[db.query(`${scopedPlotsSql} ${querySuffix}`,args)];
     if(includeCommissionPlots){
       const commissionArgs=[session.brokerMemberIds,session.siteIds];
       if(id!==undefined)commissionArgs.push(Number(id));
-      const commissionSuffix=`${id!==undefined?'AND p.id=$3':''} ORDER BY p.site_id,p.plot_no,p.id LIMIT 1001`;
+      const commissionSuffix=`${id!==undefined?'AND p.id=$3':''} ${reminderScope} ORDER BY p.site_id,p.plot_no,p.id LIMIT 1001`;
       reads.push(db.query(`${commissionPlotsSql} ${commissionSuffix}`,commissionArgs));
     }
     const results=await Promise.all(reads);
     // Prefer the current Accounts buyer projection when both explicit sources
     // authorize the same plot; never use an old commission buyer snapshot.
     const byId=new Map();
-    for(const result of results)for(const row of result.rows)byId.set(row.id,row);
-    const rows=[...byId.values()].sort((a,b)=>a.site_id-b.site_id||String(a.plot_no).localeCompare(String(b.plot_no),'en',{numeric:true})||a.id-b.id);
+    for(const result of results)for(const row of result.rows){
+      // A ledger-name fallback must not replace an explicitly current booking
+      // client when the commission and booking branches overlap.
+      if(byId.get(row.id)?.installment_reminders_eligible===true&&row.installment_reminders_eligible!==true)continue;
+      byId.set(row.id,row);
+    }
+    const rows=[...byId.values()].filter(row=>!remindersOnly||row.installment_reminders_eligible===true)
+      .sort((a,b)=>a.site_id-b.site_id||String(a.plot_no).localeCompare(String(b.plot_no),'en',{numeric:true})||a.id-b.id);
     if (rows.length > 1000) fail(503, 'Your portfolio is temporarily unavailable.');
     if (id !== undefined && !rows.length) fail(404, 'Property unavailable.');
     return rows;
@@ -125,8 +142,8 @@ export function createBrokerMobileService(db, options = {}) {
   return {
     ...auth,
     features: { commissionLinkedPlots: includeCommissionPlots, confidentialPresentation: true },
-    async portfolio(session, { forceFresh = false } = {}) {
-      const plots = await scopedPlots(session);
+    async portfolio(session, { forceFresh = false, remindersOnly = false } = {}) {
+      let plots = await scopedPlots(session, undefined, { remindersOnly });
       const args = parameters(session);
       args.push(plots.map(row => row.client_id));
       // Referral precedence is explicit member first, then user only when the
@@ -143,6 +160,13 @@ export function createBrokerMobileService(db, options = {}) {
       const clients = rows.map(safeClient);
       const byClient = new Map(clients.map(client => [client.id, client]));
       const financials = await financialsFor(plots.map(row => row.id), { forceFresh });
+      // Finance reads can be slow. Eligibility in the mobile popup/backup plan
+      // and the server worker must reflect the current buyer, broker and status
+      // after those reads. Keep historical portfolio visibility unchanged.
+      const current = await scopedPlots(session, undefined, { remindersOnly });
+      plots = plots.map(plot=>({...plot,installment_reminders_eligible:plot.installment_reminders_eligible===true
+        && current.some(row=>row.id===plot.id&&row.client_id===plot.client_id&&row.installment_reminders_eligible===true)}))
+        .filter(plot=>!remindersOnly||plot.installment_reminders_eligible);
       const today = indiaToday();
       const projected = [];
       for (const plot of plots) {
@@ -157,6 +181,7 @@ export function createBrokerMobileService(db, options = {}) {
         }
         const data = financials.get(plot.id);
         const { payments, ...detail } = presentation.plot(projectMobilePlot(plot, data.schedules, data.receipts, today));
+        detail.installmentRemindersEligible = plot.installment_reminders_eligible === true;
         client.plots.push(detail); projected.push(detail);
       }
       if(clients.length>1000)fail(503,'Your portfolio is temporarily unavailable.');
@@ -187,7 +212,8 @@ export function createBrokerMobileService(db, options = {}) {
       rememberProperties(session, candidates);
       const presentation = createBrokerPresentation(session, { brands: privateBrands([plot]) });
       const data = (await financialsFor([plot.id], { forceFresh })).get(plot.id);
-      return { plot: presentation.plot(projectMobilePlot(plot, data.schedules, data.receipts, indiaToday())), updatedAt: data.updatedAt };
+      return { plot: { ...presentation.plot(projectMobilePlot(plot, data.schedules, data.receipts, indiaToday())),
+        installmentRemindersEligible: plot.installment_reminders_eligible === true }, updatedAt: data.updatedAt };
     },
   };
 }

@@ -7,6 +7,7 @@ import { MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
 import { mobilePortalEnabled, sendPortfolioJson } from './mobilePortal.routes.js';
 import { rateLimit } from '../middlewares/rateLimit.middleware.js';
 import { mailerEnabled } from '../services/mailer.service.js';
+import { createBrokerMobilePushDevices } from '../services/brokerMobilePush.service.js';
 
 export function createBrokerMobileLoginLimiter({ now = Date.now, windowMs = 15*60*1000, maxEntries = 10000 } = {}) {
   const entries = new Map();
@@ -35,6 +36,7 @@ export function createBrokerMobileRouter(service, {
   resetRequestLimiter=createBrokerMobileLoginLimiter(),
   resetConfirmLimiter=rateLimit({limit:30,windowMs:15*60*1000,key:req=>`${req.ip}:${req.body?.challengeId||'invalid'}`}),
   passwordChangeLimiter=rateLimit({limit:10,windowMs:15*60*1000,key:req=>req.brokerSession?.account?.id||req.ip}),
+  pushDevices,
 }={}) {
   const router=express.Router();
   const run=handler=>(req,res,next)=>Promise.resolve(handler(req,res,next)).catch(error=>{
@@ -42,7 +44,7 @@ export function createBrokerMobileRouter(service, {
     res.status(status).json({ message: status===503?'The service is temporarily unavailable. Please try again.':error.message });
   });
   router.use((_req,res,next)=>{res.set('Cache-Control','private, no-store');next();});
-  router.get('/status',(_req,res)=>res.json({service:'my-real-assets-broker',apiVersion:1,authVersion:2,portfolioVersion:3,confidentialPresentation:true,commissionLinkedPlots:service.features?.commissionLinkedPlots??true,enabled:Boolean(isEnabled()),sessionDurationDays:MOBILE_SESSION_DAYS,passwordReset:'registered-email-otp',recoveryEmailEnabled:mailerEnabled()}));
+  router.get('/status',(_req,res)=>res.json({service:'my-real-assets-broker',apiVersion:1,authVersion:2,portfolioVersion:3,confidentialPresentation:true,commissionLinkedPlots:service.features?.commissionLinkedPlots??true,installmentNotifications:true,enabled:Boolean(isEnabled()),sessionDurationDays:MOBILE_SESSION_DAYS,passwordReset:'registered-email-otp',recoveryEmailEnabled:mailerEnabled()}));
   router.use((_req,res,next)=>{
     if(!isEnabled())return res.status(503).json({code:'MOBILE_PORTAL_DISABLED',message:'Partner access is temporarily unavailable.'});
     next();
@@ -58,9 +60,19 @@ export function createBrokerMobileRouter(service, {
   const fresh=req=>/(?:^|,)\s*(?:no-cache|no-store|max-age=0)\s*(?:,|$)/i.test(req.get('Cache-Control')||'');
   router.get('/me',(req,res)=>res.json({user:req.brokerSession.user}));
   router.post('/auth/password/change',passwordChangeLimiter,run(async(req,res)=>res.json(await service.changePassword(req.brokerSession,req.body))));
+  router.post('/auth/logout',run(async(req,res)=>res.json(await service.logout(req.brokerSession))));
+  router.post('/device-tokens',run(async(req,res)=>{
+    if(!pushDevices)return res.status(503).json({message:'Notifications are temporarily unavailable.'});
+    await pushDevices.register(req.brokerSession,req.body);res.json({ok:true});
+  }));
+  router.delete('/device-tokens',run(async(req,res)=>{
+    if(!pushDevices)return res.status(503).json({message:'Notifications are temporarily unavailable.'});
+    await pushDevices.unregister(req.brokerSession,req.body);res.json({ok:true});
+  }));
   router.get('/portfolio',run(async(req,res)=>sendPortfolioJson(req,res,await service.portfolio(req.brokerSession,{forceFresh:fresh(req)}))));
   router.get('/plots/:id',run(async(req,res)=>sendPortfolioJson(req,res,await service.plot(req.brokerSession,req.params.id,{forceFresh:fresh(req)}))));
   return router;
 }
 
-export default createBrokerMobileRouter(createBrokerMobileService(pool));
+const service=createBrokerMobileService(pool);
+export default createBrokerMobileRouter(service,{pushDevices:createBrokerMobilePushDevices(pool,{brokerService:service})});

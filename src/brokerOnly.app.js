@@ -7,6 +7,8 @@ const posts = new Set([
   '/api/broker-mobile/auth/password-reset/request',
   '/api/broker-mobile/auth/password-reset/confirm',
   '/api/broker-mobile/auth/password/change',
+  '/api/broker-mobile/auth/logout',
+  '/api/broker-mobile/device-tokens',
 ]);
 const gets = new Set([
   '/api/broker-mobile/status', '/api/broker-mobile/me', '/api/broker-mobile/portfolio',
@@ -24,17 +26,17 @@ export function createBrokerOnlyApp({ service, routerOptions, trustProxy } = {})
     if (req.method === 'GET' && req.url === '/health') {
       return res.json({ status: 'ok', service: 'my-real-partners-api' });
     }
-    const permitted = req.method === 'POST' ? posts.has(req.url)
+    const permitted = req.method === 'DELETE' ? req.url==='/api/broker-mobile/device-tokens' : req.method === 'POST' ? posts.has(req.url)
       : req.method === 'GET' && (gets.has(req.url) || /^\/api\/broker-mobile\/plots\/pr_[a-f0-9]{32}$/.test(req.url));
     if (!permitted) return res.status(404).json({ message: 'Not found.' });
-    if (req.method === 'POST' && !req.is('application/json')) {
+    if (['POST','DELETE'].includes(req.method) && !req.is('application/json')) {
       return res.status(415).json({ message: 'Send a JSON request.' });
     }
     next();
   });
   app.use(express.json({ limit: '16kb', strict: true }));
   app.use((req, res, next) => {
-    if (req.method === 'POST' && (!req.body || Array.isArray(req.body) || typeof req.body !== 'object')) {
+    if (['POST','DELETE'].includes(req.method) && (!req.body || Array.isArray(req.body) || typeof req.body !== 'object')) {
       return res.status(400).json({ message: 'Please check the request.' });
     }
     next();

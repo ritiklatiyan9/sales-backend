@@ -172,6 +172,26 @@ export function createBrokerMobileAuthService(db,{
     if(!sameHash(session.identity,claims.identity))unauthorized();
     return session;
   }
+  // Server-only validation for a registered notification device. A background
+  // registration may outlive its JWT, but never the exact enrolled identity,
+  // credential version, current staff bindings or site grants it registered as.
+  async function getDeviceSession({accountId,version,identity}={},connection=db){
+    if(!Number.isSafeInteger(accountId)||accountId<=0||!Number.isSafeInteger(version)||version<0
+      ||typeof identity!=='string'||!/^[a-f0-9]{64}$/.test(identity))unauthorized();
+    const account=await getAccount(accountId,connection);
+    if(!account||account.token_version!==version)unauthorized();
+    const session=await contextFor(account,connection);
+    if(!sameHash(session.identity,identity))unauthorized();
+    return session;
+  }
+  async function logout(session){
+    return transaction(async connection=>{
+      await getAccount(session.account.id,connection,{lock:true});
+      await getDeviceSession({accountId:session.account.id,version:session.account.token_version,identity:session.identity},connection);
+      await connection.query(`UPDATE booking_broker_mobile_accounts SET token_version=token_version+1,updated_at=$2 WHERE id=$1`,[session.account.id,new Date(now())]);
+      return {success:true};
+    });
+  }
   async function login(body){
     if(!body||typeof body!=='object'||Array.isArray(body)||(body.role!==undefined&&body.role!=='broker'))invalid();
     const mobile=normalizeMobile(body.mobile??body.identifier);
@@ -270,5 +290,5 @@ export function createBrokerMobileAuthService(db,{
       return {success:true};
     });
   }
-  return {login,getSession,requestPasswordReset,confirmPasswordReset,changePassword};
+  return {login,getSession,getDeviceSession,logout,requestPasswordReset,confirmPasswordReset,changePassword};
 }

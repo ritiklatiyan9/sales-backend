@@ -7,7 +7,9 @@ import { recoverOcrQueue } from './queue/ocrQueue.js';
 import { validateProductionSecurity } from './security/production.js';
 import { startWhatsAppWorker } from './services/whatsapp.service.js';
 import { startMobilePushWorker } from './services/mobilePush.service.js';
+import { startBrokerMobilePushWorker } from './services/brokerMobilePush.service.js';
 import { migrateBookingAccountsLoginAccess } from './migrations/047_booking_accounts_login_access.js';
+import { migrateBrokerMobilePush } from './migrations/048_broker_mobile_push.js';
 
 validateProductionSecurity();
 
@@ -20,9 +22,11 @@ async function start() {
   try {
     await connectDB();
     await migrateBookingAccountsLoginAccess(pool);
+    await migrateBrokerMobilePush(pool);
     await recoverOcrQueue(pool);
     startWhatsAppWorker();
     startMobilePushWorker(pool);
+    startBrokerMobilePushWorker(pool);
     server.listen(PORT, () => console.log(`[booking-api] running on port ${PORT}`));
   } catch (err) {
     console.error('[booking-api] Failed to connect to DB:', err.code || 'CONNECTION_ERROR');
