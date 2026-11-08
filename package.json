@@ -83,6 +83,7 @@
     "test:client-invitations": "node --test src/services/clientInvitation.service.test.mjs",
     "test:mobile-push": "node --test src/services/mobilePush.service.test.mjs scripts/check-mobile-fcm.test.mjs",
     "test:broker-mobile-push": "node --test src/services/brokerMobilePush.service.test.mjs",
+    "test:broker-booking-progress": "node --test src/services/brokerBookingProgress.service.test.mjs",
     "check:mobile-fcm": "node scripts/check-mobile-fcm.mjs",
     "migrate:broker-mobile": "node src/migrations/043_broker_mobile_indexes.js",
     "test:broker-mobile": "node --test src/services/brokerMobile.service.test.mjs src/services/brokerMobileAuth.service.test.mjs src/services/brokerPresentation.service.test.mjs src/services/brokerResetEmail.service.test.mjs",

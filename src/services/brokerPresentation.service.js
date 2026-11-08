@@ -73,7 +73,7 @@ export function createBrokerPresentation(session, { brands = [] } = {}) {
   };
   const plot = value => {
     const planName = ['Full payment', 'Installment plan', 'Payment plan not set'].includes(value.paymentPlan?.name) ? value.paymentPlan.name : 'Installment plan';
-    const states = { booked: 'Booked', sold: 'Sold', registry: 'Registered', registered: 'Registered', active: 'Active', transferred: 'Transferred', cancelled: 'Cancelled', canceled: 'Cancelled', 'under cancellation': 'Under cancellation' };
+    const states = { booked: 'Booked', sold: 'Sold', registry: 'Registry', registered: 'Registry', active: 'Active', transferred: 'Transferred', cancelled: 'Cancelled', canceled: 'Cancelled', resale: 'Resale', 'under cancellation': 'Under cancellation' };
     let numbered = 0;
     const installments = value.installments.map(row => {
       const original = String(row.title || '').trim().toLowerCase();
@@ -90,7 +90,7 @@ export function createBrokerPresentation(session, { brands = [] } = {}) {
       id: propertyId(value.id), number: publicNumber(value.number), projectName: 'Your Property',
       propertyRef: readable('RA', 'property-reference', value.id), ...collection(value.projectId),
       area: value.area, areaUnit: value.areaUnit === 'sq ft' ? 'sq ft' : 'sq yd',
-      status: states[String(value.status || '').toLowerCase()] || 'Active',
+      status: states[String(value.status || '').trim().toLowerCase()] || 'Active',
       totalAmount: value.totalAmount, paidAmount: value.paidAmount, balanceAmount: value.balanceAmount,
       interestAmount: value.interestAmount, totalDueAmount: value.totalDueAmount, progress: value.progress,
       nextDueDate: value.nextDueDate, nextDueAmount: value.nextDueAmount,

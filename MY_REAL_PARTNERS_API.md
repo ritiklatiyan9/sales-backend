@@ -10,7 +10,7 @@ remains separate.
 ## Mobile sign-in and recovery
 
 - `GET /status`: public `{service:"my-real-assets-broker",apiVersion:1,authVersion:2,
-  portfolioVersion:3,commissionLinkedPlots:true,installmentNotifications:true,enabled:true,sessionDurationDays:30,passwordReset:"registered-email-otp",
+  portfolioVersion:3,commissionLinkedPlots:true,installmentNotifications:true,bookingProgressVersion:1,enabled:true,sessionDurationDays:30,passwordReset:"registered-email-otp",
   recoveryEmailEnabled:true}`. The email flag reports transport configuration;
   it does not send a test message or guarantee delivery to every address.
 - `POST /auth/login`: `{mobile,password}`. Initial app password is the broker's
@@ -63,6 +63,47 @@ All authenticated requests require `Authorization: Bearer <token>`.
   are omitted from this response.
 - `GET /plots/:id`: `{plot,updatedAt}`, adding the full payment history for that
   currently assigned plot. Invalid/unassigned IDs receive a generic 404.
+
+### Booking progress
+
+Detail responses add `plot.bookingProgress` without expanding the portfolio or
+changing plot entitlement. It contains `currentStage`, `nextAction` and
+`milestones:[{code,state,date}]`. Codes and actions are a fixed allowlist; no
+raw status notes, document paths, bank information, company names or internal
+record IDs are exposed. Public `/status` advertises `bookingProgressVersion:1`.
+
+This is current recorded progress, not a reconstructed status audit. The
+backend has no complete booking/status-transition history. Booking dates,
+eligible registry/deed/handover dates and posted refund-entry dates are shown
+only when the records establish them. Unrelated `updated_at` values are never
+used as milestone dates. A `REGISTRY` plot status or an auto-created registry
+workspace does not establish completion; document handover requires a current
+deed on file. Missing evidence remains pending or unavailable with an Admin
+Office next action.
+
+Historical evidence is bound to the latest current-client booking and exact
+plot/site IDs. Registry rows predating that booking or contradicting the
+current buyer are excluded; matching plot numbers never join records. Refund
+entries follow the existing posting/approval/cheque policy, exclude transfer
+debits, and cannot establish settlement of the entire booking. A recorded
+refund therefore asks the user to confirm any remaining refund with the Admin
+Office.
+
+A later booking edit is a conservative evidence boundary: older registry,
+deed, handover and refund records may no longer establish the current client's
+progress. Edit timestamps are used only to exclude ambiguous history, never
+displayed as milestone dates. This can produce a neutral Admin Office fallback
+after unrelated edits. Legacy records without a safe current-booking boundary
+also show current status without inventing historical milestones. Existing
+retired/unassigned plot denials are preserved; the timeline does not restore
+plots that the broker is no longer entitled to view.
+
+Details are rechecked after financial and progress reads, including current
+broker identity and plot/client/status snapshots. A concurrent reassignment,
+access removal or account revocation cannot release the previous snapshot.
+The app refreshes detail progress when opened or resumed and hides stale
+details during refresh, backgrounding or denial. This release is read-only and
+requires no new database migration.
 
 Each plot includes `installmentRemindersEligible`. The app must require explicit
 `true` before showing an installment reminder or scheduling a local backup;

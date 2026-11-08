@@ -39,6 +39,10 @@ test('known company names, compact brands and raw bookkeeping text cannot escape
     };
     const view = p.plot(source);
     assert.equal(view.number, 'B34');
+    assert.equal(view.status,'Registry');
+    assert.equal(p.plot({...source,status:'REGISTERED'}).status,'Registry');
+    assert.equal(p.plot({...source,status:' RESALE '}).status,'Resale');
+    assert.equal(p.plot({...source,status:' UNDER CANCELLATION '}).status,'Under cancellation');
     assert.equal(view.totalAmount, 1000); assert.equal(view.paidAmount, 600);
     assert.equal(view.installments[0].title, 'Installment 1');
     assert.match(view.installments[0].id, /^ins_[a-f0-9]{32}$/);

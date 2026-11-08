@@ -347,6 +347,51 @@ test('commission-linked Accounts plots include approved related owners without l
   });
 });
 
+test('broker detail timeline uses current scope and rejects changes during slow reads',async t=>{
+  const previous=process.env.MOBILE_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET='synthetic-test-only-broker-timeline-secret-long-enough';
+  const db=await fixture();
+  let duringFinance;
+  const service=createBrokerMobileService({...db,query:async(sql,args)=>{
+    const result=await db.query(sql,args);
+    if(duringFinance && /FROM plot_installments pi WHERE/.test(sql)){
+      const change=duringFinance;duringFinance=null;await change();
+    }
+    return result;
+  }},{bcryptRounds:4});
+  t.after(async()=>{await db.close();if(previous===undefined)delete process.env.MOBILE_PORTAL_SECRET;else process.env.MOBILE_PORTAL_SECRET=previous;});
+  const session=await service.getSession((await service.login(credentials)).token);
+  const id=createBrokerPresentation(session).propertyId(1);
+  await t.test('additive timeline stays lazy, contains only safe milestones and follows current status',async()=>{
+    const portfolio=await service.portfolio(session);
+    assert.ok(portfolio.clients.every(c=>c.plots.every(p=>!Object.hasOwn(p,'bookingProgress'))));
+    const {plot}=await service.plot(session,id,{forceFresh:true});
+    assert.equal(plot.buyerName,'Client Alpha');
+    assert.equal(plot.bookingProgress.currentStage,'booked');
+    assert.ok(Array.isArray(plot.bookingProgress.milestones));
+    assert.ok(!JSON.stringify(plot.bookingProgress).includes('567890123456'));
+    await db.exec("UPDATE plots SET status='UNDER CANCELLATION' WHERE id=1");
+    assert.equal((await service.plot(session,id,{forceFresh:true})).plot.bookingProgress.currentStage,'cancellation_pending');
+    await db.exec("UPDATE plots SET status='BOOKED' WHERE id=1");
+  });
+  await t.test('buyer reassignment during finance cannot return old details or timeline',async()=>{
+    duringFinance=()=>db.exec('UPDATE plots SET buyer_member_id=13 WHERE id=1; UPDATE bookings SET client_member_id=13 WHERE id=1');
+    await assert.rejects(service.plot(session,id,{forceFresh:true}),{statusCode:404});
+    assert.equal((await service.plot(session,id,{forceFresh:true})).plot.buyerName,'Explicit Booking Client');
+    await db.exec('UPDATE plots SET buyer_member_id=10 WHERE id=1; UPDATE bookings SET client_member_id=10 WHERE id=1');
+  });
+  await t.test('cancellation removing current broker authority blocks an in-flight detail',async()=>{
+    duringFinance=()=>db.exec("UPDATE bookings SET status='CANCELLED' WHERE id=1");
+    await assert.rejects(service.plot(session,id,{forceFresh:true}),{statusCode:404});
+    await db.exec("UPDATE bookings SET status='CONFIRMED' WHERE id=1");
+  });
+  await t.test('account revocation during finance is checked before returning a timeline',async()=>{
+    duringFinance=()=>db.query('UPDATE booking_broker_mobile_accounts SET is_active=false WHERE id=$1',[session.account.id]);
+    await assert.rejects(service.plot(session,id,{forceFresh:true}),{statusCode:401});
+    await db.query('UPDATE booking_broker_mobile_accounts SET is_active=true WHERE id=$1',[session.account.id]);
+  });
+});
+
 test('broker router is opt-in, scoped and returns only safe service errors',async()=>{
   const invoke=(router,method,url,headers={})=>new Promise((resolve,reject)=>{
     const req={method,url,headers,query:{},get(name){return this.headers[name.toLowerCase()];},ip:'test-ip'};
@@ -357,6 +402,7 @@ test('broker router is opt-in, scoped and returns only safe service errors',asyn
   const service={async getSession(){touched=true;throw new Error('SQL password=secret');}};
   const off=createBrokerMobileRouter(service,{isEnabled:()=>false});
   const status=await invoke(off,'GET','/status');assert.equal(status.body.service,'my-real-assets-broker');assert.equal(status.body.authVersion,2);assert.equal(status.body.enabled,false);assert.equal(status.body.passwordReset,'registered-email-otp');
+  assert.equal(status.body.bookingProgressVersion,1);
   assert.equal((await invoke(off,'GET','/portfolio')).status,503);assert.equal(touched,false);
   const on=createBrokerMobileRouter(service,{isEnabled:()=>true});
   const anon=await invoke(on,'GET','/portfolio');assert.equal(anon.status,401);assert.match(anon.headers['Cache-Control'],/no-store/);

@@ -1,6 +1,7 @@
 import { createBrokerMobileAuthService } from './brokerMobileAuth.service.js';
 import { createMobileFinancialReader, projectMobilePlot, mobileCurrentOwnerSql } from './mobilePortal.service.js';
 import { createBrokerPresentation, isBrokerPropertyId } from './brokerPresentation.service.js';
+import { createBrokerBookingProgressReader } from './brokerBookingProgress.service.js';
 
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
@@ -23,7 +24,10 @@ const scopedPlotsSql = `WITH allowed_sites AS (
     SELECT s.id,s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name FROM sites s WHERE s.id=ANY($3::integer[])
   )
   SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
-    a.private_site_name,a.private_org_name,m.id AS client_id,
+    a.private_site_name,a.private_org_name,m.id AS client_id,m.full_name AS current_client_name,
+    to_jsonb(p)->>'updated_at' AS access_updated_at,
+    b.id AS access_booking_id,b.status AS access_booking_status,b.updated_at AS access_booking_updated_at,
+    b.created_at AS access_booking_created_at,b.booking_date AS access_booking_date,
     (${reminderEligibilitySql}) AS installment_reminders_eligible,
     COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
     to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
@@ -32,7 +36,8 @@ const scopedPlotsSql = `WITH allowed_sites AS (
     COALESCE((to_jsonb(p)->>'interest_rate')::numeric,0) AS interest_rate,
     COALESCE(to_jsonb(p)->>'interest_type','per_month') AS interest_type
   FROM plots p JOIN allowed_sites a ON a.id=p.site_id
-  JOIN LATERAL (SELECT b.id,b.client_member_id,b.booking_agent_id,b.agent_user_id,b.status
+  JOIN LATERAL (SELECT b.id,b.client_member_id,b.booking_agent_id,b.agent_user_id,b.status,
+    to_jsonb(b)->>'updated_at' AS updated_at,to_jsonb(b)->>'created_at' AS created_at,to_jsonb(b)->>'booking_date' AS booking_date
     FROM bookings b WHERE b.site_id=p.site_id AND b.plot_id=p.id ORDER BY b.id DESC LIMIT 1) b ON true
   JOIN members m ON m.id=COALESCE(p.buyer_member_id,b.client_member_id) AND m.site_id=p.site_id
   WHERE b.client_member_id=m.id AND ${clientRole('m')} AND ${active('m')}
@@ -48,7 +53,10 @@ const scopedPlotsSql = `WITH allowed_sites AS (
 // is the primary Booking By person. Names never grant plot access here.
 const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
     s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name,
-    owner.id AS client_id,COALESCE(to_jsonb(p)->>'buyer_name','') AS ledger_buyer_name,
+    owner.id AS client_id,owner.full_name AS current_client_name,COALESCE(to_jsonb(p)->>'buyer_name','') AS ledger_buyer_name,
+    to_jsonb(p)->>'updated_at' AS access_updated_at,
+    latest_booking.id AS access_booking_id,latest_booking.status AS access_booking_status,latest_booking.updated_at AS access_booking_updated_at,
+    latest_booking.created_at AS access_booking_created_at,latest_booking.booking_date AS access_booking_date,
     ((${reminderEligibilitySql}) AND owner.id=(${mobileCurrentOwnerSql})) AS installment_reminders_eligible,
     COALESCE((to_jsonb(p)->>'full_payment_due')::boolean,false) AS full_payment_due,
     to_jsonb(p)->>'full_payment_due_date' AS full_payment_due_date,
@@ -58,7 +66,7 @@ const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_p
     COALESCE(to_jsonb(p)->>'interest_type','per_month') AS interest_type
   FROM plots p JOIN sites s ON s.id=p.site_id
   LEFT JOIN LATERAL (
-    SELECT m.id FROM members m WHERE m.site_id=p.site_id AND ${active('m')}
+    SELECT m.id,m.full_name FROM members m WHERE m.site_id=p.site_id AND ${active('m')}
       AND CASE WHEN p.buyer_member_id IS NOT NULL THEN m.id=p.buyer_member_id ELSE
         NULLIF(BTRIM(to_jsonb(p)->>'buyer_name'),'') IS NOT NULL
         AND UPPER(BTRIM(m.full_name))=UPPER(BTRIM(to_jsonb(p)->>'buyer_name'))
@@ -66,6 +74,9 @@ const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_p
           AND UPPER(BTRIM(duplicate.full_name))=UPPER(BTRIM(to_jsonb(p)->>'buyer_name')))
       END
   ) owner ON true
+  LEFT JOIN LATERAL (SELECT b.id,b.status,to_jsonb(b)->>'updated_at' AS updated_at,
+    to_jsonb(b)->>'created_at' AS created_at,to_jsonb(b)->>'booking_date' AS booking_date
+    FROM bookings b WHERE b.plot_id=p.id AND b.site_id=p.site_id ORDER BY b.id DESC LIMIT 1) latest_booking ON true
   WHERE p.site_id=ANY($2::integer[])
     AND upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY')
     AND EXISTS(SELECT 1 FROM plot_commissions_v2 pc JOIN members bm ON bm.id=pc.agent_id AND bm.site_id=p.site_id
@@ -91,6 +102,7 @@ export function createBrokerMobileService(db, options = {}) {
   // Financial calculations, posting policy, batch queries and bounded caching
   // are shared with the client app; this instance has its own cache boundary.
   const financialsFor = createMobileFinancialReader(db, options);
+  const bookingProgressFor = createBrokerBookingProgressReader(db, options);
   const auth = createBrokerMobileAuthService(db, options);
   const propertyLookups = new Map();
   const rememberProperties = (session, plots) => {
@@ -211,9 +223,19 @@ export function createBrokerMobileService(db, options = {}) {
       if (!plot) fail(404, 'Property unavailable.');
       rememberProperties(session, candidates);
       const presentation = createBrokerPresentation(session, { brands: privateBrands([plot]) });
-      const data = (await financialsFor([plot.id], { forceFresh })).get(plot.id);
-      return { plot: { ...presentation.plot(projectMobilePlot(plot, data.schedules, data.receipts, indiaToday())),
-        installmentRemindersEligible: plot.installment_reminders_eligible === true }, updatedAt: data.updatedAt };
+      const scope = JSON.stringify(plot);
+      const data = (await financialsFor([plot.id], { forceFresh, cacheScopes:new Map([[plot.id,scope]]) })).get(plot.id);
+      const projected = projectMobilePlot(plot, data.schedules, data.receipts, indiaToday());
+      const bookingProgress = await bookingProgressFor({...plot,balanceAmount:projected.balanceAmount});
+      // Do not return a timeline or an old buyer's details if authority changes
+      // while financial / registry records are being read.
+      const current = (await scopedPlots(session,plot.id)).find(row=>row.id===plot.id);
+      if (!current || JSON.stringify(current)!==scope) fail(404, 'Property unavailable.');
+      await auth.getDeviceSession({accountId:session.account.id,version:session.account.token_version,identity:session.identity});
+      return { plot: { ...presentation.plot(projected),
+        buyerName: plot.current_client_name ? presentation.redact(plot.current_client_name) : undefined,
+        installmentRemindersEligible: plot.installment_reminders_eligible === true,
+        bookingProgress }, updatedAt: data.updatedAt };
     },
   };
 }
