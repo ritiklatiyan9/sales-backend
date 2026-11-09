@@ -49,9 +49,10 @@ if (process.env.NODE_ENV !== 'production') {
   app.use('/uploads', express.static(path.join(process.cwd(), 'src', 'uploads'), { dotfiles: 'deny', index: false }));
 }
 
-// The My Real Assets privacy and deletion pages must be publicly readable,
+// The mobile apps' privacy and deletion pages must be publicly readable,
 // including by app-store reviewers, without exposing the rest of the API.
 app.use('/my-real-assets', express.static(path.join(process.cwd(), 'public', 'my-real-assets'), { dotfiles: 'deny', index: false }));
+app.use('/my-real-partners', express.static(path.join(process.cwd(), 'public', 'my-real-partners'), { dotfiles: 'deny', index: false }));
 
 // API routes
 app.use('/', indexRoutes);
