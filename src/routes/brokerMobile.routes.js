@@ -9,6 +9,7 @@ import { rateLimit } from '../middlewares/rateLimit.middleware.js';
 import { mailerEnabled } from '../services/mailer.service.js';
 import { createBrokerMobilePushDevices } from '../services/brokerMobilePush.service.js';
 import { createBrokerReviewerAccess } from '../services/brokerReviewer.service.js';
+import { mobileMessaging, pushEnabled } from '../services/mobilePush.service.js';
 
 export function createBrokerMobileLoginLimiter({ now = Date.now, windowMs = 15*60*1000, maxEntries = 10000 } = {}) {
   const entries = new Map();
@@ -38,7 +39,11 @@ export function createBrokerMobileRouter(service, {
   resetConfirmLimiter=rateLimit({limit:30,windowMs:15*60*1000,key:req=>`${req.ip}:${req.body?.challengeId||'invalid'}`}),
   passwordChangeLimiter=rateLimit({limit:10,windowMs:15*60*1000,key:req=>req.brokerSession?.account?.id||req.ip}),
   pushDevices,
-  reviewerAccess=createBrokerReviewerAccess(),
+  reviewerAccess=createBrokerReviewerAccess({getNotificationSender:()=>{
+    if(!pushEnabled())return null;
+    const messaging=mobileMessaging();
+    return messaging?message=>messaging.send(message):null;
+  }}),
 }={}) {
   const router=express.Router();
   const run=handler=>(req,res,next)=>Promise.resolve(handler(req,res,next)).catch(error=>{
