@@ -8,6 +8,7 @@ import { mobilePortalEnabled, sendPortfolioJson } from './mobilePortal.routes.js
 import { rateLimit } from '../middlewares/rateLimit.middleware.js';
 import { mailerEnabled } from '../services/mailer.service.js';
 import { createBrokerMobilePushDevices } from '../services/brokerMobilePush.service.js';
+import { createBrokerReviewerAccess } from '../services/brokerReviewer.service.js';
 
 export function createBrokerMobileLoginLimiter({ now = Date.now, windowMs = 15*60*1000, maxEntries = 10000 } = {}) {
   const entries = new Map();
@@ -37,6 +38,7 @@ export function createBrokerMobileRouter(service, {
   resetConfirmLimiter=rateLimit({limit:30,windowMs:15*60*1000,key:req=>`${req.ip}:${req.body?.challengeId||'invalid'}`}),
   passwordChangeLimiter=rateLimit({limit:10,windowMs:15*60*1000,key:req=>req.brokerSession?.account?.id||req.ip}),
   pushDevices,
+  reviewerAccess=createBrokerReviewerAccess(),
 }={}) {
   const router=express.Router();
   const run=handler=>(req,res,next)=>Promise.resolve(handler(req,res,next)).catch(error=>{
@@ -49,28 +51,41 @@ export function createBrokerMobileRouter(service, {
     if(!isEnabled())return res.status(503).json({code:'MOBILE_PORTAL_DISABLED',message:'Partner access is temporarily unavailable.'});
     next();
   });
-  router.post('/auth/login',loginLimiter,run(async(req,res)=>res.json(await service.login(req.body))));
-  router.post('/auth/password-reset/request',resetRequestLimiter,run(async(req,res)=>res.json(await service.requestPasswordReset(req.body))));
-  router.post('/auth/password-reset/confirm',resetConfirmLimiter,run(async(req,res)=>res.json(await service.confirmPasswordReset(req.body))));
+  const reviewerToken=req=>{
+    const authorization=req.get('Authorization');
+    return typeof authorization==='string'&&authorization.startsWith('Bearer ')&&authorization.length<=4096
+      &&reviewerAccess.handlesToken(authorization.slice(7));
+  };
+  const loginService=req=>reviewerAccess.handlesLogin(req.body)||reviewerToken(req)?reviewerAccess:service;
+  const resetService=req=>reviewerAccess.handlesReset(req.body)||reviewerToken(req)?reviewerAccess:service;
+  router.post('/auth/login',loginLimiter,run(async(req,res)=>res.json(await loginService(req).login(req.body))));
+  router.post('/auth/password-reset/request',resetRequestLimiter,run(async(req,res)=>res.json(await resetService(req).requestPasswordReset(req.body))));
+  router.post('/auth/password-reset/confirm',resetConfirmLimiter,run(async(req,res)=>res.json(await resetService(req).confirmPasswordReset(req.body))));
   router.use(run(async(req,res,next)=>{
     const authorization=req.get('Authorization');
     if(!/^Bearer [A-Za-z0-9_.-]+$/.test(authorization||'')||authorization.length>4096)return res.status(401).json({message:'Please sign in again.'});
-    req.brokerSession=await service.getSession(authorization.slice(7));next();
+    const token=authorization.slice(7);
+    req.brokerService=reviewerAccess.handlesToken(token)?reviewerAccess:service;
+    req.brokerSession=await req.brokerService.getSession(token);next();
   }));
   const fresh=req=>/(?:^|,)\s*(?:no-cache|no-store|max-age=0)\s*(?:,|$)/i.test(req.get('Cache-Control')||'');
   router.get('/me',(req,res)=>res.json({user:req.brokerSession.user}));
-  router.post('/auth/password/change',passwordChangeLimiter,run(async(req,res)=>res.json(await service.changePassword(req.brokerSession,req.body))));
-  router.post('/auth/logout',run(async(req,res)=>res.json(await service.logout(req.brokerSession))));
+  router.post('/auth/password/change',passwordChangeLimiter,run(async(req,res)=>res.json(await req.brokerService.changePassword(req.brokerSession,req.body))));
+  router.post('/auth/logout',run(async(req,res)=>res.json(await req.brokerService.logout(req.brokerSession))));
   router.post('/device-tokens',run(async(req,res)=>{
+    if(req.brokerService===reviewerAccess)return res.json(await reviewerAccess.registerDevice(req.brokerSession,req.body));
     if(!pushDevices)return res.status(503).json({message:'Notifications are temporarily unavailable.'});
     await pushDevices.register(req.brokerSession,req.body);res.json({ok:true});
   }));
   router.delete('/device-tokens',run(async(req,res)=>{
+    if(req.brokerService===reviewerAccess)return res.json(await reviewerAccess.unregisterDevice(req.brokerSession,req.body));
     if(!pushDevices)return res.status(503).json({message:'Notifications are temporarily unavailable.'});
     await pushDevices.unregister(req.brokerSession,req.body);res.json({ok:true});
   }));
-  router.get('/portfolio',run(async(req,res)=>sendPortfolioJson(req,res,await service.portfolio(req.brokerSession,{forceFresh:fresh(req)}))));
-  router.get('/plots/:id',run(async(req,res)=>sendPortfolioJson(req,res,await service.plot(req.brokerSession,req.params.id,{forceFresh:fresh(req)}))));
+  router.get('/portfolio',run(async(req,res)=>sendPortfolioJson(req,res,await req.brokerService.portfolio(req.brokerSession,{forceFresh:fresh(req)}))));
+  router.get('/plots/:id',run(async(req,res)=>sendPortfolioJson(req,res,await req.brokerService.plot(req.brokerSession,req.params.id,{forceFresh:fresh(req)}))));
+  // A sample principal can never fall through into another production route.
+  router.use((req,res,next)=>req.brokerService===reviewerAccess?res.status(404).json({message:'Not found.'}):next());
   return router;
 }
 
