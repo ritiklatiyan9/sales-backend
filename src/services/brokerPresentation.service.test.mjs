@@ -13,6 +13,10 @@ test('broker presentation uses stable scoped nonreversible identifiers and disti
     assert.equal(a.propertyId(117), same.propertyId(117));
     assert.notEqual(a.propertyId(117), other.propertyId(117));
     assert.notEqual(a.clientId(117), a.propertyId(117));
+    assert.match(a.commissionTransactionId(117),/^ct_[a-f0-9]{32}$/);
+    assert.equal(a.commissionTransactionId(117),same.commissionTransactionId(117));
+    assert.notEqual(a.commissionTransactionId(117),other.commissionTransactionId(117));
+    assert.notEqual(a.commissionTransactionId(117),a.propertyId(117));
     assert.notEqual(a.collection(5).collectionId, other.collection(5).collectionId);
     assert.match(a.collection(5).collectionLabel, /^Collection [A-F0-9]{4}-[A-F0-9]{4}$/);
     assert.equal(new Set(Array.from({ length: 1000 }, (_, i) => a.propertyId(i + 1))).size, 1000);

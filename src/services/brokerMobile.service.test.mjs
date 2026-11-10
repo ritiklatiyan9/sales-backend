@@ -420,7 +420,7 @@ test('broker commissions use exact Accounts member amounts, posted settlements a
   let duringCommission;
   const service=createBrokerMobileService({...db,query:async(sql,args)=>{
     const result=await db.query(sql,args);
-    if(duringCommission && /AS received_amount/.test(sql)){
+    if(duringCommission && /AS received_amount|AS payment_records/.test(sql)){
       const change=duringCommission;duringCommission=null;await change();
     }
     return result;
@@ -442,6 +442,72 @@ test('broker commissions use exact Accounts member amounts, posted settlements a
     const correction=response.commissions.find(row=>row.plotId===pid(13));
     assert.equal(correction.paidAmount,-500);assert.equal(correction.remainingAmount,1500);
     assert.ok(!/Private Organization Brand|Private Company Branding|BANK-PRIVATE|agent_id|site_id|remarks/.test(JSON.stringify(response)));
+  });
+  await t.test('plot transaction detail reconciles exact posted cash and tax while showing unposted entries separately',async()=>{
+    const response=await service.commission(session,pid(1));
+    assert.equal(response.transactionVersion,1);assert.equal(response.commissionVersion,1);
+    assert.deepEqual(response.commission,(await service.commissions(session)).commissions.find(row=>row.plotId===pid(1)));
+    assert.equal(response.transactions.length,5,'invalid dates, wrong sites and co-broker payments must be absent');
+    assert.deepEqual(response.transactions.map(row=>row.date),['2026-01-03','2026-01-03','2026-01-03','2026-01-02','2026-01-01']);
+    assert.deepEqual(response.transactions.map(row=>row.status),['pending','rejected','pending','posted','posted']);
+    assert.equal(response.transactions.filter(row=>row.contributesToPaid).reduce((sum,row)=>sum+row.amount,0),45000);
+    assert.equal(response.transactions.filter(row=>row.contributesToPaid).reduce((sum,row)=>sum+row.tdsAmount,0),5000);
+    assert.equal(response.transactions.filter(row=>row.contributesToPaid).reduce((sum,row)=>sum+row.totalAmount,0),response.commission.paidAmount);
+    for(const row of response.transactions){assert.match(row.id,/^ct_[a-f0-9]{32}$/);assert.equal(row.kind,'payment');}
+    assert.equal(new Set(response.transactions.map(row=>row.id)).size,5);
+    assert.deepEqual((await service.commission(session,pid(1))).transactions,response.transactions,'opaque IDs remain stable');
+    assert.ok(!/Private Organization Brand|Private Company Branding|BANK-PRIVATE|agent_id|site_id|remarks|bank_name|transaction_id|cheque_no|voucher|tds_pan|aadhaar/.test(JSON.stringify(response)));
+  });
+  await t.test('detail rejects invalid, cross-broker, unknown and booked-without-commission property ids',async()=>{
+    const other=await service.getSession((await service.login({mobile:'9876500002',password:'345678901234'})).token);
+    for(const id of ['1','pr_bad',`pr_${'f'.repeat(32)}`,createBrokerPresentation(other).propertyId(1),pid(3)]){
+      await assert.rejects(service.commission(session,id),{statusCode:404});
+    }
+    const refund=await service.commission(session,pid(13));
+    assert.equal(refund.transactions[0].kind,'refund');assert.equal(refund.transactions[0].amount,-500);
+    assert.equal(refund.transactions[0].status,'posted');assert.equal(refund.transactions[0].contributesToPaid,true);
+    assert.equal(refund.commission.paidAmount,-500);assert.equal(refund.commission.remainingAmount,1500);
+  });
+  await t.test('bounced, cancelled and private payment labels are normalized without changing posted totals',async()=>{
+    await db.exec(`INSERT INTO plot_commission_payments VALUES
+      (11,1,1,'2026-01-04',8000,0,'CHEQUE','approved','BOUNCED','PRIVATE FREEFORM'),
+      (12,1,1,'2026-01-04',9000,0,'BANK','voided',NULL,NULL),
+      (13,1,1,'2026-01-04',10000,500,'Private Company Branding BANK-PRIVATE','pending',NULL,NULL)`);
+    const detail=await service.commission(session,pid(1));
+    assert.deepEqual(detail.transactions.slice(0,3).map(row=>row.status),['pending','cancelled','bounced']);
+    assert.equal(detail.transactions[0].paymentMode,'OTHER');
+    assert.ok(detail.transactions.slice(0,3).every(row=>!row.contributesToPaid));
+    assert.equal(detail.commission.paidAmount,50000);
+    assert.ok(!/PRIVATE FREEFORM|Private Company Branding|BANK-PRIVATE/.test(JSON.stringify(detail)));
+    await db.exec('DELETE FROM plot_commission_payments WHERE id IN (11,12,13)');
+  });
+  await t.test('multiple owned commission masters for a plot retain exact payment snapshot and separate entries',async()=>{
+    await db.exec(`INSERT INTO plot_commissions_v2 VALUES(11,1,1,101,10000,'Partial');
+      INSERT INTO plot_commission_payments VALUES(11,1,11,'2026-01-05',4950.15,49.85,'UPI','approved',NULL,NULL)`);
+    const detail=await service.commission(session,pid(1));
+    assert.equal(detail.commission.totalAmount,110000);assert.equal(detail.commission.paidAmount,55000);
+    assert.equal(detail.transactions[0].totalAmount,5000);assert.equal(detail.transactions[0].paymentMode,'UPI');
+    assert.equal(detail.commission.receivedAmount,49950.15);assert.equal(detail.commission.tdsAmount,5049.85);
+    assert.deepEqual(detail.commission,(await service.commissions(session)).commissions.find(row=>row.plotId===pid(1)));
+    await db.exec('DELETE FROM plot_commission_payments WHERE id=11; DELETE FROM plot_commissions_v2 WHERE id=11');
+  });
+  await t.test('detail fails closed after reassignment, buyer change or session revocation during transaction read',async()=>{
+    duringCommission=()=>db.exec('UPDATE plot_commissions_v2 SET agent_id=102 WHERE id=1');
+    await assert.rejects(service.commission(session,pid(1)),{statusCode:503});
+    await assert.rejects(service.commission(session,pid(1)),{statusCode:404});
+    await db.exec('UPDATE plot_commissions_v2 SET agent_id=101 WHERE id=1');
+    duringCommission=()=>db.exec('UPDATE plots SET buyer_member_id=13 WHERE id=1; UPDATE bookings SET client_member_id=13 WHERE id=1');
+    await assert.rejects(service.commission(session,pid(1)),{statusCode:503});
+    await db.exec('UPDATE plots SET buyer_member_id=10 WHERE id=1; UPDATE bookings SET client_member_id=10 WHERE id=1');
+    duringCommission=()=>db.query('UPDATE booking_broker_mobile_accounts SET is_active=false WHERE id=$1',[session.account.id]);
+    await assert.rejects(service.commission(session,pid(1)),{statusCode:401});
+    await db.query('UPDATE booking_broker_mobile_accounts SET is_active=true WHERE id=$1',[session.account.id]);
+  });
+  await t.test('detail refuses to truncate oversized transaction history',async()=>{
+    await db.exec(`INSERT INTO plot_commission_payments(id,site_id,plot_commission_id,date,amount,tds_amount,payment_mode,status)
+      SELECT x,1,3,'2026-01-01',0,0,'BANK','pending' FROM generate_series(100,10100) x`);
+    await assert.rejects(service.commission(session,pid(2)),{statusCode:503});
+    await db.exec('DELETE FROM plot_commission_payments WHERE id>=100');
   });
   await t.test('reassigning commission during its payment read fails even when booking access remains',async()=>{
     duringCommission=()=>db.exec('UPDATE plot_commissions_v2 SET agent_id=102 WHERE id=1');
@@ -482,6 +548,7 @@ test('broker router is opt-in, scoped and returns only safe service errors',asyn
   const on=createBrokerMobileRouter(service,{isEnabled:()=>true});
   const anon=await invoke(on,'GET','/portfolio');assert.equal(anon.status,401);assert.match(anon.headers['Cache-Control'],/no-store/);
   assert.equal((await invoke(on,'GET','/commissions')).status,401);
+  assert.equal((await invoke(on,'GET',`/commissions/pr_${'f'.repeat(32)}`)).status,401);
   const bad=await invoke(on,'GET','/portfolio',{'authorization':'Bearer test.token.value'});assert.equal(bad.status,503);assert.ok(!JSON.stringify(bad).includes('secret'));
 });
 

@@ -75,9 +75,18 @@ test('sample sign-in and every readonly page use fictional DTOs without touching
   assert.equal(commissions.status,200);assert.equal(commissions.body.sampleData,true);
   assert.equal(commissions.body.summary.totalAmount,200000);assert.equal(commissions.body.summary.paidAmount,150000);
   assert.deepEqual(commissions.body.commissions.map(row=>row.plotId),portfolio.body.clients.flatMap(client=>client.plots.map(plot=>plot.id)));
+  for (const commission of commissions.body.commissions) {
+    const detail = await f.invoke('GET', `/commissions/${commission.plotId}`, { token });
+    assert.equal(detail.status,200);assert.equal(detail.body.sampleData,true);
+    assert.equal(detail.body.transactionVersion,1);assert.deepEqual(detail.body.commission,commission);
+    assert.match(detail.headers['Cache-Control'],/no-store/);
+    assert.equal(detail.body.transactions.filter(row=>row.contributesToPaid).reduce((sum,row)=>sum+row.totalAmount,0),commission.paidAmount);
+    for (const row of detail.body.transactions) assert.match(row.id,/^ct_[a-f0-9]{32}$/);
+  }
   assert.ok(!/aadhaar|aadhar|pan_no|bank_account|kyc|password/i.test(serialized));
   for (const id of ['1', '999999', `pr_${'f'.repeat(32)}`, 'sample-client-1']) {
     assert.equal((await f.invoke('GET', `/plots/${id}`, { token })).status, 404);
+    assert.equal((await f.invoke('GET', `/commissions/${id}`, { token })).status, 404);
   }
   for (const [method, path] of [['DELETE', '/account'], ['POST', '/admin/accounts'], ['GET', '/unknown']]) {
     assert.equal((await f.invoke(method, path, { token })).status, 404, path);

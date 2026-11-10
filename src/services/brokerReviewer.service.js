@@ -217,6 +217,25 @@ export function createBrokerReviewerAccess({ env = process.env, now = Date.now, 
         summary: { plotCount: 2, totalAmount: 200000, paidAmount: 150000, remainingAmount: 50000, receivedAmount: 150000, tdsAmount: 0, extraPaidAmount: 0 },
         updatedAt: new Date(now()).toISOString() };
     },
+    async commission(session, id) {
+      const response = await this.commissions(session);
+      const commission = response.commissions.find(value => value.plotId === id);
+      if (!commission) fail(404, 'Commission unavailable.');
+      const index = PROPERTY_IDS.indexOf(id);
+      const date = new Date(now()).toISOString().slice(0,10);
+      const transactions = [{
+        id: `ct_${tokenHash(`sample-commission-${index}-paid`).slice(0,32)}`,
+        date, amount: commission.receivedAmount, tdsAmount: 0, totalAmount: commission.paidAmount,
+        paymentMode: 'BANK', status: 'posted', kind: 'payment', contributesToPaid: true,
+      }, ...(index === 0 ? [{
+        id: `ct_${tokenHash('sample-commission-pending').slice(0,32)}`,
+        date, amount: 10000, tdsAmount: 0, totalAmount: 10000,
+        paymentMode: 'CHEQUE', status: 'pending', kind: 'payment', contributesToPaid: false,
+      }] : [])];
+      requireSession(session);
+      return { commissionVersion: 1, transactionVersion: 1, commission, transactions,
+        updatedAt: response.updatedAt, sampleData: true };
+    },
     async plot(session, id) {
       requireSession(session);
       const plot = data().find(value => value.id === id);

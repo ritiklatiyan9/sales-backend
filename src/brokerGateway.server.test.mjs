@@ -18,7 +18,7 @@ async function fixture(t, upstreamFetch, options = {}) {
 test('gateway exposes minimal health and only the approved broker paths', async t => {
   const f = await fixture(t);
   assert.equal((await f.request('/health')).status, 200);
-  for (const path of ['/', '/public/website/config', '/api/mobile/status', '/api/broker-mobile/plots/117', '/api/broker-mobile/status?url=https://evil.test', '/api/broker-mobile/%2fpublic']) {
+  for (const path of ['/', '/public/website/config', '/api/mobile/status', '/api/broker-mobile/plots/117', '/api/broker-mobile/commissions/117', '/api/broker-mobile/commissions/pr_invalid', '/api/broker-mobile/status?url=https://evil.test', '/api/broker-mobile/%2fpublic']) {
     const response = await f.request(path); assert.equal(response.status, 404, path);
     assert.ok(!(await response.text()).includes('private-upstream'));
   }
@@ -27,6 +27,13 @@ test('gateway exposes minimal health and only the approved broker paths', async 
   assert.equal(f.calls.length, 1);
   assert.equal((await f.request('/api/broker-mobile/commissions',{headers:{Authorization:'Bearer fictional.token'}})).status,200);
   assert.equal(f.calls.length,2);
+  const detailPath=`/api/broker-mobile/commissions/pr_${'a'.repeat(32)}`;
+  const detail=await f.request(detailPath,{headers:{Authorization:'Bearer fictional.token','Cache-Control':'no-cache'}});
+  assert.equal(detail.status,200);assert.match(detail.headers.get('cache-control'),/no-store/);
+  assert.equal(new URL(f.calls.at(-1).url).pathname,detailPath);
+  assert.equal(f.calls.at(-1).init.headers.Authorization,'Bearer fictional.token');
+  assert.equal(f.calls.at(-1).init.headers['Cache-Control'],'no-cache');
+  assert.equal(f.calls.length,3);
 });
 test('gateway forwards only needed auth/cache headers and JSON, never cookies or upstream metadata', async t => {
   const f = await fixture(t, () => Response.json({ clients: [] }, { headers: { 'Set-Cookie': 'internal=secret', Server: 'upstream', 'X-Powered-By': 'company', 'Retry-After': '60' } }));

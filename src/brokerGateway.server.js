@@ -19,7 +19,7 @@ const getPaths = new Set([
 
 function permitted(method, path) {
   return method === 'DELETE' ? path==='/api/broker-mobile/device-tokens' : method === 'POST' ? postPaths.has(path)
-    : method === 'GET' && (getPaths.has(path) || /^\/api\/broker-mobile\/plots\/pr_[a-f0-9]{32}$/.test(path));
+    : method === 'GET' && (getPaths.has(path) || /^\/api\/broker-mobile\/(?:plots|commissions)\/pr_[a-f0-9]{32}$/.test(path));
 }
 
 async function readBody(req, maximum) {

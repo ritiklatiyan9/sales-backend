@@ -1,4 +1,4 @@
-import { createBrokerPresentation } from './brokerPresentation.service.js';
+import { createBrokerPresentation, isBrokerPropertyId } from './brokerPresentation.service.js';
 
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
 const unavailable = () => { throw Object.assign(new Error('Commission details changed. Please refresh.'), { statusCode: 503 }); };
@@ -12,13 +12,57 @@ const scope = `FROM plot_commissions_v2 pc
     AND upper(trim(COALESCE(to_jsonb(bm)->>'status','ACTIVE'))) NOT IN ('INACTIVE','BLOCKED','DISABLED','DEACTIVATED','DELETED','SUSPENDED')
     AND lower(trim(COALESCE(pc.status,''))) IN ('pending','partial','completed')`;
 const authority = rows => JSON.stringify(rows.map(row => [row.id,row.site_id,row.plot_id,row.agent_id,String(row.total_commission),row.status]));
+const notFound = () => { throw Object.assign(new Error('Commission unavailable.'), { statusCode: 404 }); };
+const paymentModes = new Set(['CASH','BANK','CHEQUE','UPI','CARD','ONLINE','NEFT','RTGS','IMPS','NET_BANKING','BANK_TRANSFER','DD']);
+const postedPayment = `financial_transaction_posts(CASE WHEN pcp.amount<0 THEN 'credit' ELSE 'debit' END,
+  pcp.status,pcp.payment_mode,pcp.cheque_status)`;
+const paymentRecords = `COALESCE((SELECT json_agg(payment ORDER BY payment.date DESC,payment.id DESC)
+  FROM (SELECT pcp.id,pcp.date::text AS date,pcp.amount,
+      COALESCE((to_jsonb(pcp)->>'tds_amount')::numeric,0) AS tds_amount,
+      pcp.payment_mode,pcp.status,pcp.cheque_status,${postedPayment} AS posts
+    FROM plot_commission_payments pcp
+    WHERE pcp.plot_commission_id=pc.id AND pcp.site_id=pc.site_id
+      AND pcp.date BETWEEN DATE '1900-01-01' AND DATE '2100-12-31'
+    ORDER BY pcp.date DESC,pcp.id DESC LIMIT 10001) payment),'[]'::json) AS payment_records`;
+
+function projectTransaction(row, presentation) {
+  const status = String(row.status || '').trim().toLowerCase();
+  const cheque = String(row.cheque_status || '').trim().toUpperCase();
+  const mode = String(row.payment_mode || '').trim().toUpperCase().replace(/[ -]+/g,'_');
+  return {
+    id: presentation.commissionTransactionId(row.id), date: row.date,
+    amount: amount(row.amount), tdsAmount: amount(row.tds_amount),
+    totalAmount: amount(Number(row.amount) + Number(row.tds_amount)),
+    paymentMode: mode === 'CHECK' ? 'CHEQUE' : paymentModes.has(mode) ? mode : 'OTHER',
+    status: status === 'rejected' ? 'rejected'
+      : ['cancelled','deleted','void','voided'].includes(status) ? 'cancelled'
+      : ['BOUNCED','RETURNED'].includes(cheque) ? 'bounced'
+      : row.posts ? 'posted' : 'pending',
+    kind: Number(row.amount) < 0 || Number(row.tds_amount) < 0 ? 'refund' : 'payment',
+    contributesToPaid: row.posts === true,
+  };
+}
 
 /** Accounts commission amounts belong to the enrolled member, never the whole plot or its other agents. */
 export function createBrokerCommissionReader(db, { scopedPlots, validateSession, now = Date.now }) {
-  return async session => {
-    const plots = await scopedPlots(session);
+  return createCommissionReader(db,{scopedPlots,validateSession,now},false);
+}
+
+export function createBrokerCommissionDetailReader(db, { scopedPlots, validateSession, now = Date.now }) {
+  return createCommissionReader(db,{scopedPlots,validateSession,now},true);
+}
+
+function createCommissionReader(db, { scopedPlots, validateSession, now }, detail) {
+  return async (session, id) => {
+    if (detail && !isBrokerPropertyId(id)) notFound();
+    let plots = await scopedPlots(session);
+    if (detail) {
+      const identities = createBrokerPresentation(session);
+      plots = plots.filter(plot => identities.propertyId(plot.id) === id);
+      if (plots.length !== 1) notFound();
+    }
     const args = [session.brokerMemberIds,session.siteIds,plots.map(plot => plot.id)];
-    const { rows } = await db.query(`SELECT ${columns},
+    const { rows } = await db.query(`SELECT ${columns},${detail ? paymentRecords : `
       COALESCE((SELECT SUM(pcp.amount) FROM plot_commission_payments pcp
         WHERE pcp.plot_commission_id=pc.id AND pcp.site_id=pc.site_id
           AND pcp.date BETWEEN DATE '1900-01-01' AND DATE '2100-12-31'
@@ -28,9 +72,17 @@ export function createBrokerCommissionReader(db, { scopedPlots, validateSession,
         WHERE pcp.plot_commission_id=pc.id AND pcp.site_id=pc.site_id
           AND pcp.date BETWEEN DATE '1900-01-01' AND DATE '2100-12-31'
           AND financial_transaction_posts(CASE WHEN pcp.amount<0 THEN 'credit' ELSE 'debit' END,
-            pcp.status,pcp.payment_mode,pcp.cheque_status)),0) AS tds_amount
+            pcp.status,pcp.payment_mode,pcp.cheque_status)),0) AS tds_amount`}
       ${scope} ORDER BY pc.id LIMIT 10001`, args);
     if (rows.length > 10000) unavailable();
+    if (detail) {
+      if (!rows.length) notFound();
+      if (rows.reduce((sum,row) => sum + row.payment_records.length,0) > 10000) unavailable();
+      for (const row of rows) {
+        row.received_amount = row.payment_records.reduce((sum,payment) => sum + (payment.posts ? Number(payment.amount) : 0),0);
+        row.tds_amount = row.payment_records.reduce((sum,payment) => sum + (payment.posts ? Number(payment.tds_amount) : 0),0);
+      }
+    }
 
     // A booking can still authorize the plot after its commission is reassigned.
     // Recheck both authorities after the potentially slow Accounts payment read.
@@ -70,6 +122,13 @@ export function createBrokerCommissionReader(db, { scopedPlots, validateSession,
     for (const field of ['totalAmount','paidAmount','remainingAmount','receivedAmount','tdsAmount','extraPaidAmount']) {
       summary[field] = amount(commissions.reduce((sum,row) => sum + row[field],0));
     }
-    return { commissionVersion: 1, commissions, summary, updatedAt: new Date(now()).toISOString() };
+    const updatedAt = new Date(now()).toISOString();
+    if (detail) {
+      const transactions = rows.flatMap(row => row.payment_records)
+        .sort((a,b) => b.date.localeCompare(a.date) || Number(b.id) - Number(a.id))
+        .map(row => projectTransaction(row,presentation));
+      return { commissionVersion: 1, transactionVersion: 1, commission: commissions[0], transactions, updatedAt };
+    }
+    return { commissionVersion: 1, commissions, summary, updatedAt };
   };
 }

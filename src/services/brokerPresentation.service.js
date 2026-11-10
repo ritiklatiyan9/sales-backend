@@ -45,6 +45,7 @@ export function createBrokerPresentation(session, { brands = [] } = {}) {
   const readable = (prefix, purpose, value, groups = 3) => `${prefix}-${hash(purpose, value).slice(0, groups * 4).toUpperCase().match(/.{4}/g).join('-')}`;
   const redactor = createCompanyRedactor(brands);
   const propertyId = value => token('pr', value);
+  const commissionTransactionId = value => token('ct', value);
   const clientId = value => token('cl', value);
   const collection = siteId => ({
     collectionId: token('col', siteId),
@@ -105,5 +106,5 @@ export function createBrokerPresentation(session, { brands = [] } = {}) {
       })),
     };
   };
-  return { propertyId, clientId, collection, client, plot, plotNumber: publicNumber, redact: redactor.text };
+  return { propertyId, commissionTransactionId, clientId, collection, client, plot, plotNumber: publicNumber, redact: redactor.text };
 }

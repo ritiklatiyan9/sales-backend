@@ -9,6 +9,7 @@ async function fixture(t, overrides = {}) {
     getSession: async token => { calls.push(['session', token]); return { account: { id: 1 }, user: { name: 'Partner' } }; },
     portfolio: async () => ({ presentationVersion: 3, clients: [], confidentialPresentation: true }),
     commissions: async () => ({ commissionVersion: 1, commissions: [], summary: { plotCount: 0, totalAmount: 0 } }),
+    commission: async (_session,id) => ({ commissionVersion: 1, transactionVersion: 1, commission: { plotId: id }, transactions: [] }),
     plot: async (_session, id) => ({ plot: { id, projectName: 'Your Property' } }),
     login: async body => { calls.push(['login', body]); return { token: 'fictional.token', user: { name: 'Partner' } }; },
     ...overrides,
@@ -26,7 +27,7 @@ test('standalone service excludes website, client/staff, numeric ids, queries an
   const health = await f.request('/health');
   assert.deepEqual(await health.json(), { status: 'ok', service: 'my-real-partners-api' });
   for (const path of ['/', '/public/website/config', '/api/mobile/status', '/api/users', '/uploads/private.pdf',
-    '/api/broker-mobile/plots/117', '/api/broker-mobile/status?url=anything', '/api/broker-mobile/status/']) {
+    '/api/broker-mobile/plots/117', '/api/broker-mobile/commissions/117', '/api/broker-mobile/commissions/pr_invalid', '/api/broker-mobile/status?url=anything', '/api/broker-mobile/status/']) {
     const response = await f.request(path);
     assert.equal(response.status, 404, path);
     assert.match(response.headers.get('content-type'), /application\/json/);
@@ -47,9 +48,13 @@ test('standalone reuses broker auth, safe DTOs, opaque detail and private header
   const headers = { Authorization: 'Bearer fictional.token' };
   assert.equal((await (await f.request('/api/broker-mobile/portfolio', { headers })).json()).presentationVersion, 3);
   const id = `pr_${'a'.repeat(32)}`;
+  assert.equal((await f.request(`/api/broker-mobile/commissions/${id}`)).status,401);
   assert.equal((await (await f.request(`/api/broker-mobile/plots/${id}`, { headers })).json()).plot.id, id);
   assert.equal((await (await f.request('/api/broker-mobile/commissions', { headers })).json()).commissionVersion, 1);
-  assert.equal(f.calls.filter(call => call[0] === 'session').length, 3);
+  const detail=await f.request(`/api/broker-mobile/commissions/${id}`,{headers});
+  assert.match(detail.headers.get('cache-control'),/no-store/);
+  const result=await detail.json();assert.equal(result.transactionVersion,1);assert.equal(result.commission.plotId,id);
+  assert.equal(f.calls.filter(call => call[0] === 'session').length, 4);
 });
 test('malformed and oversized login bodies fail before credentials reach the service', async t => {
   const f = await fixture(t);

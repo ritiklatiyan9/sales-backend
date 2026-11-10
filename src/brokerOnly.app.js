@@ -27,7 +27,7 @@ export function createBrokerOnlyApp({ service, routerOptions, trustProxy } = {})
       return res.json({ status: 'ok', service: 'my-real-partners-api' });
     }
     const permitted = req.method === 'DELETE' ? req.url==='/api/broker-mobile/device-tokens' : req.method === 'POST' ? posts.has(req.url)
-      : req.method === 'GET' && (gets.has(req.url) || /^\/api\/broker-mobile\/plots\/pr_[a-f0-9]{32}$/.test(req.url));
+      : req.method === 'GET' && (gets.has(req.url) || /^\/api\/broker-mobile\/(?:plots|commissions)\/pr_[a-f0-9]{32}$/.test(req.url));
     if (!permitted) return res.status(404).json({ message: 'Not found.' });
     if (['POST','DELETE'].includes(req.method) && !req.is('application/json')) {
       return res.status(415).json({ message: 'Send a JSON request.' });
