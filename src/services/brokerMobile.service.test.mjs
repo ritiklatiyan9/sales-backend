@@ -392,6 +392,81 @@ test('broker detail timeline uses current scope and rejects changes during slow 
   });
 });
 
+test('broker commissions use exact Accounts member amounts, posted settlements and current authority',async t=>{
+  const previous=process.env.MOBILE_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET='synthetic-test-only-broker-commission-secret-long-enough';
+  const db=await fixture();
+  t.after(async()=>{await db.close();if(previous===undefined)delete process.env.MOBILE_PORTAL_SECRET;else process.env.MOBILE_PORTAL_SECRET=previous;});
+  await db.exec(`
+    ALTER TABLE plots ADD COLUMN plot_commission numeric DEFAULT 999999;
+    CREATE TABLE plot_commission_payments(id integer PRIMARY KEY,site_id integer,plot_commission_id integer,date date,
+      amount numeric,tds_amount numeric DEFAULT 0,payment_mode text,status text,cheque_status text,remarks text);
+    INSERT INTO plot_commissions_v2 VALUES
+      (1,1,1,101,100000,'Partial'),(2,2,7,201,50000,'Completed'),(3,1,2,101,20000,'Pending'),(4,1,13,101,1000,'Pending'),
+      (5,1,1,102,800000,'Completed'),(6,2,14,202,777777,'Pending'),(7,3,8,301,888888,'Pending'),
+      (8,2,7,101,123456,'Pending'),(9,1,1,101,200000,'Cancelled'),(10,1,NULL,101,999999,'Pending');
+    INSERT INTO plot_commission_payments VALUES
+      (1,1,1,'2026-01-01',40000,5000,'BANK','approved',NULL,'Private Organization Brand BANK-PRIVATE'),
+      (2,1,1,'2026-01-02',5000,0,'CHEQUE','approved','CLEARED',NULL),
+      (3,1,1,'2026-01-03',9999,0,'BANK','pending',NULL,NULL),
+      (4,1,1,'2026-01-03',9999,0,'CASH','rejected',NULL,NULL),
+      (5,1,1,'2026-01-03',9999,0,'CHEQUE','approved','UNCLEARED',NULL),
+      (6,1,1,'22022-01-03',9999,0,'BANK','approved',NULL,NULL),
+      (7,2,1,'2026-01-03',9999,0,'BANK','approved',NULL,NULL),
+      (8,2,2,'2026-01-03',60000,0,'CASH','approved',NULL,NULL),
+      (9,1,4,'2026-01-03',-500,0,'BANK','pending',NULL,NULL),
+      (10,1,5,'2026-01-03',800000,0,'CASH','approved',NULL,NULL);
+  `);
+  let duringCommission;
+  const service=createBrokerMobileService({...db,query:async(sql,args)=>{
+    const result=await db.query(sql,args);
+    if(duringCommission && /AS received_amount/.test(sql)){
+      const change=duringCommission;duringCommission=null;await change();
+    }
+    return result;
+  }},{bcryptRounds:4});
+  const session=await service.getSession((await service.login(credentials)).token);
+  const pid=id=>createBrokerPresentation(session).propertyId(id);
+  await t.test('totals exclude co-brokers, shared phones, other sites, land and cancelled commission records',async()=>{
+    const response=await service.commissions(session);
+    assert.equal(response.commissionVersion,1);
+    assert.deepEqual(response.commissions.map(row=>row.plotId).sort(),[1,2,7,13].map(pid).sort());
+    assert.deepEqual(response.summary,{plotCount:4,totalAmount:171000,paidAmount:109500,remainingAmount:71500,receivedAmount:104500,tdsAmount:5000,extraPaidAmount:10000});
+    const first=response.commissions.find(row=>row.plotId===pid(1));
+    assert.equal(first.totalAmount,100000,'whole-plot commission must not replace this broker\'s record');
+    assert.equal(first.paidAmount,50000);assert.equal(first.receivedAmount,45000);assert.equal(first.tdsAmount,5000);
+    assert.equal(first.remainingAmount,50000);assert.equal(first.status,'part_paid');
+    assert.equal(first.plotSize,120);assert.equal(first.plotSizeUnit,'sq yd');assert.equal(first.buyerName,'Client Alpha');
+    const extra=response.commissions.find(row=>row.plotId===pid(7));
+    assert.equal(extra.status,'overpaid');assert.equal(extra.remainingAmount,0);assert.equal(extra.extraPaidAmount,10000);
+    const correction=response.commissions.find(row=>row.plotId===pid(13));
+    assert.equal(correction.paidAmount,-500);assert.equal(correction.remainingAmount,1500);
+    assert.ok(!/Private Organization Brand|Private Company Branding|BANK-PRIVATE|agent_id|site_id|remarks/.test(JSON.stringify(response)));
+  });
+  await t.test('reassigning commission during its payment read fails even when booking access remains',async()=>{
+    duringCommission=()=>db.exec('UPDATE plot_commissions_v2 SET agent_id=102 WHERE id=1');
+    await assert.rejects(service.commissions(session),{statusCode:503});
+    assert.ok(!(await service.commissions(session)).commissions.some(row=>row.plotId===pid(1)));
+    await db.exec('UPDATE plot_commissions_v2 SET agent_id=101 WHERE id=1');
+  });
+  await t.test('buyer changes and broker session revocation during payment reads fail closed',async()=>{
+    duringCommission=()=>db.exec('UPDATE plots SET buyer_member_id=13 WHERE id=1; UPDATE bookings SET client_member_id=13 WHERE id=1');
+    await assert.rejects(service.commissions(session),{statusCode:503});
+    await db.exec('UPDATE plots SET buyer_member_id=10 WHERE id=1; UPDATE bookings SET client_member_id=10 WHERE id=1');
+    duringCommission=()=>db.query('UPDATE booking_broker_mobile_accounts SET is_active=false WHERE id=$1',[session.account.id]);
+    await assert.rejects(service.commissions(session),{statusCode:401});
+    await db.query('UPDATE booking_broker_mobile_accounts SET is_active=true WHERE id=$1',[session.account.id]);
+  });
+  await t.test('fresh payment and commission updates are visible with no financial cache',async()=>{
+    await db.exec("UPDATE plot_commission_payments SET amount=45000 WHERE id=1; UPDATE plot_commissions_v2 SET total_commission=110000 WHERE id=1");
+    const first=(await service.commissions(session)).commissions.find(row=>row.plotId===pid(1));
+    assert.equal(first.totalAmount,110000);assert.equal(first.paidAmount,55000);assert.equal(first.remainingAmount,55000);
+    await db.exec('DELETE FROM plot_commissions_v2');
+    const empty=await service.commissions(session);
+    assert.deepEqual(empty.commissions,[]);assert.equal(empty.summary.plotCount,0);assert.equal(empty.summary.totalAmount,0);
+  });
+});
+
 test('broker router is opt-in, scoped and returns only safe service errors',async()=>{
   const invoke=(router,method,url,headers={})=>new Promise((resolve,reject)=>{
     const req={method,url,headers,query:{},get(name){return this.headers[name.toLowerCase()];},ip:'test-ip'};
@@ -406,6 +481,7 @@ test('broker router is opt-in, scoped and returns only safe service errors',asyn
   assert.equal((await invoke(off,'GET','/portfolio')).status,503);assert.equal(touched,false);
   const on=createBrokerMobileRouter(service,{isEnabled:()=>true});
   const anon=await invoke(on,'GET','/portfolio');assert.equal(anon.status,401);assert.match(anon.headers['Cache-Control'],/no-store/);
+  assert.equal((await invoke(on,'GET','/commissions')).status,401);
   const bad=await invoke(on,'GET','/portfolio',{'authorization':'Bearer test.token.value'});assert.equal(bad.status,503);assert.ok(!JSON.stringify(bad).includes('secret'));
 });
 

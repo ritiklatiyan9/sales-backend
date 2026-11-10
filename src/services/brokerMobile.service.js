@@ -2,6 +2,7 @@ import { createBrokerMobileAuthService } from './brokerMobileAuth.service.js';
 import { createMobileFinancialReader, projectMobilePlot, mobileCurrentOwnerSql } from './mobilePortal.service.js';
 import { createBrokerPresentation, isBrokerPropertyId } from './brokerPresentation.service.js';
 import { createBrokerBookingProgressReader } from './brokerBookingProgress.service.js';
+import { createBrokerCommissionReader } from './brokerCommission.service.js';
 
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
@@ -153,7 +154,12 @@ export function createBrokerMobileService(db, options = {}) {
   }
   return {
     ...auth,
-    features: { commissionLinkedPlots: includeCommissionPlots, confidentialPresentation: true },
+    features: { commissionLinkedPlots: includeCommissionPlots, confidentialPresentation: true, commissionVersion: 1 },
+    commissions: createBrokerCommissionReader(db, {
+      scopedPlots,
+      validateSession: session => auth.getDeviceSession({ accountId: session.account.id, version: session.account.token_version, identity: session.identity }),
+      now,
+    }),
     async portfolio(session, { forceFresh = false, remindersOnly = false } = {}) {
       let plots = await scopedPlots(session, undefined, { remindersOnly });
       const args = parameters(session);

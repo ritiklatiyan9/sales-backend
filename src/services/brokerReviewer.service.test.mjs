@@ -71,6 +71,10 @@ test('sample sign-in and every readonly page use fictional DTOs without touching
     }
   }
   const serialized = JSON.stringify(portfolio.body);
+  const commissions = await f.invoke('GET', '/commissions', { token });
+  assert.equal(commissions.status,200);assert.equal(commissions.body.sampleData,true);
+  assert.equal(commissions.body.summary.totalAmount,200000);assert.equal(commissions.body.summary.paidAmount,150000);
+  assert.deepEqual(commissions.body.commissions.map(row=>row.plotId),portfolio.body.clients.flatMap(client=>client.plots.map(plot=>plot.id)));
   assert.ok(!/aadhaar|aadhar|pan_no|bank_account|kyc|password/i.test(serialized));
   for (const id of ['1', '999999', `pr_${'f'.repeat(32)}`, 'sample-client-1']) {
     assert.equal((await f.invoke('GET', `/plots/${id}`, { token })).status, 404);

@@ -25,6 +25,8 @@ test('gateway exposes minimal health and only the approved broker paths', async 
   assert.equal(f.calls.length, 0);
   assert.equal((await f.request('/api/broker-mobile/status')).status, 200);
   assert.equal(f.calls.length, 1);
+  assert.equal((await f.request('/api/broker-mobile/commissions',{headers:{Authorization:'Bearer fictional.token'}})).status,200);
+  assert.equal(f.calls.length,2);
 });
 test('gateway forwards only needed auth/cache headers and JSON, never cookies or upstream metadata', async t => {
   const f = await fixture(t, () => Response.json({ clients: [] }, { headers: { 'Set-Cookie': 'internal=secret', Server: 'upstream', 'X-Powered-By': 'company', 'Retry-After': '60' } }));

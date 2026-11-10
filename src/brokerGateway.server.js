@@ -14,7 +14,7 @@ const postPaths = new Set([
   '/api/broker-mobile/device-tokens',
 ]);
 const getPaths = new Set([
-  '/api/broker-mobile/status', '/api/broker-mobile/me', '/api/broker-mobile/portfolio',
+  '/api/broker-mobile/status', '/api/broker-mobile/me', '/api/broker-mobile/portfolio', '/api/broker-mobile/commissions',
 ]);
 
 function permitted(method, path) {

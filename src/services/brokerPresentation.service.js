@@ -105,5 +105,5 @@ export function createBrokerPresentation(session, { brands = [] } = {}) {
       })),
     };
   };
-  return { propertyId, clientId, collection, client, plot, redact: redactor.text };
+  return { propertyId, clientId, collection, client, plot, plotNumber: publicNumber, redact: redactor.text };
 }

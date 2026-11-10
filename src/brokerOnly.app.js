@@ -11,7 +11,7 @@ const posts = new Set([
   '/api/broker-mobile/device-tokens',
 ]);
 const gets = new Set([
-  '/api/broker-mobile/status', '/api/broker-mobile/me', '/api/broker-mobile/portfolio',
+  '/api/broker-mobile/status', '/api/broker-mobile/me', '/api/broker-mobile/portfolio', '/api/broker-mobile/commissions',
 ]);
 
 /** Direct Bookings services, without mounting its website, staff or client APIs. */

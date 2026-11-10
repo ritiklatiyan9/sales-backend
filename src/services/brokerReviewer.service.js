@@ -206,6 +206,17 @@ export function createBrokerReviewerAccess({ env = process.env, now = Date.now, 
         updatedAt: new Date(now()).toISOString(),
       };
     },
+    async commissions(session) {
+      requireSession(session);
+      const commissions = data().map((plot,index) => ({
+        plotId: plot.id, plotNumber: plot.number, plotSize: plot.area, plotSizeUnit: plot.areaUnit, buyerName: plot.buyerName,
+        totalAmount: 100000, paidAmount: index === 0 ? 50000 : 100000, remainingAmount: index === 0 ? 50000 : 0,
+        receivedAmount: index === 0 ? 50000 : 100000, tdsAmount: 0, extraPaidAmount: 0, status: index === 0 ? 'part_paid' : 'paid',
+      }));
+      return { commissionVersion: 1, sampleData: true, commissions,
+        summary: { plotCount: 2, totalAmount: 200000, paidAmount: 150000, remainingAmount: 50000, receivedAmount: 150000, tdsAmount: 0, extraPaidAmount: 0 },
+        updatedAt: new Date(now()).toISOString() };
+    },
     async plot(session, id) {
       requireSession(session);
       const plot = data().find(value => value.id === id);
