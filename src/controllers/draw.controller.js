@@ -127,6 +127,7 @@ export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
     scheme_name: row?.draw_scheme_name || null,
     configured: amount > 0,
     enabled: row?.draw_enabled !== false,
+    allow_partial_receipts: row?.draw_allow_partial_receipts === true,
     wait_days: row?.draw_wait_days || 10,
     opening_date: row?.draw_opening_date || '',
     terms: row?.draw_terms || DEFAULT_DRAW_TERMS,
@@ -150,6 +151,8 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
   const previous = await getDrawSettings(siteId);
   if (req.body.enabled !== undefined && typeof req.body.enabled !== 'boolean') throw workflowError('Choose whether draw enrollment is enabled');
   const enabled = req.body.enabled ?? previous?.draw_enabled ?? true;
+  if (req.body.allow_partial_receipts !== undefined && typeof req.body.allow_partial_receipts !== 'boolean') throw workflowError('Choose whether receipts can be printed for partial payments');
+  const allow_partial_receipts = req.body.allow_partial_receipts ?? previous?.draw_allow_partial_receipts ?? false;
   const wait_days = Number(req.body.wait_days ?? previous?.draw_wait_days ?? 10);
   const opening_date = req.body.opening_date === undefined ? previous?.draw_opening_date : req.body.opening_date;
   const applyToExisting = req.body.apply_to_existing === true;
@@ -172,7 +175,7 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms, enabled }, client);
+      row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms, enabled, allow_partial_receipts }, client);
       const { rows: registrations } = await client.query(
         `SELECT id, draw_opening_date FROM draw_registrations
          WHERE site_id = $1 AND status IN ('REGISTERED', 'ELIGIBLE', 'SLIP_ISSUED')
@@ -198,7 +201,7 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
       client.release();
     }
   } else {
-    row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms, enabled });
+    row = await upsertDrawSettings(siteId, { required_amount: amount, scheme_name: clean(scheme_name), wait_days, opening_date, terms, enabled, allow_partial_receipts });
   }
   res.json({
     site_id: Number(row.site_id),
@@ -206,6 +209,7 @@ export const setDrawSettings = asyncHandler(async (req, res) => {
     scheme_name: row.draw_scheme_name,
     configured: true,
     enabled: row.draw_enabled !== false,
+    allow_partial_receipts: row.draw_allow_partial_receipts === true,
     wait_days: row.draw_wait_days,
     opening_date: row.draw_opening_date || '',
     updated_registrations: updatedRegistrations,

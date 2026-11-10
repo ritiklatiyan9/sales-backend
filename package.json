@@ -64,6 +64,7 @@
     "test:sidebar": "node --test src/controllers/sidebarLayout.controller.test.mjs",
     "migrate:site-draw-enabled": "node src/migrations/035_site_draw_enabled.js",
     "test:site-draw-enabled": "node --test src/controllers/drawSettings.controller.test.mjs",
+    "migrate:draw-partial-receipts": "node src/migrations/049_draw_partial_receipts.js",
     "test:header-access": "node --test src/controllers/headerAccess.controller.test.mjs",
     "test:mobile-navigation": "node --test src/controllers/navigationSettings.controller.test.mjs src/controllers/headerAccess.controller.test.mjs",
     "migrate:member-code-referrals": "node src/migrations/036_member_code_referrals.js",
