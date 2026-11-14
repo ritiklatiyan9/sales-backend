@@ -6,7 +6,9 @@ import { migrateWhatsAppMessages } from '../migrations/039_whatsapp_messages.js'
 import { migrateWhatsAppStudio } from '../migrations/040_whatsapp_studio.js';
 import { migrateWhatsAppMarketing } from '../migrations/041_whatsapp_marketing.js';
 import { migrateWhatsAppTemplateManagement } from '../migrations/042_whatsapp_template_management.js';
-import { EVENTS, compileBody, deleteTemplate, drainWhatsApp, queueWhatsApp, saveStage, studioState, toE164, updateTemplate } from './whatsapp.service.js';
+import { createServer } from 'node:http';
+import { SocialMessagingClient, ListWhatsAppMessageTemplatesCommand } from '@aws-sdk/client-socialmessaging';
+import { EVENTS, compileBody, deleteTemplate, drainWhatsApp, queueWhatsApp, saveStage, studioState, toE164, updateTemplate, whatsappAwsConfig } from './whatsapp.service.js';
 import { SAMPLE_RECEIPT, amountInWords, money, receiptTerms, renderDrawReceipt } from './whatsappDocuments.js';
 
 test('toE164 accepts valid Indian mobiles only', () => {
@@ -288,5 +290,18 @@ test('WhatsApp outbox on isolated PostgreSQL: stages, approved versions, attachm
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     await f.close();
+  }
+});
+
+test('a stalled AWS socket rejects instead of hanging the WhatsApp worker', { timeout: 10_000 }, async () => {
+  const server = createServer(() => {}); // accepts the request, never answers
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const client = new SocialMessagingClient({ ...whatsappAwsConfig(), endpoint: `http://127.0.0.1:${server.address().port}`,
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' }, maxAttempts: 1 });
+  try {
+    // Per-call requestTimeout keeps the test short; throwOnRequestTimeout must come from whatsappAwsConfig().
+    await assert.rejects(client.send(new ListWhatsAppMessageTemplatesCommand({ id: 'waba-test' }), { requestTimeout: 300 }), { name: 'TimeoutError' });
+  } finally {
+    client.destroy(); server.closeAllConnections(); server.close();
   }
 });

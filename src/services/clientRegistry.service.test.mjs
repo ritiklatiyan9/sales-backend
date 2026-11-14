@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawFixture } from '../test/drawFixture.mjs';
+import { migrateMemberBookingName } from '../migrations/051_member_booking_name.js';
+import drawModel from '../models/Draw.model.js';
 import { migrateClientRegistry } from '../migrations/030_client_registry.js';
 import { normalizeClientIdentity, normalizeClientPhone } from './clientRegistry.service.js';
 import { resolvePaymentCollector } from './paymentCollector.js';
@@ -43,6 +45,7 @@ test('reusable client registration and bounded site directory on isolated Postgr
       INSERT INTO members(site_id,member_type,full_name,phone) VALUES
         (1,'CLIENT','Legacy One','7777777777'),(1,'CLIENT','Legacy Two','+91 7777777777');
     `);
+    await migrateMemberBookingName(fixture.pool);
     await migrateClientRegistry(fixture.pool);
     await migrateClientRegistry(fixture.pool);
 
@@ -99,11 +102,12 @@ test('reusable client registration and bounded site directory on isolated Postgr
 
     await t.test('any site-authorized user registers once with normalized identity, explicit referral and reusable KYC', async () => {
       const created = await call(controller.createClient, { user: agent, body: {
-        site_id: 1, registration: true, full_name: 'Asha Client', phone: '+91 98765 43210',
+        site_id: 1, registration: true, full_name: 'Asha Client', booking_name: '  Aarav  ', phone: '+91 98765 43210',
         pan_no: 'abcde1234f', aadhar_no: '1234 5678 9012', agent_referral_code: 'agt-sub',
       } });
       assert.equal(created.status, 201, JSON.stringify(created.data));
       member = created.data;
+      assert.equal(member.booking_name, 'Aarav');
       assert.equal(member.phone, '9876543210');
       assert.equal(member.pan_no, 'ABCDE1234F');
       assert.equal(member.referred_by_user_id, 4);
@@ -118,6 +122,31 @@ test('reusable client registration and bounded site directory on isolated Postgr
       assert.equal(repeat.data.full_name, 'Asha Client');
       assert.equal(repeat.data.reused, true);
       assert.equal((await fixture.query('SELECT count(*)::int AS n FROM members WHERE phone=$1', ['9876543210'])).rows[0].n, 1);
+    });
+
+    await t.test('Booking Name persists, reaches the application and clears without changing Full Name', async () => {
+      const params = { id: member.id };
+      const detail = await call(controller.getClient, { params });
+      assert.equal(detail.data.booking_name, 'Aarav');
+      await migrateMemberBookingName(fixture.pool);
+      assert.equal((await call(controller.getClient, { params })).data.booking_name, 'Aarav', 'rerunning migration keeps saved names');
+      const changed = await call(controller.updateClient, { params, body: { booking_name: '  Pari  ' } });
+      assert.equal(changed.status, 200, JSON.stringify(changed.data));
+      assert.equal(changed.data.booking_name, 'Pari');
+      assert.equal(changed.data.full_name, 'Asha Client');
+      const draw = await drawModel.create({ site_id: 1, client_member_id: member.id, registration_no: 'BOOKING-NAME-TEST', qr_token: 'booking-name-test', created_by: 1 }, fixture.pool);
+      const application = await drawModel.getDetail(draw.id, fixture.pool);
+      assert.equal(application.client_booking_name, 'Pari');
+      assert.equal(application.client_name, 'Asha Client');
+      const invalid = await call(controller.updateClient, { params, body: { booking_name: 'x'.repeat(256) } });
+      assert.equal(invalid.status, 400);
+      assert.equal((await call(controller.getClient, { params })).data.booking_name, 'Pari');
+      const cleared = await call(controller.updateClient, { params, body: { booking_name: '   ' } });
+      assert.equal(cleared.status, 200, JSON.stringify(cleared.data));
+      assert.equal(cleared.data.booking_name, null);
+      assert.equal((await drawModel.getDetail(draw.id, fixture.pool)).client_booking_name, null);
+      assert.equal((await call(controller.getClient, { params })).data.full_name, 'Asha Client');
+      await fixture.query('DELETE FROM draw_registrations WHERE id=$1', [draw.id]);
     });
 
     await t.test('referral validation preserves an existing attribution and rejects another site', async () => {

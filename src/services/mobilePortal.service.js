@@ -116,7 +116,7 @@ export function projectMobilePlot(plot, schedule, receipts, today = todayInIndia
   return {
     id: String(plot.id), number: plot.plot_no || 'Plot', projectName: 'Your Property',
     projectId: String(plot.site_id), area: amount(plot.plot_size),
-    areaUnit: plot.unit_type === 'flat' ? 'sq ft' : 'sq yd',
+    areaUnit: ['flat', 'shop'].includes(plot.unit_type) ? 'sq ft' : 'sq yd',
     status: plot.status || 'Active', totalAmount, paidAmount: netPaid,
     balanceAmount, interestAmount, totalDueAmount: amount(balanceAmount + interestAmount),
     progress: totalAmount > 0 ? Math.min(1, Math.max(netPaid / totalAmount, 0)) : 0,

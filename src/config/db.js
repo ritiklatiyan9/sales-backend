@@ -28,6 +28,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
+  application_name: `booking-api${process.env.NODE_ENV === 'production' ? '' : '-dev'}`,
 });
 
 // Idle TLS disconnects are recoverable: pg discards that connection and opens
@@ -41,5 +42,26 @@ export const connectDB = async () => {
   console.log('[booking-api] Connected to PostgreSQL');
   client.release();
 };
+
+// Lock-free catalog read. `ADD COLUMN IF NOT EXISTS` takes ACCESS EXCLUSIVE even when the
+// column exists, so callers run their idempotent DDL only when this returns false.
+// Names resolve through search_path exactly like the DDL they guard.
+export const schemaHas = async ({ relations = [], columns = [] }, db = pool) => {
+  const { rows: [row] } = await db.query(`SELECT
+      (SELECT count(*) FROM unnest($1::text[]) r WHERE to_regclass(r) IS NOT NULL)
+    + (SELECT count(*) FROM unnest($2::text[], $3::text[]) c(rel, col)
+        WHERE EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = to_regclass(c.rel) AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped)) AS n`,
+  [relations, columns.map(([rel]) => rel), columns.map(([, col]) => col)]);
+  return Number(row.n) === relations.length + columns.length;
+};
+
+// Every object boot migrations 051, 047 and 048 create; server.js runs them only when one is missing.
+// ponytail: hand-kept list; a boot migration added to server.js must add its objects here (db.test.mjs drops each one).
+export const bootSchemaReady = (db = pool) => schemaHas({
+  relations: ['login_otps', 'booking_broker_push_devices', 'booking_broker_push_events', 'booking_broker_push_deliveries',
+    'booking_broker_push_devices_account_idx', 'booking_broker_push_event_pending_idx', 'booking_broker_push_delivery_pending_idx'],
+  columns: [['members', 'booking_name'], ['users', 'can_login_accounts'], ['users', 'can_login_booking'],
+    ['users', 'can_login_booking_accounts'], ['login_otps', 'app_context']],
+}, db);
 
 export default pool;

@@ -33,3 +33,11 @@ test('unexpected 5xx messages stay private even when an unapproved publicMessage
  const res=response();errorMiddleware(Object.assign(new Error('database password'),{status:500,code:'UNEXPECTED_INTERNAL',publicMessage:'private credentials'}),{},res,()=>{});
  assert.equal(res.body.code,undefined);assert.doesNotMatch(res.body.message,/credentials|password/);
 });
+test('a stalled response body aborts at the timeout instead of freezing the single-slot OCR queue',{timeout:5000},async()=>{
+  const saved={fetch:globalThis.fetch,key:process.env.OPENROUTER_API_KEY,ms:process.env.OPENROUTER_OCR_TIMEOUT_MS};
+  process.env.OPENROUTER_API_KEY='isolated-test-key';process.env.OPENROUTER_OCR_TIMEOUT_MS='100';
+  // Headers arrive, the body never does; like undici, the body read fails once the signal aborts.
+  globalThis.fetch=async(url,{signal})=>new Response(new ReadableStream({start(c){signal.addEventListener('abort',()=>c.error(signal.reason));}}),{status:200});
+  try{await assert.rejects(openRouterChat('fictional document'),{name:'AbortError'});}
+  finally{globalThis.fetch=saved.fetch;for(const [k,v] of [['OPENROUTER_API_KEY',saved.key],['OPENROUTER_OCR_TIMEOUT_MS',saved.ms]])if(v===undefined)delete process.env[k];else process.env[k]=v;}
+});

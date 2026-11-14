@@ -67,6 +67,15 @@ export function normalizeClientPhone(value, { required = false, strict = false }
 
 export function normalizeClientIdentity(input) {
   const output = { ...input };
+  if (output.booking_name !== undefined) {
+    if (output.booking_name !== null && typeof output.booking_name !== 'string') {
+      throw clientRegistryError('Booking Name must be text');
+    }
+    output.booking_name = String(output.booking_name ?? '').trim() || null;
+    if (output.booking_name && output.booking_name.length > 255) {
+      throw clientRegistryError('Booking Name must be at most 255 characters');
+    }
+  }
   if (output.pan_no !== undefined) {
     output.pan_no = String(output.pan_no ?? '').replace(/\s/g, '').toUpperCase() || null;
     if (output.pan_no && !/^[A-Z]{5}\d{4}[A-Z]$/.test(output.pan_no)) {

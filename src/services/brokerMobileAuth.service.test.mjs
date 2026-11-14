@@ -427,3 +427,24 @@ test('a dedicated stable identity secret preserves app passwords across signing-
   process.env.BROKER_MOBILE_IDENTITY_SECRET = 'too-short';
   await assert.rejects(f.service.login({ mobile: owner.mobile, password: chosenPassword }), { statusCode: 503 });
 });
+
+test('session reads run together on the pool but stay sequential on a transaction client', async () => {
+  const track = () => {
+    const seen = { queries: 0, inFlight: 0, peak: 0 };
+    seen.query = async sql => {
+      seen.queries++; seen.peak = Math.max(seen.peak, ++seen.inFlight);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      seen.inFlight--;
+      return { rows: /FROM booking_broker_mobile_accounts/.test(sql) ? [{ id: 1, is_active: true, token_version: 0 }] : [] };
+    };
+    return seen;
+  };
+  const pool = track();
+  const service = createBrokerMobileAuthService(pool);
+  const claims = { accountId: 1, version: 0, identity: 'a'.repeat(64) };
+  await assert.rejects(service.getDeviceSession(claims), { statusCode: 401 });
+  assert.deepEqual([pool.queries, pool.peak], [4, 3], 'account, then members + bindings + KYC links together');
+  const client = track();
+  await assert.rejects(service.getDeviceSession(claims, client), { statusCode: 401 });
+  assert.deepEqual([client.queries, client.peak], [2, 1], 'no concurrent queries on one client; no members still stops before bindings');
+});

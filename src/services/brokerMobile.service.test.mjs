@@ -404,7 +404,7 @@ test('broker commissions use exact Accounts member amounts, posted settlements a
     INSERT INTO plot_commissions_v2 VALUES
       (1,1,1,101,100000,'Partial'),(2,2,7,201,50000,'Completed'),(3,1,2,101,20000,'Pending'),(4,1,13,101,1000,'Pending'),
       (5,1,1,102,800000,'Completed'),(6,2,14,202,777777,'Pending'),(7,3,8,301,888888,'Pending'),
-      (8,2,7,101,123456,'Pending'),(9,1,1,101,200000,'Cancelled'),(10,1,NULL,101,999999,'Pending');
+      (8,1,7,101,123456,'Pending'),(9,1,1,101,200000,'Cancelled'),(10,1,NULL,101,999999,'Pending');
     INSERT INTO plot_commission_payments VALUES
       (1,1,1,'2026-01-01',40000,5000,'BANK','approved',NULL,'Private Organization Brand BANK-PRIVATE'),
       (2,1,1,'2026-01-02',5000,0,'CHEQUE','approved','CLEARED',NULL),
@@ -427,11 +427,11 @@ test('broker commissions use exact Accounts member amounts, posted settlements a
   }},{bcryptRounds:4});
   const session=await service.getSession((await service.login(credentials)).token);
   const pid=id=>createBrokerPresentation(session).propertyId(id);
-  await t.test('totals exclude co-brokers, shared phones, other sites, land and cancelled commission records',async()=>{
+  await t.test('totals exclude co-brokers, shared phones, mismatched sites, land and cancelled commission records',async()=>{
     const response=await service.commissions(session);
     assert.equal(response.commissionVersion,1);
     assert.deepEqual(response.commissions.map(row=>row.plotId).sort(),[1,2,7,13].map(pid).sort());
-    assert.deepEqual(response.summary,{plotCount:4,totalAmount:171000,paidAmount:109500,remainingAmount:71500,receivedAmount:104500,tdsAmount:5000,extraPaidAmount:10000});
+    assert.deepEqual(response.summary,{plotCount:4,totalAmount:171000,paidAmount:109500,remainingAmount:71500,receivedAmount:104500,tdsAmount:5000,extraPaidAmount:10000,originalCommission:171000,paidOutAmount:110000,recoveredAmount:500,recoverableAmount:10000,tdsAdjustmentAmount:0});
     const first=response.commissions.find(row=>row.plotId===pid(1));
     assert.equal(first.totalAmount,100000,'whole-plot commission must not replace this broker\'s record');
     assert.equal(first.paidAmount,50000);assert.equal(first.receivedAmount,45000);assert.equal(first.tdsAmount,5000);
@@ -490,6 +490,88 @@ test('broker commissions use exact Accounts member amounts, posted settlements a
     assert.equal(detail.commission.receivedAmount,49950.15);assert.equal(detail.commission.tdsAmount,5049.85);
     assert.deepEqual(detail.commission,(await service.commissions(session)).commissions.find(row=>row.plotId===pid(1)));
     await db.exec('DELETE FROM plot_commission_payments WHERE id=11; DELETE FROM plot_commissions_v2 WHERE id=11');
+  });
+  await t.test('30/50/20 shop split exposes only each broker allocation and own settlement history',async()=>{
+    await db.exec(`ALTER TABLE plot_commissions_v2 ADD COLUMN allocation_type text,
+        ADD COLUMN allocation_value numeric,ADD COLUMN allocation_base numeric;
+      ALTER TABLE plots ADD COLUMN unit_type text DEFAULT 'plot';
+      UPDATE plots SET unit_type='shop',status='REGISTERED' WHERE id=2;
+      UPDATE plot_commissions_v2 SET total_commission=30000,allocation_type='percentage',
+        allocation_value=30,allocation_base=100000 WHERE id=3;
+      INSERT INTO members(id,site_id,full_name,phone,aadhar_no,member_type)
+        VALUES(103,1,'Third Partner','9876500099','456789012345','BROKER');
+      INSERT INTO plot_commissions_v2(id,site_id,plot_id,agent_id,total_commission,status,allocation_type,allocation_value,allocation_base)
+        VALUES(11,1,2,102,50000,'Partial','percentage',50,100000),(12,1,2,103,20000,'Partial','percentage',20,100000);
+      INSERT INTO plot_commission_payments VALUES
+        (11,1,3,'2026-01-05',3000,0,'UPI','approved',NULL,NULL),
+        (12,1,11,'2026-01-05',5000,0,'CASH','approved',NULL,NULL),
+        (13,1,12,'2026-01-05',2000,0,'BANK','approved',NULL,NULL)`);
+    const own=await service.commission(session,pid(2));
+    assert.equal(own.commission.propertyType,'SHOP');
+    assert.equal(own.commission.plotSizeUnit,'sq ft');
+    assert.equal(own.commission.totalAmount,30000);
+    assert.equal(own.commission.paidAmount,3000);
+    assert.deepEqual(own.commission.allocations,[{type:'percentage',value:30,amount:30000,originalAmount:30000}]);
+    assert.equal(own.transactions.length,1);
+    assert.equal(own.transactions[0].amount,3000);
+    assert.ok(!/allocation_base|allocation_value|agent_id|Third Partner|50000|20000/.test(JSON.stringify(own)));
+    assert.deepEqual(own.commission,(await service.commissions(session)).commissions.find(row=>row.plotId===pid(2)));
+    const other=await service.getSession((await service.login({mobile:'9876500002',password:'345678901234'})).token);
+    const otherDetail=await service.commission(other,createBrokerPresentation(other).propertyId(2));
+    assert.deepEqual(otherDetail.commission.allocations,[{type:'percentage',value:50,amount:50000,originalAmount:50000}]);
+    assert.equal(otherDetail.transactions.length,1);
+    assert.equal(otherDetail.transactions[0].amount,5000);
+    assert.notEqual(otherDetail.transactions[0].id,own.transactions[0].id);
+    await db.exec("UPDATE plot_commissions_v2 SET allocation_type='amount',allocation_value=30000 WHERE id=3");
+    assert.deepEqual((await service.commission(session,pid(2))).commission.allocations,[{type:'amount',value:30000,amount:30000,originalAmount:30000}]);
+    // The commission amount can remain the same while its agreed percentage
+    // changes; it still must not escape the current-authority recheck.
+    duringCommission=()=>db.exec("UPDATE plot_commissions_v2 SET allocation_type='percentage',allocation_value=30 WHERE id=3");
+    await assert.rejects(service.commission(session,pid(2)),{statusCode:503});
+    await db.exec(`DELETE FROM plot_commission_payments WHERE id IN(11,12,13);
+      DELETE FROM plot_commissions_v2 WHERE id IN(11,12);DELETE FROM members WHERE id=103;
+      UPDATE plots SET unit_type='plot',status='BOOKED' WHERE id=2;
+      UPDATE plot_commissions_v2 SET total_commission=20000,allocation_type=NULL,
+        allocation_value=NULL,allocation_base=NULL WHERE id=3`);
+    assert.deepEqual((await service.commission(session,pid(2))).commission.allocations,[{type:'amount',value:20000,amount:20000,originalAmount:20000}]);
+  });
+  await t.test('explicit cross-site commission grants only the assigned same-organization property',async()=>{
+    await db.exec(`INSERT INTO sites VALUES(4,'Unassigned Site Same Organization',1);
+      INSERT INTO members(id,site_id,full_name,phone,member_type) VALUES(50,4,'Cross Site Client','9876590050','CLIENT');
+      INSERT INTO plots(id,site_id,plot_no,plot_size,sale_price,status,buyer_member_id,buyer_name) VALUES
+        (50,4,'CROSS-SITE-OWN',120,1000,'SOLD',50,'Cross Site Client'),
+        (51,4,'CROSS-SITE-UNASSIGNED',120,1000,'SOLD',50,'Cross Site Client'),
+        (52,3,'CROSS-ORG-DENIED',120,1000,'SOLD',30,'Other Org Client'),
+        (53,4,'CROSS-SITE-OTHER',120,1000,'SOLD',50,'Cross Site Client');
+      INSERT INTO plot_commissions_v2(id,site_id,plot_id,agent_id,total_commission,status,allocation_type,allocation_value,allocation_base) VALUES
+        (50,4,50,101,30000,'Partial','percentage',30,100000),
+        (51,3,52,101,90000,'Partial','percentage',90,100000),
+        (52,4,53,102,50000,'Partial','percentage',50,100000),
+        (53,4,50,301,20000,'Partial','percentage',20,100000);
+      INSERT INTO plot_commission_payments VALUES
+        (50,4,50,'2026-01-05',3000,0,'UPI','approved',NULL,NULL),
+        (51,1,50,'2026-01-05',9999,0,'CASH','approved',NULL,NULL),
+        (52,4,52,'2026-01-05',5000,0,'BANK','approved',NULL,NULL)`);
+    assert.deepEqual(session.siteIds,[1,2], 'target site is never added to authenticated site grants');
+    const portfolio=await service.portfolio(session);
+    const properties=portfolio.clients.flatMap(client=>client.plots);
+    assert.equal(properties.filter(plot=>plot.id===pid(50)).length,1);
+    assert.equal((await service.plot(session,pid(50))).plot.id,pid(50));
+    for(const id of [51,52,53]) {
+      assert.ok(!properties.some(plot=>plot.id===pid(id)));
+      await assert.rejects(service.plot(session,pid(id)),{statusCode:404});
+      await assert.rejects(service.commission(session,pid(id)),{statusCode:404});
+    }
+    const own=await service.commission(session,pid(50));
+    assert.equal(own.commission.totalAmount,30000);
+    assert.deepEqual(own.commission.allocations,[{type:'percentage',value:30,amount:30000,originalAmount:30000}]);
+    assert.equal(own.transactions.length,1);
+    assert.equal(own.transactions[0].amount,3000);
+    assert.deepEqual((await service.getDeviceSession({accountId:session.account.id,version:session.account.token_version,identity:session.identity})).siteIds,[1,2]);
+    await db.exec('DELETE FROM plot_commission_payments WHERE id IN(50,51,52);DELETE FROM plot_commissions_v2 WHERE id IN(50,51,52,53)');
+    await assert.rejects(service.plot(session,pid(50)),{statusCode:404});
+    await assert.rejects(service.commission(session,pid(50)),{statusCode:404});
+    await db.exec('DELETE FROM plots WHERE id IN(50,51,52,53);DELETE FROM members WHERE id=50;DELETE FROM sites WHERE id=4');
   });
   await t.test('detail fails closed after reassignment, buyer change or session revocation during transaction read',async()=>{
     duringCommission=()=>db.exec('UPDATE plot_commissions_v2 SET agent_id=102 WHERE id=1');
@@ -558,4 +640,132 @@ test('broker limiter separates identifiers, bounds repeated guesses and expires'
   for(let i=0;i<10;i++)assert.equal(invoke('broker@test.example'),200);
   assert.equal(invoke('broker@test.example'),429);assert.equal(invoke('other@test.example'),200);
   time=1001;assert.equal(invoke('broker@test.example'),200);
+});
+
+test('cancelled booking commissions keep three old brokers separate from the two new brokers', async t => {
+  const previous = process.env.MOBILE_PORTAL_SECRET;
+  process.env.MOBILE_PORTAL_SECRET = 'synthetic-only-five-broker-history-secret-long-enough';
+  const db = await fixture();
+  t.after(async () => { await db.close(); if (previous === undefined) delete process.env.MOBILE_PORTAL_SECRET; else process.env.MOBILE_PORTAL_SECRET = previous; });
+  await db.exec(`ALTER TABLE plots ADD COLUMN unit_type text DEFAULT 'plot',
+      ADD COLUMN booking_cancelled_at timestamptz,ADD COLUMN previous_booking_plot_id int,ADD COLUMN approval_status text DEFAULT 'approved';
+    ALTER TABLE plot_commissions_v2 ADD COLUMN allocation_type text,ADD COLUMN allocation_value numeric,
+      ADD COLUMN allocation_base numeric,ADD COLUMN settlement_commission numeric,
+      ADD COLUMN settlement_percent numeric,ADD COLUMN settled_at timestamptz;
+    CREATE TABLE plot_commission_payments(id int PRIMARY KEY,site_id int,plot_commission_id int,date date,
+      amount numeric,tds_amount numeric DEFAULT 0,payment_mode text,status text,cheque_status text,remarks text);
+    INSERT INTO members(id,site_id,full_name,phone,aadhar_no,member_type) VALUES
+      (103,1,'Old Broker C','9876500103','567890123456','BROKER'),
+      (104,1,'New Broker D','9876500104','678901234567','BROKER'),
+      (105,1,'New Broker E','9876500105','789012345678','BROKER'),
+      (400,1,'Historical member profile renamed','9876500400','812345678901','CLIENT'),
+      (401,1,'New buyer private contact','9876500401','923456789012','CLIENT');
+    INSERT INTO plots(id,site_id,plot_no,plot_size,sale_price,booking_date,status,buyer_member_id,buyer_name,booking_cancelled_at,previous_booking_plot_id) VALUES
+      (200,1,'HISTORY-A2',100,10000,'2026-09-01','CANCELLED',400,'Old booking buyer snapshot','2026-10-01',NULL),
+      (201,1,'HISTORY-A2',100,12000,'2026-11-01','BOOKED',401,'New buyer recorded label',NULL,200);
+    INSERT INTO plot_commissions_v2(id,site_id,plot_id,agent_id,total_commission,status,allocation_type,allocation_value,allocation_base,settlement_commission,settled_at) VALUES
+      (200,1,200,101,300,'Partial','percentage',30,1000,75,'2026-10-01'),
+      (201,1,200,102,500,'Partial','percentage',50,1000,0,'2026-10-01'),
+      (202,1,200,103,200,'Partial','amount',200,1000,80,'2026-10-01'),
+      (203,1,201,104,600,'Partial','percentage',60,1000,NULL,NULL),
+      (204,1,201,105,400,'Pending','amount',400,1000,NULL,NULL);
+    INSERT INTO plot_commission_payments VALUES
+      (200,1,200,'2026-09-05',200,20,'BANK','approved',NULL,'Private old payment'),
+      (201,1,200,'2026-10-05',-50,0,'CASH','approved',NULL,'Recovery of excess commission'),
+      (202,1,200,'2026-10-06',-100,0,'CHEQUE','pending','UNCLEARED','Not received yet'),
+      (203,1,201,'2026-09-05',0,100,'BANK','approved',NULL,'Tax only; not cash recoverable'),
+      (204,1,202,'2026-09-05',20,0,'CASH','approved',NULL,NULL),
+      (205,1,203,'2026-11-05',60,0,'BANK','approved',NULL,'New booking payment');`);
+  let duringCommission;
+  const service = createBrokerMobileService({ ...db, query: async (sql,args) => {
+    const result = await db.query(sql,args);
+    if (duringCommission && /AS received_amount|AS payment_records/.test(sql)) { const mutate=duringCommission;duringCommission=null;await mutate(); }
+    return result;
+  } }, { bcryptRounds: 4 });
+  const logins = [credentials,{mobile:'9876500002',password:'345678901234'},
+    {mobile:'9876500103',password:'567890123456'},{mobile:'9876500104',password:'678901234567'},
+    {mobile:'9876500105',password:'789012345678'}];
+  const sessions=[];
+  for (const login of logins) sessions.push(await service.getSession((await service.login(login)).token));
+  const id = (session,raw) => createBrokerPresentation(session).propertyId(raw);
+  const oldCards=[];
+  for (let i=0;i<3;i++) {
+    const session=sessions[i];
+    const response=await service.commissions(session);
+    assert.equal(response.commissions.length,1);
+    const card=response.commissions[0]; oldCards.push(card);
+    assert.equal(card.plotId,id(session,200));
+    assert.equal(card.historicalBooking,true);assert.equal(card.bookingStatus,'CANCELLED');
+    assert.equal(card.bookingDate,'2026-09-01');
+    assert.equal(card.buyerName,'Old booking buyer snapshot','Historical name is an immutable old booking label');
+    assert.equal(card.settlementKind,'manual');assert.equal(card.settlementPercentage,null);assert.equal(card.settlementApprovalStatus,'approved');
+    assert.equal(card.settlementAmount,card.totalAmount);
+    assert.ok(!/New buyer|9876500401|Historical member profile renamed|agent_id|settlement_reason/.test(JSON.stringify(response)));
+    const details=await service.commission(session,id(session,200));
+    assert.deepEqual(details.commission,card);
+    assert.equal(details.transactions.filter(row=>row.contributesToPaid).reduce((sum,row)=>sum+row.totalAmount,0),card.paidAmount);
+    await assert.rejects(service.commission(session,id(session,201)),{statusCode:404});
+    await assert.rejects(service.plot(session,id(session,200)),{statusCode:404});
+    await assert.rejects(service.plot(session,id(session,201)),{statusCode:404});
+    const portfolio=await service.portfolio(session);
+    assert.ok(!portfolio.clients.some(client=>client.plots.some(plot=>[id(session,200),id(session,201)].includes(plot.id))));
+    assert.ok(!JSON.stringify(portfolio).includes('New buyer private contact'));
+  }
+  assert.deepEqual(oldCards.map(row=>[row.originalCommission,row.totalAmount]),[[300,75],[500,0],[200,80]],'Manual decisions are not a fixed25% calculation');
+  assert.deepEqual(oldCards[0].allocations,[{type:'percentage',value:30,originalAmount:300,amount:75}]);
+  assert.deepEqual([oldCards[0].paidOutAmount,oldCards[0].recoveredAmount,oldCards[0].paidAmount,oldCards[0].recoverableAmount],[220,50,170,95]);
+  assert.equal(oldCards[1].extraPaidAmount,100);assert.equal(oldCards[1].recoverableAmount,0);assert.equal(oldCards[1].tdsAdjustmentAmount,100);
+  assert.equal(oldCards[2].remainingAmount,60);
+  for (let i=3;i<5;i++) {
+    const response=await service.commissions(sessions[i]);
+    assert.equal(response.commissions.length,1);const card=response.commissions[0];
+    assert.equal(card.plotId,id(sessions[i],201));assert.equal(card.historicalBooking,false);
+    assert.equal(card.bookingStatus,'BOOKED');assert.equal(card.buyerName,'New buyer private contact');
+    assert.equal(card.originalCommission,i===3?600:400);assert.equal(card.totalAmount,card.originalCommission);
+    assert.equal(card.settlementAmount,null);assert.equal(card.recoveredAmount,0);
+    await assert.rejects(service.commission(sessions[i],id(sessions[i],200)),{statusCode:404});
+    assert.ok(!JSON.stringify(response).includes('Old booking buyer snapshot'));
+  }
+  await t.test('pending and rejected cancellation proposals retain original entitlement and have no actionable recovery',async()=>{
+    for(const approval of ['pending','rejected','awaiting',null]) {
+      await db.query('UPDATE plots SET approval_status=$1 WHERE id=200',[approval]);
+      for(let i=0;i<3;i++) {
+        const response=await service.commission(sessions[i],id(sessions[i],200));
+        const card=response.commission;
+        assert.equal(card.settlementApprovalStatus,approval==='rejected'?'rejected':'pending');
+        assert.equal(card.totalAmount,[300,500,200][i]);
+        assert.equal(card.originalCommission,card.totalAmount);
+        assert.equal(card.settlementAmount,[75,0,80][i],'A proposal is separate from effective original entitlement');
+        assert.equal(card.allocations[0].amount,card.allocations[0].originalAmount);
+        assert.equal(card.recoverableAmount,0);assert.equal(card.tdsAdjustmentAmount,0);
+      }
+    }
+    await db.exec("UPDATE plots SET approval_status='approved' WHERE id=200");
+    const approved=await service.commission(sessions[1],id(sessions[1],200));
+    assert.equal(approved.commission.totalAmount,0,'An approved explicitzero is effective');
+    assert.equal(approved.commission.tdsAdjustmentAmount,100);
+  });
+  await t.test('approval changes during a commission read invalidate the pending financial proposal',async()=>{
+    duringCommission=()=>db.exec("UPDATE plots SET approval_status='pending' WHERE id=200");
+    await assert.rejects(service.commission(sessions[0],id(sessions[0],200)),{statusCode:503});
+    const pending=await service.commission(sessions[0],id(sessions[0],200));
+    assert.equal(pending.commission.totalAmount,300);assert.equal(pending.commission.recoverableAmount,0);
+    await db.exec("UPDATE plots SET approval_status='approved' WHERE id=200");
+  });
+  await t.test('one broker on both bookings gets distinct cards and ledgers, then loses only the reassigned card',async()=>{
+    await db.exec('UPDATE plot_commissions_v2 SET agent_id=101 WHERE id=204');
+    const both=await service.commissions(sessions[0]);
+    assert.equal(both.commissions.length,2);
+    assert.notEqual(both.commissions[0].plotId,both.commissions[1].plotId);
+    assert.equal((await service.commission(sessions[0],id(sessions[0],200))).transactions.length,3);
+    assert.equal((await service.commission(sessions[0],id(sessions[0],201))).transactions.length,0);
+    await db.exec('UPDATE plot_commissions_v2 SET agent_id=105 WHERE id=204');
+    await assert.rejects(service.commission(sessions[0],id(sessions[0],201)),{statusCode:404});
+    assert.equal((await service.commissions(sessions[0])).commissions.length,1);
+  });
+  await t.test('settlement edits during a slow history read fail closed',async()=>{
+    duringCommission=()=>db.exec('UPDATE plot_commissions_v2 SET settlement_commission=76 WHERE id=200');
+    await assert.rejects(service.commission(sessions[0],id(sessions[0],200)),{statusCode:503});
+    assert.equal((await service.commission(sessions[0],id(sessions[0],200))).commission.totalAmount,76);
+  });
 });

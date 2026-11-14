@@ -1,9 +1,12 @@
 import pool from '../config/db.js';
 import { requireWorkspaceAccess } from './bookingWorkspaceAccess.js';
 import { todayIST, validDate, workflowError } from './drawWorkflow.js';
+import { isFullAdmin } from './subAdminPermissions.js';
 
 const dateOnly = value => value instanceof Date ? value.toISOString().slice(0,10) : String(value).slice(0,10);
 export const ATTENDANCE_MODULE = 'booking_draw_attendance';
+// Tokens that belong on a draw-day roster (alias r = draw_registrations).
+export const ISSUED_TOKEN = `r.slip_no IS NOT NULL AND r.status IN ('SLIP_ISSUED','WINNER','ALLOTTED')`;
 export function attendanceDate(value) {
   if (!validDate(value)) throw workflowError('Select a valid draw date');
   return value;
@@ -33,7 +36,7 @@ export async function checkInDraw({ user, siteId, date, token, now = new Date() 
     const draw = rows[0];
     if (!draw) throw workflowError('No issued token matches this site. Check the token and selected project.', 404);
     if (!draw.slip_no || !['SLIP_ISSUED','WINNER','ALLOTTED'].includes(draw.status)) throw workflowError('This token is cancelled or has not been issued',409);
-    if (dateOnly(draw.draw_opening_date) !== date) throw workflowError('This token belongs to a different draw date',409);
+    if (dateOnly(draw.draw_opening_date) !== date) throw workflowError(draw.draw_opening_date ? `This token is for the ${dateOnly(draw.draw_opening_date)} draw, not today's` : 'This token has no draw date yet', 409);
     const saved = await client.query(`INSERT INTO draw_attendance(draw_registration_id,attendance_date,checked_in_by) VALUES($1,$2,$3)
       ON CONFLICT(draw_registration_id,attendance_date) DO UPDATE SET present=true,checked_in_at=now(),checked_in_by=EXCLUDED.checked_in_by,updated_at=now()
       WHERE draw_attendance.present=false RETURNING *`, [draw.id,date,user.id]);
@@ -65,4 +68,26 @@ export async function correctAttendance({ user, siteId, id, reason, now = new Da
     return { corrected:true };
   } catch(error) { await client.query('ROLLBACK'); throw error; }
   finally { client.release(); }
+}
+
+// Attendance Register override: admins tick P / A, or clear entries so their tokens can be scanned again.
+export async function setAttendance({ user, siteId, date, ids, present, now = new Date() }, db = pool) {
+  if (!isFullAdmin(user)) throw workflowError('Only Admin and Super Admin can change attendance in the register', 403);
+  const site = await requireWorkspaceAccess(user, siteId, ATTENDANCE_MODULE, 'can_update', db);
+  attendanceDate(date);
+  if (typeof present !== 'boolean') throw workflowError('Choose Present or Absent');
+  if (!Array.isArray(ids) || !ids.length || ids.length > 1000 || !ids.every(id => Number.isSafeInteger(id) && id > 0)) throw workflowError('Select applicants from the register');
+  if (present && date > todayIST(now)) throw workflowError('Present can be marked only from the draw day onwards', 409);
+  // One statement each way, so the attendance change and its audit event commit together.
+  const sql = present
+    ? `WITH changed AS (INSERT INTO draw_attendance(draw_registration_id,attendance_date,checked_in_by)
+        SELECT r.id,$2,$4 FROM draw_registrations r WHERE r.site_id=$1 AND r.draw_opening_date=$2 AND r.id=ANY($3::int[]) AND ${ISSUED_TOKEN}
+        ON CONFLICT(draw_registration_id,attendance_date) DO UPDATE SET present=true,checked_in_at=now(),checked_in_by=EXCLUDED.checked_in_by,updated_at=now()
+        WHERE draw_attendance.present=false RETURNING id)
+      INSERT INTO draw_attendance_events(attendance_id,action,actor_id,reason) SELECT id,'CHECKED_IN',$4,'Marked present in register' FROM changed`
+    : `WITH changed AS (UPDATE draw_attendance a SET present=false,updated_at=now() FROM draw_registrations r
+        WHERE r.id=a.draw_registration_id AND r.site_id=$1 AND a.attendance_date=$2 AND a.draw_registration_id=ANY($3::int[]) AND a.present RETURNING a.id)
+      INSERT INTO draw_attendance_events(attendance_id,action,actor_id,reason) SELECT id,'CORRECTED',$4,'Cleared in register' FROM changed`;
+  const { rowCount } = await db.query(sql, [site.id, date, ids, user.id]);
+  return { changed: rowCount };
 }

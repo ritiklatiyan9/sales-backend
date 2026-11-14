@@ -1,11 +1,13 @@
 import { subAdminPermission } from '../middlewares/subAdminPermission.middleware.js';
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
-import { listDrawAttendance, markDrawAttendance, undoDrawAttendance } from '../controllers/drawAttendance.controller.js';
+import { listDrawAttendance, listDrawAttendanceDates, markDrawAttendance, setDrawAttendance, undoDrawAttendance } from '../controllers/drawAttendance.controller.js';
 const router=express.Router();
 router.use(authMiddleware);
 router.use(subAdminPermission('booking_draw_attendance'));
 router.get('/',listDrawAttendance);
+router.get('/dates',listDrawAttendanceDates);
 router.post('/scan',markDrawAttendance);
+router.post('/mark',setDrawAttendance);
 router.patch('/:id/correct',undoDrawAttendance);
 export default router;

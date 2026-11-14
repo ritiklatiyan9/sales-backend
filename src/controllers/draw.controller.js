@@ -1,3 +1,4 @@
+import { applicationSigningContext } from '../services/applicationFormSnapshot.js';
 import { resolvePaymentCollector } from '../services/paymentCollector.js';
 import { resolveDrawBroker } from '../services/dealerTeams.js';
 import { ensureBookingCreditFields } from '../services/bookingDrawCredits.js';
@@ -5,6 +6,7 @@ import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import crypto from 'crypto';
 import { DEFAULT_DRAW_TERMS, money, openingDate, todayIST, validDate, validatePayment, validateWinner, workflowError } from '../services/drawWorkflow.js';
 import asyncHandler from '../utils/asyncHandler.js';
+import { signMemberDocumentUrl } from '../utils/memberDocumentUrls.js';
 import pool from '../config/db.js';
 import drawModel from '../models/Draw.model.js';
 import bookingModel from '../models/Booking.model.js';
@@ -17,7 +19,9 @@ import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.m
 import { validateDrawInstallmentPlan } from '../services/drawInstallmentPlan.js';
 import { clientDrawBlock, drawAvailability, drawOpenState, normalizeDrawScheme } from '../services/drawEnrollment.js';
 import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
+import { allInOrder } from '../services/clientRegistry.service.js';
 import { queueWhatsApp } from '../services/whatsapp.service.js';
+import { getDrawApplicationSignatures, saveDrawApplicationSignatures } from '../services/drawApplicationSignatures.js';
 
 /**
  * Draw-based shop allotment module.
@@ -117,8 +121,8 @@ const reconcileEligibility = async (registration, actorId, db) => {
 export const getDrawSettingsHandler = asyncHandler(async (req, res) => {
   const siteId = parseInt(req.query.site_id, 10);
   if (!siteId || siteId <= 0) return res.status(400).json({ message: 'A valid site_id is required' });
-  await requireSiteAccess(req.user, siteId);
-  const row = await getDrawSettings(siteId);
+  // Guard and read in one wave; the guard's error wins and the row is used only after it passes.
+  const [, row] = await allInOrder([requireSiteAccess(req.user, siteId), getDrawSettings(siteId)]);
   const amount = Number(row?.draw_required_amount || 0);
   const { open, reason } = drawAvailability(row); // the server's IST date, so no device clock decides
   res.json({
@@ -425,11 +429,17 @@ export const listDraws = asyncHandler(async (req, res) => {
     { siteId: site_id, status, q, clientMemberId: client_member_id, visibleUserIds },
     pool
   );
+  // Member photos live in a private bucket; the raw URL 403s in <img>.
+  await Promise.all(rows.map(async (r) => { if (r.client_photo) r.client_photo = await signMemberDocumentUrl(r.client_photo); }));
   res.json(rows);
 });
 
 /** GET /draws/:id — registration + Draw Payment Ledger + audit events + rollups. */
 export const getDraw = asyncHandler(async (req, res) => {
+  // Same wave as the detail reads, but awaited only after every check below, so a failure
+  // here cannot turn a 404/403 into a 500 and nothing is sent before the checks pass.
+  const signatures = getDrawApplicationSignatures(req.params.id);
+  signatures.catch(() => {}); // observed (and rethrown) by the await at the end
   const [detail, visibleUserIds] = await Promise.all([
     buildDetail(req.params.id, pool),
     getVisibleUserIds(req.user),
@@ -440,7 +450,21 @@ export const getDraw = asyncHandler(async (req, res) => {
       && !visibleUserIds.includes(detail.created_by)) {
     return res.status(403).json({ message: 'You are not authorised to view this draw registration' });
   }
-  res.json(detail);
+  await requireSiteAccess(req.user, detail.site_id);
+  if (detail.client_photo) detail.client_photo = await signMemberDocumentUrl(detail.client_photo);
+  const savedSignatures=await signatures;
+  if(savedSignatures?.form_snapshot?.draw?.client_photo) savedSignatures.form_snapshot.draw.client_photo=await signMemberDocumentUrl(savedSignatures.form_snapshot.draw.client_photo);
+  res.json({ ...detail, application_signatures: savedSignatures });
+});
+
+/** PUT /draws/:id/signatures — save the tablet's confirmed application drawing. */
+export const saveApplicationSignatures = asyncHandler(async (req, res) => {
+  const application_signatures = await saveDrawApplicationSignatures({
+    id: req.params.id, user: req.user, body: req.body,
+    visibleUserIds: await getVisibleUserIds(req.user),
+  });
+  if(application_signatures?.form_snapshot?.draw?.client_photo) application_signatures.form_snapshot.draw.client_photo=await signMemberDocumentUrl(application_signatures.form_snapshot.draw.client_photo);
+  res.json({ application_signatures });
 });
 
 /**
@@ -1056,7 +1080,7 @@ export const deleteDraw = asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: regRows } = await client.query(
-      'SELECT id, status, slip_no FROM draw_registrations WHERE id = $1 FOR UPDATE',
+      'SELECT id, site_id, status, slip_no FROM draw_registrations WHERE id = $1 FOR UPDATE',
       [req.params.id]
     );
     const registration = regRows[0];
@@ -1064,10 +1088,12 @@ export const deleteDraw = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
+    await requireSiteAccess(req.user, registration.site_id, client);
     // Issued slips are always retained. Paid-but-unissued entries (e.g. test or
     // mistaken registrations) may go only with an explicit ?with_payments=true and
     // only while none of their receipts has been transferred to Accounting.
-    if (registration.slip_no) throw workflowError('This entry has an issued draw slip and must be retained. Cancel it instead.', 409);
+    // A cancelled entry is out of the lottery pool, so its slip may go too (slip numbers derive from the id, never reused).
+    if (registration.slip_no && registration.status !== 'CANCELLED') throw workflowError('This entry has an issued draw slip and must be retained. Cancel it instead.', 409);
     const paid = await drawModel.getTotalPaid(registration.id, client);
     if (paid > 0) {
       if (req.query.with_payments !== 'true') throw workflowError('This entry has payments. Confirm deleting its receipts too, or cancel the entry instead.', 409);
@@ -1080,6 +1106,8 @@ export const deleteDraw = asyncHandler(async (req, res) => {
         message: `Cannot delete a registration with status ${registration.status} — it is already in the lottery. Cancel it instead.`,
       });
     }
+    await client.query('DELETE FROM draw_attendance_events WHERE attendance_id IN (SELECT id FROM draw_attendance WHERE draw_registration_id = $1)', [registration.id]);
+    await client.query('DELETE FROM draw_attendance WHERE draw_registration_id = $1', [registration.id]);
     await client.query('DELETE FROM draw_payments WHERE draw_registration_id = $1', [registration.id]);
     await client.query('DELETE FROM draw_events WHERE draw_registration_id = $1', [registration.id]);
     await client.query('DELETE FROM draw_registrations WHERE id = $1', [registration.id]);
@@ -1209,4 +1237,15 @@ export const startDrawKyc = asyncHandler(async (req, res) => {
     throw err;
   } finally { client.release(); }
   res.json(await buildDetail(req.params.id));
+});
+
+export const getApplicationSigningContext = asyncHandler(async(req,res)=>{
+ const client=await pool.connect();
+ try {
+  await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+  const context=await applicationSigningContext({id:req.params.id,user:req.user,visibleUserIds:await getVisibleUserIds(req.user),db:client});
+  await client.query('COMMIT');
+  if(context.snapshot.draw.client_photo) context.snapshot.draw.client_photo=await signMemberDocumentUrl(context.snapshot.draw.client_photo);
+  res.json(context);
+ } catch(error){await client.query('ROLLBACK');throw error;} finally{client.release();}
 });

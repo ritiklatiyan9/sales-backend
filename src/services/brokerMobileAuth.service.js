@@ -5,6 +5,7 @@ import { STAFF_AUTH_SELECT } from './staffIdentity.service.js';
 import { MOBILE_SESSION_DAYS, normalizeMobile } from './mobilePortal.service.js';
 import { mailerEnabled, sendBrokerPasswordResetEmail } from './mailer.service.js';
 import { createCompanyRedactor } from './brokerPresentation.service.js';
+import { allInOrder } from './clientRegistry.service.js';
 
 const ISSUER='my-real-assets-broker-bookings';
 const AUDIENCE='my-real-assets-broker';
@@ -76,18 +77,27 @@ export function createBrokerMobileAuthService(db,{
   }
   async function contextFor(account,connection=db){
     if(!account||account.is_active!==true)unauthorized();
-    const {rows:linkedMembers}=await connection.query(`SELECT ${memberColumns} FROM members m
+    const read=sql=>connection.query(sql,[account.id]).then(result=>result.rows);
+    const linkedMembersSql=`SELECT ${memberColumns} FROM members m
       JOIN sites s ON s.id=m.site_id JOIN booking_broker_mobile_members bm ON bm.member_id=m.id AND bm.account_id=$1
-      ORDER BY m.id`,[account.id]);
-    const members=linkedMembers.filter(m=>m.broker_active&&m.broker_role&&matchingIdentity(m,account));
-    if(!members.length)unauthorized();
-    const {rows:bindings}=await connection.query(`SELECT b.user_id,b.member_id,b.kyc_case_id,
+      ORDER BY m.id`;
+    const bindingsSql=`SELECT b.user_id,b.member_id,b.kyc_case_id,
       EXISTS(SELECT 1 FROM kyc_cases k JOIN members m ON m.id=k.client_member_id AND m.site_id=k.site_id
         WHERE k.id=b.kyc_case_id AND k.client_member_id=b.member_id AND k.status='VERIFIED'
         AND ${brokerRole('m')} AND ${activeSql('m')}) AS binding_verified
-      FROM booking_broker_mobile_user_bindings b WHERE b.account_id=$1 ORDER BY b.user_id`,[account.id]);
-    const currentLinks=(await connection.query(`SELECT user_id,member_id,kyc_case_id FROM booking_user_kyc_links
-      WHERE member_id=ANY($1::integer[])`,[linkedMembers.map(m=>m.id)])).rows;
+      FROM booking_broker_mobile_user_bindings b WHERE b.account_id=$1 ORDER BY b.user_id`;
+    // Same unfiltered join set as linkedMembers, so it no longer waits for that read.
+    const currentLinksSql=`SELECT user_id,member_id,kyc_case_id FROM booking_user_kyc_links
+      WHERE member_id IN (SELECT bm.member_id FROM booking_broker_mobile_members bm JOIN members m ON m.id=bm.member_id
+        JOIN sites s ON s.id=m.site_id WHERE bm.account_id=$1)`;
+    // The pool runs the three account-keyed reads together; a transaction client
+    // keeps them sequential (pg 8 deprecates concurrent queries on one client).
+    const together=connection===db?await allInOrder([linkedMembersSql,bindingsSql,currentLinksSql].map(read)):null;
+    const linkedMembers=together?together[0]:await read(linkedMembersSql);
+    const members=linkedMembers.filter(m=>m.broker_active&&m.broker_role&&matchingIdentity(m,account));
+    if(!members.length)unauthorized();
+    const bindings=together?together[1]:await read(bindingsSql);
+    const currentLinks=together?together[2]:await read(currentLinksSql);
     // New staff enrollment changes the authority boundary. An older member-only
     // token cannot ignore it; fresh password authentication captures the binding.
     if(currentLinks.some(link=>!bindings.some(b=>b.user_id===link.user_id&&b.member_id===link.member_id&&b.kyc_case_id===link.kyc_case_id)))unauthorized();

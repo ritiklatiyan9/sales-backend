@@ -251,6 +251,9 @@ export const whatsappAwsConfig = () => ({
       secretAccessKey: process.env.WHATSAPP_AWS_SECRET_ACCESS_KEY,
     },
   } : {}),
+  // A hung AWS call must reject, or the worker (rescheduled only in `finally`) stops for good.
+  // throwOnRequestTimeout: the 4.x handler (socialmessaging) only logs a WARN without it; 3.3.3 (S3) ignores it.
+  requestHandler: { connectionTimeout: 5_000, requestTimeout: 30_000, throwOnRequestTimeout: true },
 });
 
 let social = null;

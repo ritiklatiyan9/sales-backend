@@ -4,6 +4,8 @@ import { Upload } from '@aws-sdk/lib-storage';
 import fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import path from 'path';
+import pool from '../config/db.js';
+import { signOpts } from './memberDocumentUrls.js';
 
 // Same S3-with-local-fallback approach as the accounting backend, but KYC docs
 // live under the `kyc_documents/` prefix. NOTE: for the OCR worker (a separate
@@ -18,6 +20,9 @@ if (process.env.AWS_ACCESS_KEY_ID) {
       accessKeyId: process.env.AWS_ACCESS_KEY_ID,
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     },
+    // A stalled connection fails instead of hanging the request. requestTimeout is socket
+    // inactivity in @smithy/node-http-handler 3.x, so long multipart uploads still finish.
+    requestHandler: { connectionTimeout: 5_000, requestTimeout: 60_000 },
   });
 }
 
@@ -68,8 +73,13 @@ export const fetchKycDocumentBytes = async (storageKey) => {
   return Buffer.concat(chunks);
 };
 
+// Several documents rows can share one stored file, so it is removed only once no row
+// references it. Callers delete their own rows (and COMMIT) first, then call this.
+// ponytail: seq scan (no index on documents.file_path, ~1 ms at 10k rows); index it if the table grows.
 export const deleteKycDocument = async (storageKey) => {
   if (!storageKey) return;
+  const { rows: stillUsed } = await pool.query('SELECT 1 FROM documents WHERE file_path = $1 LIMIT 1', [storageKey]);
+  if (stillUsed.length) return;
   if (storageKey.startsWith('local::')) {
     const p = path.join(LOCAL_DIR, storageKey.replace('local::', ''));
     if (fs.existsSync(p)) fs.unlinkSync(p);
@@ -87,7 +97,7 @@ export const getKycDocumentUrl = async (storageKey) => {
   }
   if (usingS3()) {
     const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: storageKey });
-    return await getSignedUrl(s3Client, cmd, { expiresIn: 3600 });
+    return await getSignedUrl(s3Client, cmd, signOpts());
   }
   return null;
 };

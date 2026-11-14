@@ -11,9 +11,26 @@ export const BOOKING_FORM_FIELDS = {
 
 export function validateBookingTemplate(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw workflowError('A booking form template is required');
-  const allowed = new Set([...Object.keys(BOOKING_FORM_FIELDS), 'accent_color', 'heading_font', 'body_font', 'design']);
+  const allowed = new Set([...Object.keys(BOOKING_FORM_FIELDS), 'form_type', 'installment_dates', 'accent_color', 'heading_font', 'body_font', 'design']);
   for (const key of Object.keys(input)) if (!allowed.has(key)) throw workflowError(`Unknown template field: ${key}`);
   const out = {};
+  if (Object.hasOwn(input, 'form_type')) {
+    if (!['booking', 'booking_allotment'].includes(input.form_type)) throw workflowError('Choose a supported booking form type');
+    out.form_type = input.form_type;
+  }
+  if (Object.hasOwn(input, 'installment_dates')) {
+    const dates = input.installment_dates;
+    const validDate = value => {
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+      const parsed = new Date(`${value}T00:00:00.000Z`);
+      return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+    };
+    if (!Array.isArray(dates) || dates.length !== 4 || !Array.from(dates).every(validDate)
+      || dates.some((date, index) => index > 0 && date <= dates[index - 1])) {
+      throw workflowError('Provide four valid installment dates in YYYY-MM-DD format, in strictly increasing order');
+    }
+    out.installment_dates = [...dates];
+  }
   for (const [key, limit] of Object.entries(BOOKING_FORM_FIELDS)) {
     const value = input[key] ?? '';
     if (typeof value !== 'string' || value.length > limit) throw workflowError(`${key.replaceAll('_', ' ')} must contain at most ${limit} characters`);
@@ -33,6 +50,9 @@ export function validateBookingTemplate(input) {
 }
 
 export function requirePublishableBookingTemplate(template) {
+  if (template.form_type === 'booking_allotment' && (!Array.isArray(template.installment_dates) || template.installment_dates.length !== 4)) {
+    throw workflowError('Complete all four installment dates before publishing a Booking Cum Allotment Form');
+  }
   for (const key of ['form_title','brand_name','applicant_title','related_title','property_title','kyc_title','declarations_title','declarations','terms_title','terms','office_title','acceptance_note']) {
     if (!template[key]?.trim()) throw workflowError(`Complete ${key.replaceAll('_', ' ')} before publishing`);
   }

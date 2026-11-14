@@ -45,7 +45,7 @@ const TOKEN_PAYMENT_FIELDS = [
  * screen — a field missing here silently never persists no matter what the UI shows.
  */
 const CLIENT_FIELDS = [
-  'full_name', 'father_name', 'mother_name', 'spouse_name', 'gender', 'date_of_birth',
+  'full_name', 'booking_name', 'father_name', 'mother_name', 'spouse_name', 'gender', 'date_of_birth',
   'nationality', 'religion', 'marital_status', 'qualification', 'occupation', 'company_name',
   'blood_group', 'caste', 'anniversary_date',
   'phone', 'alt_phone', 'whatsapp', 'email',
@@ -316,10 +316,11 @@ export const getBookingDrawCredits = asyncHandler(async (req, res) => {
 /** One selected-client fetch hydrates the booking form and its draw dropdown. */
 export const getBookingIntake = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Only admins can prepare property bookings' });
-  const site = await requireSiteAccess(req.user, req.query.site_id);
+  const siteId = Number(req.query.site_id);
   const memberId = Number(req.query.client_member_id);
-  if (!Number.isInteger(memberId) || memberId <= 0) return res.status(400).json({ message: 'Select a valid registered client' });
-  const { rows } = await pool.query(`
+  // Gate, client and draw reads in one wave; the gate still wins and no NaN id is ever sent.
+  const ids = Number.isInteger(siteId) && siteId > 0 && Number.isInteger(memberId) && memberId > 0;
+  const [, { rows }, credits] = await allInOrder([requireSiteAccess(req.user, req.query.site_id), !ids ? { rows: [] } : pool.query(`
     SELECT m.*, u.name AS referred_by_name, u.referral_code AS referred_by_code,
            k.id AS kyc_case_id, k.status AS kyc_status, k.attachable AS kyc_attachable
     FROM members m
@@ -331,9 +332,10 @@ export const getBookingIntake = asyncHandler(async (req, res) => {
       ORDER BY (kc.booking_id IS NULL OR b.status = 'CANCELLED') DESC,
                (kc.status = 'VERIFIED') DESC, kc.id DESC LIMIT 1
     ) k ON true
-    WHERE m.id = $1 AND m.site_id = $2 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`, [memberId, site.id]);
+    WHERE m.id = $1 AND m.site_id = $2 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`, [memberId, siteId]),
+    ids ? listBookingDrawCredits(siteId, memberId) : []]);
+  if (!Number.isInteger(memberId) || memberId <= 0) return res.status(400).json({ message: 'Select a valid registered client' });
   if (!rows[0]) return res.status(404).json({ message: 'Client not found at the selected site' });
-  const credits = await listBookingDrawCredits(site.id, memberId);
   const draws = ['admin', 'super_admin'].includes(req.user.role) ? credits : credits.map(draw => draw.eligible
     ? { ...draw, eligible: false, reason: 'An admin or super admin must apply draw payments during allotment' } : draw);
   res.set?.('Cache-Control', 'private, no-store');
@@ -475,18 +477,20 @@ export const createBooking = asyncHandler(async (req, res) => {
 
 /** GET /bookings/:id  → booking + kyc cases + documents (with latest OCR result) */
 export const getBooking = asyncHandler(async (req, res) => {
-  const booking = await bookingModel.getDetail(req.params.id, pool);
+  // One wave, all keyed by the booking id; the 404/403 below still decide before any body.
+  const [booking, visibleUserIds, cases, docs] = await allInOrder([
+    bookingModel.getDetail(req.params.id, pool), getVisibleUserIds(req.user),
+    kycCaseModel.findByBooking(req.params.id, pool), kycCaseModel.getDocumentsWithResultsForBooking(req.params.id, pool),
+  ]);
   if (!booking) return res.status(404).json({ message: 'Booking not found' });
 
   // Network scoping: non-admins may only open bookings inside their own hierarchy.
-  const visibleUserIds = await getVisibleUserIds(req.user);
   if (visibleUserIds && !visibleUserIds.includes(booking.agent_user_id) && !visibleUserIds.includes(booking.created_by)) {
     return res.status(403).json({ message: 'You are not authorised to view this booking' });
   }
 
-  const cases = await kycCaseModel.findByBooking(booking.id, pool);
   for (const c of cases) {
-    c.documents = await kycCaseModel.getDocumentsWithResults(c.id, pool);
+    c.documents = docs.filter(d => String(d.kyc_case_id) === String(c.id));
     // Resolve a viewable URL per document (same helper the KYC endpoints use).
     for (const d of c.documents) {
       try { d.file_url = await getKycDocumentUrl(d.file_path); } catch { /* leave undefined */ }
@@ -569,7 +573,7 @@ export const cancelBooking = asyncHandler(async (req, res) => {
  * DELETE /bookings/:id — permanently delete a booking.
  * SAFE: only touches booking-module tables. The DB cascade removes this booking's
  * kyc_cases → documents → ocr_results; the linked member/plot are NOT affected
- * (those FKs are SET NULL/RESTRICT and point outward). Uploaded files are cleaned first.
+ * (those FKs are SET NULL/RESTRICT and point outward). Uploaded files are cleaned after the rows.
  */
 export const deleteBooking = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
@@ -592,14 +596,12 @@ export const deleteBooking = asyncHandler(async (req, res) => {
       RETURNING k.id`,
     [id]
   );
-  // Cases with no member to anchor on still cascade — clean their files first.
+  // Cases with no member to anchor on still cascade — collect their files now, delete them
+  // only after the rows are gone (deleteKycDocument keeps objects other rows still reference).
   const { rows: docs } = await pool.query(
     `SELECT d.file_path FROM documents d JOIN kyc_cases k ON k.id = d.kyc_case_id WHERE k.booking_id = $1`,
     [id]
   );
-  for (const d of docs) {
-    try { await deleteKycDocument(d.file_path); } catch { /* best-effort file cleanup */ }
-  }
 
   // Remove the still-pending token payment first (approved rows are preserved + unlinked).
   // Forcing the removal path keeps the chosen lifecycle: a deleted booking takes its
@@ -611,6 +613,9 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   await revertDrawAllotment(booking.id, req.user?.id);
 
   await pool.query('DELETE FROM bookings WHERE id = $1', [id]);
+  for (const d of docs) {
+    try { await deleteKycDocument(d.file_path); } catch { /* best-effort file cleanup */ }
+  }
   res.json({
     message: 'Booking deleted', id: Number(id),
     detachedKycCases: detached.length, removedDocuments: docs.length, token_sync,
@@ -647,70 +652,80 @@ const clientLookupSelect = `
     ) k ON true`;
 
 export const searchClients = asyncHandler(async (req, res) => {
-  const site = await requireSiteAccess(req.user, req.query.site_id);
-  const params = [site.id];
-  const where = ['m.site_id = $1'];
-  const memberType = memberTypeFilterFromQuery(req.query);
-  if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
-  const phoneOnly = ['true', '1', 'yes'].includes(String(req.query.phone_only || '').toLowerCase());
-  if (phoneOnly) {
-    const search = clientSearchFilter(req.query.q, params);
-    if (search) where.push(search);
-  } else {
-    // Retain the shared Members/KYC picker contract. The dedicated phone-only
-    // picker and /clients directory use indexed prefixes; older general lookups
-    // also need partial names, identity numbers and accounting member roles.
-    const q = String(req.query.q || '').trim().slice(0, 120);
-    if (parseMemberCode(q)) {
-      where.push(clientSearchFilter(q,params));
-    } else if (q) {
-      params.push(`%${q.replace(/[\\%_]/g, '\\$&')}%`);
-      const parameter = `$${params.length}`;
-      const matches = ['full_name', 'phone', 'aadhar_no', 'pan_no', 'member_type']
-        .map(field => `m.${field} ILIKE ${parameter}`);
-      if (/^[+\d\s().-]+$/.test(q)) {
-        let digits = q.replace(/\D/g, '');
-        if ((digits.length === 12 && digits.startsWith('91')) || (digits.length === 11 && digits.startsWith('0'))) digits = digits.slice(-10);
-        if (digits) {
-          params.push(`%${digits}%`);
-          matches.push(`${memberPhoneSql()} LIKE $${params.length}`);
+  // Gate and search in one wave. The builder runs inside the second slot, so its
+  // member_type 400 still loses to the site gate's 400/403/404, as when awaited first.
+  const [, { rows }] = await allInOrder([requireSiteAccess(req.user, req.query.site_id), (async () => {
+    const siteId = Number(req.query.site_id);
+    if (!Number.isInteger(siteId) || siteId <= 0) return { rows: [] }; // the gate rejects it
+    const params = [siteId];
+    const where = ['m.site_id = $1'];
+    const memberType = memberTypeFilterFromQuery(req.query);
+    if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
+    const phoneOnly = ['true', '1', 'yes'].includes(String(req.query.phone_only || '').toLowerCase());
+    if (phoneOnly) {
+      const search = clientSearchFilter(req.query.q, params);
+      if (search) where.push(search);
+    } else {
+      // Retain the shared Members/KYC picker contract. The dedicated phone-only
+      // picker and /clients directory use indexed prefixes; older general lookups
+      // also need partial names, identity numbers and accounting member roles.
+      const q = String(req.query.q || '').trim().slice(0, 120);
+      if (parseMemberCode(q)) {
+        where.push(clientSearchFilter(q,params));
+      } else if (q) {
+        params.push(`%${q.replace(/[\\%_]/g, '\\$&')}%`);
+        const parameter = `$${params.length}`;
+        const matches = ['full_name', 'phone', 'aadhar_no', 'pan_no', 'member_type']
+          .map(field => `m.${field} ILIKE ${parameter}`);
+        if (/^[+\d\s().-]+$/.test(q)) {
+          let digits = q.replace(/\D/g, '');
+          if ((digits.length === 12 && digits.startsWith('91')) || (digits.length === 11 && digits.startsWith('0'))) digits = digits.slice(-10);
+          if (digits) {
+            params.push(`%${digits}%`);
+            matches.push(`${memberPhoneSql()} LIKE $${params.length}`);
+          }
         }
+        where.push(`(${matches.join(' OR ')})`);
       }
-      where.push(`(${matches.join(' OR ')})`);
     }
-  }
-  const limit = Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || (phoneOnly ? 25 : 100))));
-  params.push(limit);
-  const { rows } = await pool.query(`${clientLookupSelect}
-    WHERE ${where.join(' AND ')} ORDER BY m.full_name, m.id DESC LIMIT $${params.length}`, params);
+    const limit = Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || (phoneOnly ? 25 : 100))));
+    params.push(limit);
+    return pool.query(`${clientLookupSelect}
+      WHERE ${where.join(' AND ')} ORDER BY m.full_name, m.id DESC LIMIT $${params.length}`, params);
+  })()]);
   res.json(await Promise.all(rows.map(async (member) => maskClientIdentity(await withMemberPhoto(member)))));
 });
 
 /** GET /clients?site_id=&q=&kyc=pending|verified&page=&limit= — bounded reusable client directory. */
 export const listClients = asyncHandler(async (req, res) => {
-  const [, site] = await allInOrder([requireClientRegistryPermission(req.user), requireSiteAccess(req.user, req.query.site_id)]);
-  const params = [site.id];
-  const where = ['m.site_id = $1'];
-  const memberType = memberTypeFilterFromQuery({ member_type: 'CLIENT', ...req.query });
-  if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
-  const search = clientSearchFilter(req.query.q, params);
-  if (search) where.push(search);
-  // Same "registered" rule as the lookup and Home's pending count (any VERIFIED case at the site).
-  const kyc = String(req.query.kyc ?? '').trim().toLowerCase();
-  if (kyc && kyc !== 'pending' && kyc !== 'verified') throw clientRegistryError('kyc must be pending or verified');
-  if (kyc) where.push(`${kyc === 'pending' ? 'NOT ' : ''}${kycVerifiedSql('m')}`);
   const page = Math.max(1, Math.trunc(Number(req.query.page) || 1));
   const limit = Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || 25)));
-  const whereSql = where.join(' AND ');
-  const [count, records] = await Promise.all([
-    pool.query(`SELECT count(*)::int AS total FROM members m WHERE ${whereSql}`, params),
-    pool.query(`WITH selected AS (
-      SELECT m.id FROM members m WHERE ${whereSql}
-      ORDER BY m.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}
-    ) SELECT page.*, (SELECT count(*)::int FROM draw_registrations r WHERE r.site_id = $1 AND r.client_member_id = page.id) AS draw_count
-      FROM (${clientLookupSelect} JOIN selected selected_member ON selected_member.id = m.id) page
-      ORDER BY page.id DESC`, [...params, limit, (page - 1) * limit]),
-  ]);
+  // Gates and reads in one wave. The builder runs inside the last slot, so its
+  // member_type/kyc 400 still loses to the gates' errors, as when they were awaited first.
+  const [, , [count, records]] = await allInOrder([requireClientRegistryPermission(req.user), requireSiteAccess(req.user, req.query.site_id), (async () => {
+    const siteId = Number(req.query.site_id);
+    if (!Number.isInteger(siteId) || siteId <= 0) return []; // the site gate rejects it
+    const params = [siteId];
+    const where = ['m.site_id = $1'];
+    const memberType = memberTypeFilterFromQuery({ member_type: 'CLIENT', ...req.query });
+    if (memberType) { params.push(memberType); where.push(`$${params.length} = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`); }
+    const search = clientSearchFilter(req.query.q, params);
+    if (search) where.push(search);
+    // Same "registered" rule as the lookup and Home's pending count (any VERIFIED case at the site).
+    const kyc = String(req.query.kyc ?? '').trim().toLowerCase();
+    if (kyc && kyc !== 'pending' && kyc !== 'verified') throw clientRegistryError('kyc must be pending or verified');
+    if (kyc) where.push(`${kyc === 'pending' ? 'NOT ' : ''}${kycVerifiedSql('m')}`);
+    const whereSql = where.join(' AND ');
+    return Promise.all([
+      pool.query(`SELECT count(*)::int AS total FROM members m WHERE ${whereSql}`, params),
+      pool.query(`WITH selected AS (
+        SELECT m.id FROM members m WHERE ${whereSql}
+        ORDER BY m.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+      ) SELECT page.*, (SELECT count(*)::int FROM draw_registrations r WHERE r.site_id = $1 AND r.client_member_id = page.id) AS draw_count
+        FROM (${clientLookupSelect} JOIN selected selected_member ON selected_member.id = m.id) page
+        ORDER BY page.id DESC`, [...params, limit, (page - 1) * limit]),
+    ]);
+  })()]);
   const total = count.rows[0].total;
   res.json({
     items: await Promise.all(records.rows.map(async (member) => maskClientIdentity(await withMemberPhoto(member)))),
@@ -764,12 +779,13 @@ export const deleteClientMember = asyncHandler(async (req, res) => {
  */
 export const listSiteBanks = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) return res.status(403).json({ message: 'Admin access required' });
-  const site = await requireSiteAccess(req.user, req.query.site_id);
-  const { rows } = await pool.query(
+  const siteId = Number(req.query.site_id);
+  // Gate and read in one wave; the gate still wins and no NaN id is ever sent.
+  const [, { rows }] = await allInOrder([requireSiteAccess(req.user, req.query.site_id), !(Number.isInteger(siteId) && siteId > 0) ? { rows: [] } : pool.query(
     `SELECT id, name, branch, RIGHT(account_no, 4) AS account_last4
        FROM bank_accounts WHERE site_id = $1 AND is_active IS NOT FALSE ORDER BY name, id`,
-    [site.id]
-  );
+    [siteId]
+  )]);
   res.json({ banks: rows });
 });
 
@@ -780,7 +796,6 @@ export const listSiteBanks = asyncHandler(async (req, res) => {
  */
 export const searchAgents = asyncHandler(async (req, res) => {
   const { site_id, q } = req.query;
-  await requireSiteAccess(req.user, site_id);
   const params = [];
   const where = [`member_type NOT IN ('CLIENT','FARMER','VENDOR')`];
   if (site_id) { params.push(site_id); where.push(`site_id = $${params.length}`); }
@@ -788,13 +803,16 @@ export const searchAgents = asyncHandler(async (req, res) => {
     params.push(`%${q}%`);
     where.push(`(full_name ILIKE $${params.length} OR phone ILIKE $${params.length})`);
   }
-  const { rows } = await pool.query(
+  // Gate and search in one wave; the gate still wins, and an invalid site_id (which the
+  // gate rejects) never sends the unscoped query.
+  const siteId = Number(site_id);
+  const [, { rows }] = await allInOrder([requireSiteAccess(req.user, site_id), !(Number.isInteger(siteId) && siteId > 0) ? { rows: [] } : pool.query(
     `SELECT id, full_name, phone, member_type,
             member_type AS registration_role, member_type AS role, photo
        FROM members WHERE ${where.join(' AND ')}
       ORDER BY full_name ASC LIMIT 100`,
     params
-  );
+  )]);
   res.json(rows);
 });
 
@@ -809,10 +827,15 @@ const requireClientMember = async (user, id, db = pool) => {
 };
 
 export const getClient = asyncHandler(async (req, res) => {
-  const member = await requireClientMember(req.user, req.params.id);
-  const agent = await memberReferral(member,pool);
-  const {rows:[identity]}=await pool.query(`SELECT ${canonicalMemberIdSql()}::int AS code_id FROM members m WHERE m.id=$1`,[member.id]);
-  res.json({ ...await withMemberPhoto(member), ...memberTypePayload(member), code_id:identity?.code_id || member.id, referred_by_name: agent?.name || null,
+  // requireClientMember's checks inlined so code_id rides on the member read and the site
+  // gate overlaps memberReferral (whose result is only used once the gate has passed).
+  const memberId = Number(req.params.id);
+  if (!Number.isInteger(memberId) || memberId <= 0) throw clientRegistryError('Enter a valid client ID');
+  const { rows: [row] } = await pool.query(`SELECT m.*, ${canonicalMemberIdSql()}::int AS code_id FROM members m WHERE m.id = $1`, [memberId]);
+  if (!row) throw clientRegistryError('Member not found', 404);
+  const { code_id: codeId, ...member } = row;
+  const [, agent] = await allInOrder([requireSiteAccess(req.user, member.site_id), memberReferral(member, pool)]);
+  res.json({ ...await withMemberPhoto(member), ...memberTypePayload(member), code_id:codeId || member.id, referred_by_name: agent?.name || null,
     referred_by_code: agent?.referral_code || null, referral_agent_name: agent?.name || null,
     referral_code: agent?.referral_code || null });
 });

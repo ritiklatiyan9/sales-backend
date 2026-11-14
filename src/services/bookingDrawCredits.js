@@ -1,4 +1,4 @@
-import pool from '../config/db.js';
+import pool, { schemaHas } from '../config/db.js';
 import drawModel from '../models/Draw.model.js';
 import { todayIST } from './drawWorkflow.js';
 
@@ -6,7 +6,8 @@ let ready = false;
 let pending;
 export async function ensureBookingCreditFields(db = pool) {
   if (ready) return;
-  if (!pending) pending = db.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS first_installment_amount NUMERIC(15,2) CHECK (first_installment_amount > 0)')
+  if (!pending) pending = schemaHas({ columns: [['bookings', 'first_installment_amount']] }, db)
+    .then(has => has || db.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS first_installment_amount NUMERIC(15,2) CHECK (first_installment_amount > 0)'))
     .then(() => { ready = true; }).finally(() => { pending = null; });
   await pending;
 }

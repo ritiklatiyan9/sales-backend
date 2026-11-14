@@ -1,6 +1,7 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import * as projectSettings from '../models/ProjectSettings.model.js';
-import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
+import { requireSiteAccess, requireSiteId } from '../services/bookingWorkspaceAccess.js';
+import { allInOrder } from '../services/clientRegistry.service.js';
 import { hasPermission } from '../services/permissions.service.js';
 import { validateDocumentConfig } from '../services/documentSettings.js';
 
@@ -8,8 +9,9 @@ import { validateDocumentConfig } from '../services/documentSettings.js';
 export const getProjectSettings = asyncHandler(async (req, res) => {
   const siteId = req.query.site_id;
   if (!siteId) return res.status(400).json({ message: 'site_id is required' });
-  await requireSiteAccess(req.user, siteId);
-  const row = await projectSettings.getBySite(siteId);
+  requireSiteId(siteId); // an invalid id sends no query
+  // Guard and read in one wave; the guard's error wins and the row is sent only after it passes.
+  const [, row] = await allInOrder([requireSiteAccess(req.user, siteId), projectSettings.getBySite(siteId)]);
   res.json(row || { site_id: Number(siteId), milestones: [] });
 });
 

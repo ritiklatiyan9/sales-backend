@@ -42,7 +42,8 @@ export const listPlotPayments = asyncHandler(async (req, res) => {
   const plotId = parseInt(req.query.plot_id);
   if (!plotId) return res.status(400).json({ message: 'plot_id is required' });
 
-  const { rows: plotRows } = await pool.query(
+  // Both keyed only by plotId → one round trip; the 404 below still decides before any body.
+  const [{ rows: plotRows }, { rows: payments }] = await Promise.all([pool.query(
     `SELECT p.id, p.plot_no, p.block, p.plot_size, p.sale_price, p.status, p.buyer_name,
             p.site_id, s.name AS site_name, s.city AS site_city, s.state AS site_state,
             COALESCE(t.total_received, 0)::numeric AS total_received,
@@ -64,14 +65,11 @@ export const listPlotPayments = asyncHandler(async (req, res) => {
        ) t ON t.plot_id = p.id
       WHERE p.id = $1`,
     [plotId]
-  );
-  const plot = plotRows[0];
-  if (!plot) return res.status(404).json({ message: 'Plot not found' });
-
+  ),
   // ALL payment types listed — cash rows included (e.g. draw registration amounts paid
   // in cash) so the booking page shows every rupee received; the accounting cash
   // ledger remains the approval/receipt authority for CASH exactly as before.
-  const { rows: payments } = await pool.query(
+  pool.query(
     `SELECT id, plot_id, site_id, date, amount, payment_from, payment_type,
             bank_name, branch, bank_details, cheque_no, cheque_status,
             narration, received_by, buyer_name, booked_by, status, created_at
@@ -79,7 +77,9 @@ export const listPlotPayments = asyncHandler(async (req, res) => {
       WHERE plot_id = $1
       ORDER BY date ASC, created_at ASC, id ASC`,
     [plotId]
-  );
+  )]);
+  const plot = plotRows[0];
+  if (!plot) return res.status(404).json({ message: 'Plot not found' });
 
   res.json({
     plot,

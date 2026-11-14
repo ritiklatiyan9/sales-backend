@@ -4,14 +4,16 @@ import { readFile } from 'node:fs/promises';
 import { drawFixture, TEST_BROKER_CODE } from '../test/drawFixture.mjs';
 import { migrateFormStudioAttendance } from '../migrations/025_form_studio_attendance.js';
 import { validateApplicationTemplate } from '../services/applicationFormTemplate.js';
-import { checkInDraw, correctAttendance, attendanceToken } from '../services/drawAttendance.js';
+import { checkInDraw, correctAttendance, attendanceToken, setAttendance } from '../services/drawAttendance.js';
 import { todayIST } from '../services/drawWorkflow.js';
 import * as studio from './applicationForm.controller.js';
-import { listDrawAttendance } from './drawAttendance.controller.js';
+import { listDrawAttendance, listDrawAttendanceDates } from './drawAttendance.controller.js';
 import { createDraw, setDrawSettings } from './draw.controller.js';
 
 const admin={id:1,role:'admin'},agent={id:2,role:'agent'};
 const call=(handler,{body={},params={},query={},user=admin}={})=>new Promise(resolve=>handler({body,params,query,user},{statusCode:200,status(value){this.statusCode=value;return this;},json(data){resolve({status:this.statusCode,data});}},error=>resolve({status:error.status||500,data:{message:error.message}})));
+import { DEFENCE_GARDEN_PAYMENT_PLAN } from '../../../sales-dg-frontend/src/lib/defenceGardenPaymentPlan.js';
+
 const seed=JSON.parse(await readFile(new URL('../seeds/mount-valley-application.json',import.meta.url),'utf8'));
 const template={...seed,terms:'1. Registration. Read your application carefully.\n\n2. Draw day. Keep your issued token.'};
 
@@ -34,14 +36,15 @@ test('site templates and attendance use isolated PostgreSQL',async t=>{
    assert.throws(()=>validateApplicationTemplate({...template,unknown:'field'}));
   });
   await t.test('draft, publication and revision conflicts preserve issued snapshots',async()=>{
-   const withoutOverview={...template,commercial_heading:'',commercial_description:''};
+   const withoutOverview={...template,payment_plan:DEFENCE_GARDEN_PAYMENT_PLAN,commercial_heading:'',commercial_description:''};
    let saved=await call(studio.saveFormDraft,{params:{siteId:1},body:{template:withoutOverview,revision:0}});
-   assert.equal(saved.status,200,JSON.stringify(saved.data));assert.equal(saved.data.revision,1);
+   assert.equal(saved.status,200,JSON.stringify(saved.data));assert.equal(saved.data.revision,1);assert.deepEqual(saved.data.draft.payment_plan,DEFENCE_GARDEN_PAYMENT_PLAN);
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template,null);
    assert.equal((await call(studio.saveFormDraft,{params:{siteId:1},body:{template,revision:0}})).status,409);
    assert.equal((await call(studio.publishForm,{params:{siteId:1},body:{revision:99}})).status,409);
    assert.equal((await call(studio.publishForm,{params:{siteId:1},body:{revision:1}})).status,200);
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_title,'Naya Baazar');
+   assert.deepEqual((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.payment_plan,DEFENCE_GARDEN_PAYMENT_PLAN);
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_heading,'');
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_description,'');
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:2}})).data.template,null);
@@ -50,6 +53,7 @@ test('site templates and attendance use isolated PostgreSQL',async t=>{
    const draft={...template,commercial_title:'Draft only'};
    assert.equal((await call(studio.saveFormDraft,{params:{siteId:1},body:{template:draft,revision:1}})).status,200);
    assert.equal((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.commercial_title,'Naya Baazar');
+   assert.deepEqual((await call(studio.getPublishedForm,{params:{siteId:1}})).data.template.payment_plan,DEFENCE_GARDEN_PAYMENT_PLAN);
   });
   await t.test('requires explicit module permissions and assigned site',async()=>{
    assert.equal((await call(studio.getFormStudio,{params:{siteId:1},user:agent})).status,403);
@@ -96,6 +100,22 @@ test('site templates and attendance use isolated PostgreSQL',async t=>{
    assert.deepEqual((await roster()).data.summary,{total:1,present:0,remaining:1});
    assert.equal((await f.query("SELECT reason FROM draw_attendance_events WHERE action='CORRECTED'")).rows[0].reason,'Incorrect scan');
    const second=await checkInDraw({user:agent,siteId:1,date,token:'test-qr'});assert.equal(second.already_present,false);
+   { // register: only admins tick P/A or clear, and a cleared token scans again
+    const mark=(present,extra={})=>setAttendance({user:admin,siteId:1,date,ids:[drawId],present,...extra});
+    await assert.rejects(()=>setAttendance({user:agent,siteId:1,date,ids:[drawId],present:false}),e=>e.status===403);
+    await assert.rejects(()=>mark('yes'),e=>e.status===400);
+    await assert.rejects(()=>setAttendance({user:admin,siteId:1,date,ids:[],present:false}),e=>e.status===400);
+    await assert.rejects(()=>setAttendance({user:admin,siteId:1,date:'2999-01-01',ids:[drawId],present:true}),e=>e.status===409);
+    assert.equal((await mark(false)).changed,1);assert.equal((await mark(false)).changed,0);
+    assert.deepEqual((await roster()).data.summary,{total:1,present:0,remaining:1});
+    assert.equal((await checkInDraw({user:agent,siteId:1,date,token:'test-qr'})).already_present,false);
+    assert.equal((await mark(false)).changed,1);assert.equal((await mark(true)).changed,1);assert.equal((await mark(true)).changed,0);
+    assert.equal((await setAttendance({user:admin,siteId:2,date,ids:[drawId],present:false})).changed,0);
+    assert.equal((await f.query("SELECT count(*)::int AS n FROM draw_attendance_events WHERE reason LIKE '%in register'")).rows[0].n,3);
+    const named=await call(listDrawAttendance,{query:{site_id:1,date,sort:'name',limit:1000}});
+    assert.equal(named.data.items[0].present,true);assert.equal(named.data.limit,1000);
+    assert.deepEqual((await call(listDrawAttendanceDates,{query:{site_id:1}})).data.dates,[{date,total:1,present:1}]);
+   }
    await f.query("UPDATE user_permissions SET can_read=false WHERE module='booking_draw_attendance'");
    await assert.rejects(()=>checkInDraw({user:agent,siteId:1,date,token:'test-qr'}),e=>e.status===403);
    assert.equal((await roster()).status,403);

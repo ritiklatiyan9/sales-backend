@@ -24,6 +24,10 @@ if (HOST && USER && PASS) {
     port: PORT,
     secure: process.env.SMTP_SECURE === 'true' || PORT === 465,
     auth: { user: USER, pass: PASS },
+    // A stalled SMTP server fails the OTP send (caller's 502) instead of hanging the login request.
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 30_000,
   });
   console.log(`[booking-api] Mailer ready (${HOST}:${PORT})`);
 } else {

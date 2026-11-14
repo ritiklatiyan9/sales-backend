@@ -105,7 +105,8 @@ class BookingModel extends MasterModel {
     const { rows } = await pool.query(`
       SELECT b.*,
              m.id AS account_member_id,
-             m.full_name AS client_name, m.phone AS client_phone, m.email AS client_email,
+             m.full_name AS client_name, to_jsonb(m)->>'booking_name' AS client_booking_name,
+             m.phone AS client_phone, m.email AS client_email,
              m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
              m.father_name AS client_father, m.mother_name AS client_mother, m.spouse_name AS client_spouse,
              m.address AS client_address, m.city AS client_city, m.state AS client_state,

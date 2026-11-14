@@ -8,6 +8,15 @@ function parseS3ImageUrl(value) {
   return { Bucket: match[1], Key: decodeURIComponent(url.pathname.slice(1)), region: match[2] };
 }
 
+// Sign once per 15-minute window so refetches return byte-identical URLs and browsers
+// reuse cached images. A URL stays valid 3600-4500 s from issuance, which holds only
+// while signing uses long-lived IAM keys (temporary credentials may expire sooner).
+const SIGN_WINDOW_MS = 15 * 60 * 1000;
+export const signOpts = () => ({
+  expiresIn: 3600 + SIGN_WINDOW_MS / 1000,
+  signingDate: new Date(Math.floor(Date.now() / SIGN_WINDOW_MS) * SIGN_WINDOW_MS),
+});
+
 const clients = new Map();
 const credentialsFor = (accessKeyId, secretAccessKey) => (
   accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined
@@ -52,7 +61,7 @@ export async function signMemberDocumentUrl(value) {
     clients.set(clientKey, new S3Client({ region, ...(credentials ? { credentials } : {}) }));
   }
   try {
-    return await getSignedUrl(clients.get(clientKey), new GetObjectCommand({ Bucket, Key }), { expiresIn: 3600 });
+    return await getSignedUrl(clients.get(clientKey), new GetObjectCommand({ Bucket, Key }), signOpts());
   } catch {
     // Keep the member profile available if storage credentials are incomplete.
     return value;

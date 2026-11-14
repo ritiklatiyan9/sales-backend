@@ -1,7 +1,7 @@
 // UI preferences live beside module permissions, but never grant CRUD access.
 // Keep these destination slugs aligned with the frontend navigation catalog.
 const SHORTCUT_DESTINATIONS = [
-  'home', 'dashboard', 'clients', 'members', 'draws_new', 'draws', 'draws_attendance',
+  'home', 'dashboard', 'clients', 'members', 'draws_new', 'draws', 'draws_attendance', 'attendance_register',
   'kyc_new', 'kyc', 'bookings_new', 'bookings', 'booking_payments',
   'booking_form_studio', 'application_form_studio', 'agreement_studio',
   'plot_status', 'website_management', 'draws_scan', 'draws_settings',

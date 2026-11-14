@@ -3,6 +3,7 @@ import { createMobileFinancialReader, projectMobilePlot, mobileCurrentOwnerSql }
 import { createBrokerPresentation, isBrokerPropertyId } from './brokerPresentation.service.js';
 import { createBrokerBookingProgressReader } from './brokerBookingProgress.service.js';
 import { createBrokerCommissionReader, createBrokerCommissionDetailReader } from './brokerCommission.service.js';
+import { allInOrder } from './clientRegistry.service.js';
 
 const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
 const amount = value => Math.round((Number(value) || 0) * 100) / 100;
@@ -44,15 +45,29 @@ const scopedPlotsSql = `WITH allowed_sites AS (
   WHERE b.client_member_id=m.id AND ${clientRole('m')} AND ${active('m')}
     AND lower(trim(COALESCE(b.status,''))) NOT LIKE 'cancel%'
     AND lower(trim(COALESCE(b.status,''))) NOT IN ('deleted','void','voided','withdrawn')
-    AND upper(trim(COALESCE(p.status,''))) NOT IN ('AVAILABLE','COMPANY')
+    AND upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED','UNDER CANCELLATION')
     AND CASE WHEN b.booking_agent_id IS NOT NULL THEN EXISTS (
       SELECT 1 FROM members bm WHERE bm.id=b.booking_agent_id AND bm.site_id=p.site_id AND bm.id=ANY($2::integer[])
       AND ${brokerRole('bm')} AND ${active('bm')}) ELSE b.agent_user_id=ANY($1::integer[]) END`;
 
 // Accounts stores explicit co-broker relationships in the commission master.
 // The approved mobile entitlement includes those plots even when another broker
-// is the primary Booking By person. Names never grant plot access here.
-const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
+// is the primary Booking By person. An explicit assignment can cross sites
+// within the enrolled member's organization; it grants only that property,
+// never a target-site staff grant or another property's commission.
+// Names never grant plot access here.
+// The enrolled broker filters run once (MATERIALIZED) instead of per plot. The
+// owner lookup is the old CASE split into its two exclusive branches: exact
+// pointer (PK) or, without one, a unique exact name; the duplicate guard still
+// counts inactive members.
+// ponytail: OFFSET 0 is a planner fence so to_jsonb() (active) runs only on the
+// name matches, not on every site member; results are the same without it, only slow.
+const brokersCte = `WITH brokers AS MATERIALIZED (
+    SELECT bm.id,broker_site.organization_id FROM members bm JOIN sites broker_site ON broker_site.id=bm.site_id
+    WHERE bm.id=ANY($1::integer[]) AND bm.site_id=ANY($2::integer[]) AND ${brokerRole('bm')} AND ${active('bm')}
+  )`;
+const commissionPlotsSql = `${brokersCte}
+  SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_price,p.booking_date,p.status,
     s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name,
     owner.id AS client_id,owner.full_name AS current_client_name,COALESCE(to_jsonb(p)->>'buyer_name','') AS ledger_buyer_name,
     to_jsonb(p)->>'updated_at' AS access_updated_at,
@@ -66,24 +81,58 @@ const commissionPlotsSql = `SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.sale_p
     COALESCE((to_jsonb(p)->>'interest_rate')::numeric,0) AS interest_rate,
     COALESCE(to_jsonb(p)->>'interest_type','per_month') AS interest_type
   FROM plots p JOIN sites s ON s.id=p.site_id
+  CROSS JOIN LATERAL (SELECT UPPER(BTRIM(to_jsonb(p)->>'buyer_name')) AS buyer_key OFFSET 0) ledger
   LEFT JOIN LATERAL (
-    SELECT m.id,m.full_name FROM members m WHERE m.site_id=p.site_id AND ${active('m')}
-      AND CASE WHEN p.buyer_member_id IS NOT NULL THEN m.id=p.buyer_member_id ELSE
-        NULLIF(BTRIM(to_jsonb(p)->>'buyer_name'),'') IS NOT NULL
-        AND UPPER(BTRIM(m.full_name))=UPPER(BTRIM(to_jsonb(p)->>'buyer_name'))
-        AND NOT EXISTS(SELECT 1 FROM members duplicate WHERE duplicate.site_id=p.site_id AND duplicate.id<>m.id
-          AND UPPER(BTRIM(duplicate.full_name))=UPPER(BTRIM(to_jsonb(p)->>'buyer_name')))
-      END
+    SELECT m.id,m.full_name FROM members m WHERE p.buyer_member_id IS NOT NULL AND m.id=p.buyer_member_id
+      AND m.site_id=p.site_id AND ${active('m')}
+    UNION ALL
+    SELECT m.id,m.full_name FROM (SELECT named.* FROM members named WHERE p.buyer_member_id IS NULL
+        AND NULLIF(ledger.buyer_key,'') IS NOT NULL AND named.site_id=p.site_id
+        AND UPPER(BTRIM(named.full_name))=ledger.buyer_key OFFSET 0) m
+      WHERE ${active('m')} AND NOT EXISTS(SELECT 1 FROM members duplicate WHERE duplicate.site_id=p.site_id AND duplicate.id<>m.id
+        AND UPPER(BTRIM(duplicate.full_name))=ledger.buyer_key)
   ) owner ON true
   LEFT JOIN LATERAL (SELECT b.id,b.status,to_jsonb(b)->>'updated_at' AS updated_at,
     to_jsonb(b)->>'created_at' AS created_at,to_jsonb(b)->>'booking_date' AS booking_date
     FROM bookings b WHERE b.plot_id=p.id AND b.site_id=p.site_id ORDER BY b.id DESC LIMIT 1) latest_booking ON true
-  WHERE p.site_id=ANY($2::integer[])
-    AND upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY')
-    AND EXISTS(SELECT 1 FROM plot_commissions_v2 pc JOIN members bm ON bm.id=pc.agent_id AND bm.site_id=p.site_id
-      WHERE pc.plot_id=p.id AND pc.site_id=p.site_id AND bm.id=ANY($1::integer[])
-      AND ${brokerRole('bm')} AND ${active('bm')}
+  WHERE upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED')
+    AND EXISTS(SELECT 1 FROM plot_commissions_v2 pc JOIN brokers br ON br.id=pc.agent_id
+      WHERE pc.plot_id=p.id AND pc.site_id=p.site_id AND br.organization_id=s.organization_id
       AND lower(trim(COALESCE(pc.status,''))) IN ('pending','partial','completed'))`;
+
+// Commission history is a separate authority from client/property access. Its
+// historical branch deliberately reads only the old row's recorded buyer label;
+// it never follows the new booking, customer contact or payment ledger.
+const commissionHistoryPlotsSql = `${brokersCte}
+  SELECT p.id,p.site_id,p.plot_no,p.plot_size,p.booking_date::text AS booking_date,p.status,
+    s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name,
+    CASE WHEN upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED','UNDER CANCELLATION')
+      THEN owner.full_name ELSE NULL END AS current_client_name,
+    COALESCE(to_jsonb(p)->>'buyer_name','') AS ledger_buyer_name,
+    to_jsonb(p)->>'updated_at' AS access_updated_at,
+    to_jsonb(p)->>'booking_cancelled_at' AS booking_cancelled_at,
+    CASE WHEN to_jsonb(p) ? 'approval_status' THEN COALESCE(to_jsonb(p)->>'approval_status','pending') ELSE 'approved' END AS settlement_approval_status,
+    COALESCE(to_jsonb(p)->>'unit_type','plot') AS unit_type
+  FROM plots p JOIN sites s ON s.id=p.site_id
+  CROSS JOIN LATERAL (SELECT UPPER(BTRIM(to_jsonb(p)->>'buyer_name')) AS buyer_key OFFSET 0) ledger
+  LEFT JOIN LATERAL (
+    SELECT m.full_name FROM members m
+      WHERE upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED','UNDER CANCELLATION')
+      AND p.buyer_member_id IS NOT NULL AND m.id=p.buyer_member_id AND m.site_id=p.site_id AND ${active('m')}
+    UNION ALL
+    SELECT m.full_name FROM (SELECT named.* FROM members named
+        WHERE upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED','UNDER CANCELLATION')
+        AND p.buyer_member_id IS NULL AND NULLIF(ledger.buyer_key,'') IS NOT NULL AND named.site_id=p.site_id
+        AND UPPER(BTRIM(named.full_name))=ledger.buyer_key OFFSET 0) m
+      WHERE ${active('m')} AND NOT EXISTS(SELECT 1 FROM members duplicate WHERE duplicate.site_id=p.site_id AND duplicate.id<>m.id
+        AND UPPER(BTRIM(duplicate.full_name))=ledger.buyer_key)
+  ) owner ON true
+  WHERE upper(trim(COALESCE(p.status,''))) IN ('BOOKED','SOLD','REGISTRY','REGISTERED','UNDER CANCELLATION',
+    'CANCEL','CANCELLATION','CANCELLED','RESALE','TRANSFERRED')
+    AND EXISTS(SELECT 1 FROM plot_commissions_v2 pc JOIN brokers br ON br.id=pc.agent_id
+      WHERE pc.plot_id=p.id AND pc.site_id=p.site_id AND br.organization_id=s.organization_id
+        AND lower(trim(COALESCE(pc.status,''))) IN ('pending','partial','completed'))
+  ORDER BY p.site_id,p.plot_no,p.id LIMIT 1001`;
 
 const clientColumns = `m.id,m.full_name,m.phone,m.email,m.address,m.city,m.state,m.pincode,
   s.name AS private_site_name,(SELECT o.name FROM organizations o WHERE o.id=s.organization_id) AS private_org_name`;
@@ -152,16 +201,22 @@ export function createBrokerMobileService(db, options = {}) {
     if (id !== undefined && !rows.length) fail(404, 'Property unavailable.');
     return rows;
   }
+  async function scopedCommissionPlots(session) {
+    if (!includeCommissionPlots) return scopedPlots(session);
+    const { rows } = await db.query(commissionHistoryPlotsSql, [session.brokerMemberIds,session.siteIds]);
+    if (rows.length > 1000) fail(503, 'Your commission history is temporarily unavailable.');
+    return rows;
+  }
   return {
     ...auth,
-    features: { commissionLinkedPlots: includeCommissionPlots, confidentialPresentation: true, commissionVersion: 1, commissionTransactionVersion: 1 },
+    features: { commissionLinkedPlots: includeCommissionPlots, confidentialPresentation: true, commissionVersion: 1, commissionTransactionVersion: 1, commissionHistoryVersion: includeCommissionPlots ? 1 : 0 },
     commissions: createBrokerCommissionReader(db, {
-      scopedPlots,
+      scopedPlots: scopedCommissionPlots,
       validateSession: session => auth.getDeviceSession({ accountId: session.account.id, version: session.account.token_version, identity: session.identity }),
       now,
     }),
     commission: createBrokerCommissionDetailReader(db, {
-      scopedPlots,
+      scopedPlots: scopedCommissionPlots,
       validateSession: session => auth.getDeviceSession({ accountId: session.account.id, version: session.account.token_version, identity: session.identity }),
       now,
     }),
@@ -171,18 +226,20 @@ export function createBrokerMobileService(db, options = {}) {
       args.push(plots.map(row => row.client_id));
       // Referral precedence is explicit member first, then user only when the
       // member referral is absent. Referrals expose contact, never other plots.
-      const { rows } = await db.query(`SELECT ${clientColumns} FROM members m JOIN sites s ON s.id=m.site_id
-        WHERE s.id=ANY($3::integer[]) AND ${active('m')}
+      // ponytail: OFFSET 0 fence (as above) so active() runs only on matched members.
+      const [{ rows }, financials] = await allInOrder([db.query(`SELECT ${clientColumns}
+        FROM (SELECT m.* FROM members m WHERE m.site_id=ANY($3::integer[])
         AND (m.id=ANY($4::integer[]) OR (${clientRole('m')} AND CASE WHEN m.referred_by_member_id IS NOT NULL THEN EXISTS (
           SELECT 1 FROM members bm WHERE bm.id=m.referred_by_member_id AND bm.site_id=m.site_id AND bm.id=ANY($2::integer[])
           AND ${brokerRole('bm')} AND ${active('bm')}) ELSE m.referred_by_user_id=ANY($1::integer[]) END))
-        ORDER BY lower(m.full_name),m.id LIMIT 1001`, args);
+        OFFSET 0) m JOIN sites s ON s.id=m.site_id
+        WHERE ${active('m')}
+        ORDER BY lower(m.full_name),m.id LIMIT 1001`, args), financialsFor(plots.map(row => row.id), { forceFresh })]);
       if (rows.length > 1000) fail(503, 'Your portfolio is temporarily unavailable.');
       const presentation = createBrokerPresentation(session, { brands: privateBrands([...plots, ...rows]) });
       rememberProperties(session, plots);
       const clients = rows.map(safeClient);
       const byClient = new Map(clients.map(client => [client.id, client]));
-      const financials = await financialsFor(plots.map(row => row.id), { forceFresh });
       // Finance reads can be slow. Eligibility in the mobile popup/backup plan
       // and the server worker must reflect the current buyer, broker and status
       // after those reads. Keep historical portfolio visibility unchanged.
@@ -240,9 +297,12 @@ export function createBrokerMobileService(db, options = {}) {
       const bookingProgress = await bookingProgressFor({...plot,balanceAmount:projected.balanceAmount});
       // Do not return a timeline or an old buyer's details if authority changes
       // while financial / registry records are being read.
-      const current = (await scopedPlots(session,plot.id)).find(row=>row.id===plot.id);
+      // The session recheck runs alongside; its error still comes after the 404.
+      const [currentRows, sessionError] = await allInOrder([scopedPlots(session,plot.id),
+        auth.getDeviceSession({accountId:session.account.id,version:session.account.token_version,identity:session.identity}).then(()=>null,error=>error)]);
+      const current = currentRows.find(row=>row.id===plot.id);
       if (!current || JSON.stringify(current)!==scope) fail(404, 'Property unavailable.');
-      await auth.getDeviceSession({accountId:session.account.id,version:session.account.token_version,identity:session.identity});
+      if (sessionError) throw sessionError;
       return { plot: { ...presentation.plot(projected),
         buyerName: plot.current_client_name ? presentation.redact(plot.current_client_name) : undefined,
         installmentRemindersEligible: plot.installment_reminders_eligible === true,

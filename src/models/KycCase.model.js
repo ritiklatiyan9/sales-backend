@@ -279,6 +279,21 @@ class KycCaseModel extends MasterModel {
     `, [caseId]);
     return rows;
   }
+
+  /** getDocumentsWithResults for every case of a booking in one query (caller splits by kyc_case_id). */
+  async getDocumentsWithResultsForBooking(bookingId, pool) {
+    const { rows } = await pool.query(`
+      SELECT d.*,
+             r.extracted_fields, r.confidence_overall, r.confidence_map, r.raw_text, r.processed_at
+      FROM documents d
+      LEFT JOIN LATERAL (
+        SELECT * FROM ocr_results o WHERE o.document_id = d.id ORDER BY o.id DESC LIMIT 1
+      ) r ON true
+      WHERE d.kyc_case_id IN (SELECT id FROM kyc_cases WHERE booking_id = $1)
+      ORDER BY d.id ASC
+    `, [bookingId]);
+    return rows;
+  }
 }
 
 export default new KycCaseModel();

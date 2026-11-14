@@ -25,18 +25,27 @@ export const listPlotsWithDocs = asyncHandler(async (req, res) => {
   // its own payment trail) — same plot_no repeats. DISTINCT ON collapses each
   // physical plot down to its latest cycle (most recent created_at) so the
   // Documents view shows one card per plot instead of one per sale.
+  // doc_count = distinct docs attached directly OR via kyc_cases → bookings (UNION dedupes a
+  // doc matching one plot both ways). ponytail: counts every site's documents (~3-5 ms at 10k
+  // rows); scope doc_counts to the site if documents grows by orders of magnitude.
   const { rows } = await pool.query(
-    `SELECT * FROM (
+    `WITH doc_counts AS (
+       SELECT plot_id, COUNT(*)::int AS doc_count FROM (
+         SELECT d.id, d.plot_id FROM documents d WHERE d.plot_id IS NOT NULL
+         UNION
+         SELECT d.id, b.plot_id FROM documents d
+           JOIN kyc_cases k ON k.id = d.kyc_case_id
+           JOIN bookings b ON b.id = k.booking_id
+          WHERE b.plot_id IS NOT NULL
+       ) x GROUP BY plot_id
+     )
+     SELECT * FROM (
        SELECT DISTINCT ON (p.site_id, p.plot_no, p.block)
               p.id, p.plot_no, p.block, p.status, p.buyer_name, p.plot_size,
               p.booking_by, p.booking_date, p.team, p.plot_tag, p.sale_price,
-              (
-                SELECT COUNT(*) FROM documents d
-                  LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
-                  LEFT JOIN bookings b ON b.id = k.booking_id
-                WHERE d.plot_id = p.id OR b.plot_id = p.id
-              )::int AS doc_count
+              COALESCE(dc.doc_count, 0) AS doc_count
          FROM plots p
+         LEFT JOIN doc_counts dc ON dc.plot_id = p.id
         WHERE p.site_id = $1
         ORDER BY p.site_id, p.plot_no, p.block, p.created_at DESC NULLS LAST, p.id DESC
      ) latest
@@ -158,8 +167,9 @@ export const deletePlotDocument = asyncHandler(async (req, res) => {
   const doc = rows[0];
   if (!doc) return res.status(404).json({ message: 'Document not found' });
 
-  try { await deleteKycDocument(doc.file_path); } catch { /* best-effort file cleanup */ }
+  // Row first: deleteKycDocument keeps an object other documents rows still reference.
   await pool.query('DELETE FROM documents WHERE id = $1', [docId]);
+  try { await deleteKycDocument(doc.file_path); } catch { /* best-effort file cleanup */ }
 
   res.json({ message: 'Document deleted', documentId: Number(docId) });
 });

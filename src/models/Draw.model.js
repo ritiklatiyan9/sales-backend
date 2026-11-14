@@ -1,6 +1,10 @@
 import { WORKFLOW_STAGE_SQL } from '../services/drawWorkflow.js';
 import MasterModel from './MasterModel.js';
 
+// Key by the query function so isolated databases do not inherit schema state (as drawApplicationSignatures.js).
+// ponytail: only a positive to_regclass answer is kept; the table is never dropped, so no invalidation.
+const websiteRequestsReady = new WeakMap();
+
 class DrawModel extends MasterModel {
   constructor() {
     super('draw_registrations');
@@ -95,8 +99,11 @@ class DrawModel extends MasterModel {
    * 5000 rows (statements).
    */
   async workflow({ siteId, q = '', stage, page = 1, pageSize = 25, filters = {}, visibleUserIds }, db) {
-    const { rows: websiteTables } = await db.query("SELECT to_regclass('public.website_booking_requests') IS NOT NULL AS has_website_requests");
-    const bookingMethod = websiteTables[0]?.has_website_requests
+    if (!websiteRequestsReady.get(db.query)) {
+      const { rows: websiteTables } = await db.query("SELECT to_regclass('public.website_booking_requests') IS NOT NULL AS has_website_requests");
+      if (websiteTables[0]?.has_website_requests) websiteRequestsReady.set(db.query, true);
+    }
+    const bookingMethod = websiteRequestsReady.get(db.query)
       ? `CASE WHEN EXISTS (SELECT 1 FROM website_booking_requests w
           WHERE w.booking_id = r.booking_id AND w.site_id = r.site_id AND w.status = 'APPROVED')
           THEN 'WEBSITE' ELSE 'DIRECT' END`
@@ -159,7 +166,7 @@ class DrawModel extends MasterModel {
       ) items) AS items,
       (SELECT count(*)::int FROM filtered) AS total,
       (SELECT json_build_object('total_paid', COALESCE(SUM(total_paid), 0),
-        'required_amount', COALESCE(SUM(required_amount), 0)) FROM filtered) AS totals,
+        'required_amount', COALESCE(SUM(required_amount), 0)) FROM filtered WHERE stage <> 'CANCELLED') AS totals,
       (SELECT COALESCE(json_object_agg(stage, count), '{}'::json) FROM (SELECT stage, count(*)::int FROM scoped GROUP BY stage) counts) AS counts,
       (SELECT json_build_object(
         'brokers', COALESCE((SELECT json_agg(b ORDER BY b->>'name') FROM (SELECT DISTINCT jsonb_build_object('value', COALESCE(broker_code, broker_name), 'name', broker_name, 'code', broker_code) AS b FROM queue WHERE broker_name IS NOT NULL) x), '[]'::json),
@@ -174,7 +181,7 @@ class DrawModel extends MasterModel {
    */
   async paymentStatement({ siteId, q = '', filters = {}, visibleUserIds }, db) {
     const params = [siteId];
-    const where = ['r.site_id = $1'];
+    const where = ['r.site_id = $1', "r.status <> 'CANCELLED'"]; // cancelled entries' money is not counted
     const add = (value, sql) => { params.push(value); where.push(sql.replaceAll('$?', `$${params.length}`)); };
     if (Array.isArray(visibleUserIds)) add(visibleUserIds, '(r.agent_user_id = ANY($?) OR r.created_by = ANY($?))');
     if (q) add(`%${q.slice(0, 100)}%`, '(m.full_name ILIKE $? OR m.phone ILIKE $? OR r.registration_no ILIKE $? OR r.slip_no ILIKE $? OR dp.receipt_no ILIKE $?)');
@@ -202,12 +209,14 @@ class DrawModel extends MasterModel {
   async getDetail(id, pool) {
     const { rows } = await pool.query(`
       SELECT r.*,
-             m.full_name AS client_name, m.phone AS client_phone, m.email AS client_email,
+             m.full_name AS client_name, to_jsonb(m)->>'booking_name' AS client_booking_name,
+             m.phone AS client_phone, m.email AS client_email,
              m.photo AS client_photo, m.address AS client_address, m.city AS client_city,
              m.state AS client_state, m.pincode AS client_pincode,
              m.father_name AS client_father, m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
              s.name AS site_name, s.address AS site_address, s.city AS site_city, s.state AS site_state,
-             au.name AS agent_name, au.referral_code AS agent_referral_code, bm.full_name AS broker_name,
+             au.name AS agent_name, au.phone AS agent_phone, au.referral_code AS agent_referral_code,
+             consultant.name AS broker_name, consultant.phone AS broker_phone,
              p.plot_no AS allotted_plot_no, p.block AS allotted_plot_block, p.plot_size AS allotted_plot_size,
              b.booking_no, b.status AS booking_status, b.kyc_status AS booking_kyc_status,
              wu.name AS winner_marked_by_name,
@@ -218,9 +227,20 @@ class DrawModel extends MasterModel {
       LEFT JOIN members m ON m.id = r.client_member_id
       LEFT JOIN sites   s ON s.id = r.site_id
       LEFT JOIN users  au ON au.id = r.agent_user_id
-      LEFT JOIN members bm ON bm.id = r.broker_member_id
       LEFT JOIN plots   p ON p.id = r.allotted_plot_id
-      LEFT JOIN bookings b ON b.id = r.booking_id
+      LEFT JOIN bookings b ON b.id = r.booking_id AND b.site_id = r.site_id
+      LEFT JOIN members bm ON bm.id = r.broker_member_id AND bm.site_id = r.site_id
+      LEFT JOIN members booking_broker ON booking_broker.id = b.booking_agent_id AND booking_broker.site_id = r.site_id
+      LEFT JOIN users booking_agent ON booking_agent.id = b.agent_user_id
+      LEFT JOIN LATERAL (
+        SELECT NULLIF(BTRIM(candidate.name), '') AS name, NULLIF(BTRIM(candidate.phone), '') AS phone
+          FROM (VALUES (1, bm.id, bm.full_name, bm.phone),
+                       (2, booking_broker.id, booking_broker.full_name, booking_broker.phone),
+                       (3, au.id, au.name, au.phone),
+                       (4, booking_agent.id, booking_agent.name, booking_agent.phone)) candidate(priority, id, name, phone)
+         WHERE candidate.id IS NOT NULL
+         ORDER BY candidate.priority LIMIT 1
+      ) consultant ON true
       LEFT JOIN users  wu ON wu.id = r.winner_marked_by
       LEFT JOIN users  lu ON lu.id = r.allotted_by
       LEFT JOIN users  cu ON cu.id = r.created_by

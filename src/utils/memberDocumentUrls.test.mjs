@@ -19,7 +19,7 @@ test('resolves member documents from the current and earlier configured buckets'
   assert.equal(memberDocumentStorage('https://mountreality.s3.us-east-1.amazonaws.com.evil.test/x.pdf', env), null);
 });
 
-test('returns a temporary signed link only for configured S3 document URLs', async () => {
+test('returns a temporary signed link only for configured S3 document URLs', async (t) => {
   const previous = {
     AWS_S3_BUCKET_NAME: process.env.AWS_S3_BUCKET_NAME,
     AWS_REGION: process.env.AWS_REGION,
@@ -31,9 +31,14 @@ test('returns a temporary signed link only for configured S3 document URLs', asy
     AWS_ACCESS_KEY_ID: 'test-key', AWS_SECRET_ACCESS_KEY: 'test-secret',
   });
   try {
+    // 10:07:30 UTC lies in the 10:00-10:15 signing window.
+    t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 10, 14, 10, 7, 30) });
     const url = await signMemberDocumentUrl('https://mountreality.s3.us-east-1.amazonaws.com/kyc_documents/card.pdf');
     assert.match(url, /X-Amz-Signature=/);
-    assert.match(url, /X-Amz-Expires=3600/);
+    assert.match(url, /X-Amz-Expires=4500/);
+    assert.match(url, /X-Amz-Date=20261114T100000Z/);
+    t.mock.timers.tick(7 * 60 * 1000); // 10:14:30, same window: byte-identical URL, so browsers keep the cached file
+    assert.equal(await signMemberDocumentUrl('https://mountreality.s3.us-east-1.amazonaws.com/kyc_documents/card.pdf'), url);
     assert.equal(await signMemberDocumentUrl('https://cloudinary.example/image.jpg'), 'https://cloudinary.example/image.jpg');
   } finally {
     for (const [key, value] of Object.entries(previous)) {

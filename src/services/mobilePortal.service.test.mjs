@@ -321,8 +321,9 @@ test('configured overdue interest matches Accounts and remains separate from pri
   assert.equal(projectMobilePlot({ ...plot, interest_type: 'per_year' }, schedule, [], '2026-10-27').interestAmount, 0.25);
 });
 
-test('apartment area uses the Accounts square-foot unit while plots use square yards', () => {
+test('apartment and shop areas use Accounts square-foot units while plots use square yards', () => {
   assert.equal(projectMobilePlot({ unit_type: 'flat', plot_size: 1200 }, [], []).areaUnit, 'sq ft');
+  assert.equal(projectMobilePlot({ unit_type: 'shop', plot_size: 400 }, [], []).areaUnit, 'sq ft');
   assert.equal(projectMobilePlot({ unit_type: 'plot', plot_size: 120 }, [], []).areaUnit, 'sq yd');
 });
 

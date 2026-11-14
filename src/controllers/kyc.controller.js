@@ -123,8 +123,8 @@ const canAccessCase = async (user, kycCase) => {
 };
 
 /** Document-level access = access to its parent case. Returns the doc or null (denied). */
-const findAccessibleDocument = async (user, documentId) => {
-  const doc = await documentModel.findById(documentId, pool);
+const findAccessibleDocument = async (user, documentId, load = (id) => documentModel.findById(id, pool)) => {
+  const doc = await load(documentId);
   if (!doc) return { doc: null, denied: false };
   const { rows } = await pool.query('SELECT * FROM kyc_cases WHERE id = $1', [doc.kyc_case_id]);
   const kycCase = rows[0];
@@ -653,10 +653,10 @@ export const uploadDocument = asyncHandler(async (req, res) => {
 
 /** GET /kyc/document/:id — current OCR status + latest extracted fields. */
 export const getDocument = asyncHandler(async (req, res) => {
-  const { doc: allowed, denied } = await findAccessibleDocument(req.user, req.params.id);
+  // The access check loads the document with its latest result: one documents read per OCR poll.
+  const { doc, denied } = await findAccessibleDocument(req.user, req.params.id, (id) => documentModel.getWithLatestResult(id, pool));
   if (denied) return res.status(403).json({ message: 'You are not authorised to view this document' });
-  if (!allowed) return res.status(404).json({ message: 'Document not found' });
-  const doc = await documentModel.getWithLatestResult(req.params.id, pool);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
   doc.file_url = await getKycDocumentUrl(doc.file_path);
   res.json(doc);
 });
@@ -666,13 +666,6 @@ export const deleteDocument = asyncHandler(async (req, res) => {
   const { doc, denied } = await findAccessibleDocument(req.user, req.params.id);
   if (denied) return res.status(403).json({ message: 'You are not authorised to modify this document' });
   if (!doc) return res.status(404).json({ message: 'Document not found' });
-
-  // Delete the file from S3 or disk.
-  try {
-    await deleteKycDocument(doc.file_path);
-  } catch {
-    // Best-effort file cleanup; don't fail the delete if the file is already gone.
-  }
 
   // Clear the linked member column if this document was linked.
   const linkedColumns = TYPE_TO_MEMBER_COLS[doc.type] || [];
@@ -690,6 +683,13 @@ export const deleteDocument = asyncHandler(async (req, res) => {
 
   // Delete the document record and its OCR results (cascade).
   await pool.query('DELETE FROM documents WHERE id = $1', [req.params.id]);
+
+  // Delete the file from S3 or disk after the row (kept while another row still uses it).
+  try {
+    await deleteKycDocument(doc.file_path);
+  } catch {
+    // Best-effort file cleanup; don't fail the delete if the file is already gone.
+  }
 
   emitOcrUpdate({ bookingId, caseId, documentId: doc.id, status: 'DELETED' });
 
@@ -780,13 +780,16 @@ const ensureQrToken = async (kycCase) => {
 
 /** GET /kyc/case/:id — case + member/booking labels + documents (with latest OCR result). */
 export const getCase = asyncHandler(async (req, res) => {
-  const kycCase = await kycCaseModel.getDetail(req.params.id, pool);
+  // Documents are read alongside the case; nothing is used or returned before the 404/403 checks.
+  const [kycCase, documents] = await Promise.all([
+    kycCaseModel.getDetail(req.params.id, pool),
+    kycCaseModel.getDocumentsWithResults(req.params.id, pool),
+  ]);
   if (!kycCase) return res.status(404).json({ message: 'KYC case not found' });
   if (!(await canAccessCase(req.user, kycCase))) {
     return res.status(403).json({ message: 'You are not authorised to view this KYC case' });
   }
   const qrToken = await ensureQrToken(kycCase);
-  const documents = await kycCaseModel.getDocumentsWithResults(kycCase.id, pool);
   for (const d of documents) d.file_url = await getKycDocumentUrl(d.file_path);
   res.json({ ...kycCase, qr_token: qrToken, documents, verifyUrl: qrToken ? kycVerifyUrl(qrToken) : null });
 });
@@ -888,7 +891,7 @@ export const updateCaseCustomer = asyncHandler(async (req, res) => {
 /**
  * DELETE /kyc/case/:id — remove a KYC case that isn't tied to a booking (booking-tied
  * KYC belongs to the booking's lifecycle — delete/cancel the booking instead). Cleans
- * up each document's stored file before the row (and its documents/ocr_results, via
+ * up each document's stored file after the row (and its documents/ocr_results, via
  * cascade) is deleted. Gated by case access AND the "All KYCs" Delete permission.
  */
 export const deleteCase = asyncHandler(async (req, res) => {
@@ -905,11 +908,10 @@ export const deleteCase = asyncHandler(async (req, res) => {
   }
 
   const { rows: docs } = await pool.query('SELECT file_path FROM documents WHERE kyc_case_id = $1', [kycCase.id]);
+  await pool.query('DELETE FROM kyc_cases WHERE id = $1', [kycCase.id]);
   for (const d of docs) {
     try { await deleteKycDocument(d.file_path); } catch { /* best-effort file cleanup */ }
   }
-
-  await pool.query('DELETE FROM kyc_cases WHERE id = $1', [kycCase.id]);
   res.json({ message: 'KYC case deleted', id: kycCase.id, removedDocuments: docs.length });
 });
 

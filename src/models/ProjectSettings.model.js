@@ -1,4 +1,4 @@
-import pool from '../config/db.js';
+import pool, { schemaHas } from '../config/db.js';
 
 /**
  * Per-site Company + Payment details shown on the printable booking form
@@ -46,8 +46,10 @@ let ensuring;
 async function ensure() {
   if (ensured) return;
   if (!ensuring) ensuring = (async () => {
-    await pool.query(ENSURE_SQL);
-    await pool.query("ALTER TABLE project_settings ADD COLUMN IF NOT EXISTS document_config JSONB NOT NULL DEFAULT '{}'::jsonb");
+    if (!(await schemaHas({ columns: [['project_settings', 'document_config']] }))) {
+      await pool.query(ENSURE_SQL);
+      await pool.query("ALTER TABLE project_settings ADD COLUMN IF NOT EXISTS document_config JSONB NOT NULL DEFAULT '{}'::jsonb");
+    }
     ensured = true;
   })().finally(() => { ensuring = null; });
   await ensuring;
@@ -70,8 +72,21 @@ export async function getBySite(siteId) {
  * Lazy ALTER keeps the same works-before-migration behaviour as the table itself.
  */
 let drawEnsured = false;
+let drawEnsuring;
+// Every column ensure() and ensureDraw() add; once present, one catalog read replaces all five DDL statements.
+const DRAW_COLUMNS = [
+  ...['document_config', 'draw_required_amount', 'draw_scheme_name', 'draw_wait_days', 'draw_opening_date',
+    'draw_terms', 'draw_enabled', 'draw_allow_partial_receipts'].map(col => ['project_settings', col]),
+  ...['workflow_version', 'draw_opening_date', 'terms_snapshot', 'request_key'].map(col => ['draw_registrations', col]),
+  ['draw_payments', 'request_key'],
+];
 async function ensureDraw() {
   if (drawEnsured) return;
+  if (!drawEnsuring) drawEnsuring = ensureDrawColumns().finally(() => { drawEnsuring = null; });
+  await drawEnsuring;
+}
+async function ensureDrawColumns() {
+  if (await schemaHas({ columns: DRAW_COLUMNS })) { ensured = true; drawEnsured = true; return; }
   await ensure();
   await pool.query(`
     ALTER TABLE project_settings

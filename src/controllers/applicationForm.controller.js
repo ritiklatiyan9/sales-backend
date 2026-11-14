@@ -1,15 +1,20 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import sharp from 'sharp';
-import { requireSiteAccess, requireWorkspaceAccess } from '../services/bookingWorkspaceAccess.js';
+import { requireSiteAccess, requireSiteId, requireWorkspaceAccess } from '../services/bookingWorkspaceAccess.js';
+import { allInOrder } from '../services/clientRegistry.service.js';
 import { validateApplicationTemplate, requirePublishableTemplate } from '../services/applicationFormTemplate.js';
 import { workflowError } from '../services/drawWorkflow.js';
 import { uploadKycDocument, getPublicKycUrl } from '../utils/s3.js';
 
 const MODULE = 'booking_form_studio';
 export const getPublishedForm = asyncHandler(async (req, res) => {
-  await requireSiteAccess(req.user, req.params.siteId);
-  const { rows } = await pool.query('SELECT published AS template, published_revision AS revision, published_at FROM application_form_templates WHERE site_id = $1', [req.params.siteId]);
+  requireSiteId(req.params.siteId); // an invalid id sends no query
+  // Guard and read in one wave; the guard's error wins and the template is sent only after it passes.
+  const [, { rows }] = await allInOrder([
+    requireSiteAccess(req.user, req.params.siteId),
+    pool.query('SELECT published AS template, published_revision AS revision, published_at FROM application_form_templates WHERE site_id = $1', [req.params.siteId]),
+  ]);
   res.json(rows[0] || { template:null, revision:0, published_at:null });
 });
 export const getFormStudio = asyncHandler(async (req, res) => {

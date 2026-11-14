@@ -26,6 +26,7 @@ import pool from '../config/db.js';
 // Statuses we will NOT overwrite when the plot is already committed to a DIFFERENT
 // buyer — protects against clobbering a real sale/registry on a plot the booker
 // picked by mistake. Fresh/holding statuses are always bookable.
+const HISTORICAL_STATUSES = new Set(['CANCEL','CANCELLATION','CANCELLED','RESALE','TRANSFERRED','UNDER CANCELLATION']);
 const PROTECTED_STATUSES = new Set(['BOOKED', 'SOLD', 'REGISTRY', 'UNDER CANCELLATION', 'CANCELLED', 'TRANSFERRED']);
 
 /**
@@ -116,6 +117,20 @@ const matchMemberByName = async (name, siteId, db) => {
   return rows[0] || null;
 };
 
+// Explicit Accounts allocations are authoritative. A later single-agent KYC
+// resync must not replace their display attribution or create a full-pool row.
+// JSON projection keeps this compatible with an older nullable-column schema.
+const hasManagedAllocations = async (plotId, db) => {
+  try {
+    const { rows } = await db.query(`SELECT pc.id FROM plot_commissions_v2 pc
+      WHERE pc.plot_id=$1 AND to_jsonb(pc)->>'allocation_type' IS NOT NULL LIMIT 1`, [parseInt(plotId)]);
+    return rows.length > 0;
+  } catch (error) {
+    if (error.code === '42P01') return false;
+    throw error;
+  }
+};
+
 /**
  * Replicates accounting's maybeAutoCreatePlotCommission essential path:
  * commission = plots.plot_commission (decided at plot creation) — falling back to
@@ -135,7 +150,8 @@ const autoCreateCommission = async ({ plot, agentId, createdBy }, db) => {
   try {
     // Idempotency guard — never duplicate a (plot, agent) commission.
     const existing = await db.query(
-      `SELECT id FROM plot_commissions_v2 WHERE plot_id = $1 AND agent_id = $2 LIMIT 1`,
+      `SELECT pc.id FROM plot_commissions_v2 pc WHERE pc.plot_id = $1
+        AND (pc.agent_id = $2 OR to_jsonb(pc)->>'allocation_type' IS NOT NULL) LIMIT 1`,
       [parseInt(plot.id), parseInt(agentId)]
     );
     if (existing.rows[0]) return { created: false, reason: 'already_exists', commissionId: existing.rows[0].id };
@@ -175,6 +191,7 @@ const retirePreviousAutoCommission = async ({ plotId, siteId, prevName }, db) =>
           AND pc.agent_id = m.id
           AND UPPER(m.full_name) = UPPER($3)
           AND pc.remarks LIKE 'Auto-created from%'
+          AND to_jsonb(pc)->>'allocation_type' IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM plot_commission_payments p WHERE p.plot_commission_id = pc.id
           )`,
@@ -197,8 +214,8 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
     // Load the accounting plot.
     const plotRes = await db.query(
       `SELECT id, site_id, plot_no, status, buyer_member_id, buyer_name, booking_by, plot_size, plot_rate,
-              commission_rate, plot_commission
-         FROM plots WHERE id = $1`,
+              commission_rate, plot_commission, to_jsonb(p)->>'booking_cancelled_at' AS booking_cancelled_at
+         FROM plots p WHERE id = $1`,
       [parseInt(booking.plot_id)]
     );
     const plot = plotRes.rows[0];
@@ -222,45 +239,64 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
       return { ok: false, reason: 'plot_committed_to_other_buyer', plot_no: plot.plot_no, current_buyer: existingBuyer, current_status: plot.status };
     }
 
+    // A cancelled/previous booking is an immutable accounting identity. Even
+    // the same client rebooking must use a new plot row so old dealers and
+    // recovery transactions cannot become authority over the new customer.
+    if (HISTORICAL_STATUSES.has(String(plot.status || '').trim().toUpperCase()) || plot.booking_cancelled_at) {
+      return { ok: false, reason: 'historical_booking_requires_new_plot', plot_id: plot.id };
+    }
+
     // Resolve "Booking By" + commission agent.
-    const { bookingByName, agentId, autoCreatedMember } = await resolveBookingBy({ booking, plotSiteId: plot.site_id }, db);
+    const managedAllocations = await hasManagedAllocations(plot.id, db);
+    const { bookingByName, agentId, autoCreatedMember } = managedAllocations
+      ? { bookingByName: plot.booking_by, agentId: null, autoCreatedMember: false }
+      : await resolveBookingBy({ booking, plotSiteId: plot.site_id }, db);
 
     // Flip the accounting plot to BOOKED. Names upper-cased to match accounting convention.
-    await db.query(
+    const updatedPlot = await db.query(
       `UPDATE plots
           SET status       = 'BOOKED',
               buyer_name   = $1,
               buyer_member_id = $5,
-              booking_by   = COALESCE($2, booking_by),
+              booking_by   = CASE WHEN booking_by IS DISTINCT FROM $6 THEN booking_by
+                                  ELSE COALESCE($2, booking_by) END,
               booking_date = COALESCE(booking_date, $3),
               updated_at   = NOW()
-        WHERE id = $4`,
+        WHERE id = $4
+          AND upper(trim(COALESCE(status,''))) NOT IN ('CANCEL','CANCELLATION','CANCELLED','RESALE','TRANSFERRED','UNDER CANCELLATION')
+          AND NULLIF(to_jsonb(plots)->>'booking_cancelled_at','') IS NULL
+        RETURNING booking_by`,
       [
         buyerName.trim().toUpperCase(),
-        bookingByName ? bookingByName.trim().toUpperCase() : null,
+        !managedAllocations && bookingByName ? bookingByName.trim().toUpperCase() : null,
         booking.booking_date || null,
         parseInt(plot.id),
         parseInt(booking.client_member_id),
+        plot.booking_by ?? null,
       ]
     );
+
+    if (!updatedPlot.rows.length) return { ok: false, reason: 'historical_booking_requires_new_plot', plot_id: plot.id };
 
     // If the Booking By changed on a re-sync, retire the PREVIOUS agent's orphaned
     // auto-commission (mirrors accounting's updatePlot behaviour) — but only when it
     // carries NO payments, so money is never lost.
     const prevBookingBy = (plot.booking_by || '').trim();
-    if (prevBookingBy && bookingByName && prevBookingBy.toUpperCase() !== bookingByName.trim().toUpperCase()) {
+    const managedNow = managedAllocations || await hasManagedAllocations(plot.id, db);
+    if (!managedNow && prevBookingBy && bookingByName && prevBookingBy.toUpperCase() !== bookingByName.trim().toUpperCase()) {
       await retirePreviousAutoCommission({ plotId: plot.id, siteId: plot.site_id, prevName: prevBookingBy }, db);
     }
 
     // Auto-create the agent commission (the "account software flow", unchanged).
-    const commission = await autoCreateCommission({ plot, agentId, createdBy: booking.created_by }, db);
+    const commission = managedNow ? { created: false, reason: 'managed_allocations_preserved' }
+      : await autoCreateCommission({ plot, agentId, createdBy: booking.created_by }, db);
 
     return {
       ok: true,
       plot_id: plot.id,
       plot_no: plot.plot_no,
       buyer_name: buyerName,
-      booking_by: bookingByName,
+      booking_by: updatedPlot.rows[0] ? updatedPlot.rows[0].booking_by : bookingByName,
       agent_id: agentId,
       auto_created_member: !!autoCreatedMember,
       commission,

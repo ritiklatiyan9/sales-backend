@@ -4,7 +4,7 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import {
   listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
   issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
-  getDrawSettingsHandler, setDrawSettings,
+  getDrawSettingsHandler, setDrawSettings, saveApplicationSignatures, getApplicationSigningContext,
 } from '../controllers/draw.controller.js';
 
 const router = express.Router();
@@ -20,6 +20,8 @@ router.post('/:id/start-kyc', subAdminPermission("booking_draws", 'can_update'),
 router.get('/settings', subAdminPermission("booking_draws", 'can_read'), getDrawSettingsHandler);
 router.put('/settings', subAdminPermission("booking_draws", 'can_update'), setDrawSettings);
 router.get('/:id', subAdminPermission("booking_draws", 'can_read'), getDraw);
+router.get('/:id/signing-context', subAdminPermission("booking_draws", 'can_read'), getApplicationSigningContext);
+router.put('/:id/signatures', subAdminPermission("booking_draws", 'can_update'), saveApplicationSignatures);
 router.patch('/:id', subAdminPermission("booking_draws", 'can_update'), updateDraw);
 router.delete('/:id', subAdminPermission("booking_draws", 'can_delete'), deleteDraw);
 router.post('/:id/payments', subAdminPermission("booking_draws", 'can_write'), addDrawPayment);

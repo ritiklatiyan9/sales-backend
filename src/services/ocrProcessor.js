@@ -118,7 +118,8 @@ const findCachedResult = async (doc) => {
     fields: hit.extracted_fields || {},
     confidence: Number(hit.confidence_overall) || 0,
     confidenceMap: hit.confidence_map || {},
-    engine: `cache:${hit.engine || 'unknown'}`,
+    // The hit may itself be a cache copy: keep one prefix and fit varchar(40).
+    engine: `cache:${String(hit.engine || 'unknown').replace(/^(cache:)+/, '')}`.slice(0, 40),
   };
 };
 

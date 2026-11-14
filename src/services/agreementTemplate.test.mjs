@@ -68,3 +68,17 @@ test('agreement formats: first is default, one default per site, revision confli
     assert.equal((await call(c.deleteAgreementTemplate, { params: { id: a.data.id } })).status, 204);
   } finally { await f.close(); }
 });
+
+test('application project images and photo choices survive agreement saves without accepting unsafe metadata',async()=>{
+ const {NAYA_BAAZAR_AGREEMENT}=await import('../../../sales-dg-frontend/src/lib/nayaBaazarAgreement.js');
+ const source=NAYA_BAAZAR_AGREEMENT.design;
+ assert.deepEqual(validateAgreementDesign(source),source);
+ for(const commercial_images of [['javascript:alert(1)'],['//elsewhere.example/a.png'],['data:image/svg+xml,svg'],Array(4).fill('/image.png')]){
+  assert.throws(()=>validateAgreementDesign({...source,project_overview:{...source.project_overview,commercial_images}}));
+ }
+ assert.throws(()=>validateAgreementDesign({...source,show_applicant_photo:'yes'}));
+ assert.throws(()=>validateAgreementDesign({...source,project_overview:undefined}));
+ assert.throws(()=>validateAgreementDesign({...source,project_overview:{...source.project_overview,script:'unexpected'}}));
+ assert.equal(validateAgreementDesign({...source,show_project_overview:false}).show_project_overview,false);
+ assert.equal(validateAgreementDesign(design).project_overview,undefined);
+});

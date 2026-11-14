@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { drawFixture, TEST_BROKER_CODE } from '../test/drawFixture.mjs';
 import * as teams from './team.controller.js';
 import * as draws from './draw.controller.js';
+import { migrateFormStudioAttendance } from '../migrations/025_form_studio_attendance.js';
 
 const admin = { id: 1, role: 'admin', email: 'admin@example.test' };
 const call = (handler, { body = {}, params = {}, query = {}, user = admin } = {}) => new Promise((resolve) => {
@@ -13,6 +14,7 @@ const call = (handler, { body = {}, params = {}, query = {}, user = admin } = {}
 test('dealer teams: one head, any-depth sub-dealers, safe moves, per-site counts and broker-traced draws', async () => {
   const f = await drawFixture({ broker: true });
   try {
+    await migrateFormStudioAttendance(f.pool); // deleteDraw clears attendance rows, as in production
     const { rows: brokers } = await f.query(`INSERT INTO members (site_id, member_type, status, full_name, phone) VALUES
       (1, 'BROKER', 'ACTIVE', 'Head Dealer', '9100000001'), (1, 'BROKER', 'ACTIVE', 'Sub One', '9100000002'),
       (1, 'BROKER', 'ACTIVE', 'Sub Two', '9100000003'), (1, 'CLIENT', 'ACTIVE', 'Not A Broker', '9100000004') RETURNING id`);

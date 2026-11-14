@@ -61,11 +61,13 @@ export async function openRouterChat(content, { system, maxTokens = 1600, pdf = 
       body: JSON.stringify(body),
     });
   } catch (error) {
+    clearTimeout(timer);
     throw providerError(`OpenRouter request failed: ${error.message}`, { cause: error, code: 'OCR_PROVIDER_UNAVAILABLE', publicMessage: 'Document reading is temporarily unavailable. Please retry shortly.' });
-  } finally { clearTimeout(timer); }
+  }
 
+  // The timer stays live through the body read: a stalled body aborts at timeoutMs too.
   if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
+    const detail = (await response.text().finally(() => clearTimeout(timer))).slice(0, 300);
     if ([401, 403].includes(response.status)) throw providerError('OpenRouter authentication was rejected', { status: 503, code: 'OCR_PROVIDER_AUTH', publicMessage: 'Document reading is not available because its server credentials were rejected. Ask an administrator to check the OCR configuration.' });
     if (response.status === 402) throw providerError('OpenRouter credit balance is unavailable', { status: 503, code: 'OCR_PROVIDER_BILLING', publicMessage: 'Document reading is unavailable because the OCR service needs credits. Ask an administrator to check its billing.' });
     if (response.status === 404) throw providerError('OpenRouter OCR model is unavailable', { status: 503, code: 'OCR_MODEL_UNAVAILABLE', publicMessage: 'The configured document reader is unavailable. Ask an administrator to check the OCR model setting.' });
@@ -76,7 +78,7 @@ export async function openRouterChat(content, { system, maxTokens = 1600, pdf = 
     }
     throw providerError(`OpenRouter HTTP ${response.status}: ${detail}`, { publicMessage: 'Could not read this document. Try a clearer photo or scan, or type the details.' });
   }
-  const data = await response.json();
+  const data = await response.json().finally(() => clearTimeout(timer));
   if (data.error) throw providerError(`OpenRouter: ${JSON.stringify(data.error).slice(0, 300)}`, { publicMessage: 'Could not read this document. Try a clearer photo or scan, or type the details.' });
   return { content: data.choices?.[0]?.message?.content || '', model: data.model || model };
 }

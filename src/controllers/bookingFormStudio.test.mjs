@@ -13,6 +13,44 @@ const template = {
   declarations_title:'Declarations', declarations:'1. Details. Please check all entries.', terms_title:'Terms', terms:'1. Payments. Keep the receipt.',
   office_title:'Office acceptance', acceptance_note:'I acknowledge the completed form.',
 };
+const installmentDates = ['2026-12-07','2027-04-07','2027-08-07','2027-12-07'];
+
+test('booking form type is optional for legacy templates and accepts only supported explicit values', () => {
+  const legacy = validateBookingTemplate(template);
+  assert.equal(Object.hasOwn(legacy, 'form_type'), false);
+  for (const form_type of ['booking', 'booking_allotment']) {
+    assert.deepEqual(validateBookingTemplate({...template,form_type}), {...legacy,form_type});
+  }
+  for (const form_type of [undefined,null,'','allotment','BOOKING','booking_allotment ',false,0,{},[]]) {
+    assert.throws(() => validateBookingTemplate({...template,form_type}), error => {
+      assert.equal(error.status,400);
+      assert.match(error.message,/supported booking form type/);
+      return true;
+    });
+  }
+});
+
+test('installment dates are optional and require exactly four real ISO dates in ascending order', () => {
+  const legacy = validateBookingTemplate(template);
+  assert.equal(Object.hasOwn(legacy, 'installment_dates'),false);
+  const validated = validateBookingTemplate({...template,installment_dates:installmentDates});
+  assert.deepEqual(validated,{...legacy,installment_dates:installmentDates});
+  assert.notEqual(validated.installment_dates,installmentDates);
+  assert.deepEqual(validateBookingTemplate({...template,installment_dates:['2024-02-29','2024-03-01','2024-04-01','2024-05-01']}).installment_dates,['2024-02-29','2024-03-01','2024-04-01','2024-05-01']);
+  for (const installment_dates of [
+    undefined,null,installmentDates.join(','),[],Array(4),installmentDates.slice(1),[...installmentDates,'2028-04-07'],
+    ['2027-02-29',...installmentDates.slice(1)],['2026-12-32',...installmentDates.slice(1)],
+    ['2026-12-7',...installmentDates.slice(1)],['2026-12-07T00:00:00Z',...installmentDates.slice(1)],
+    [null,...installmentDates.slice(1)],[installmentDates[0],installmentDates[0],...installmentDates.slice(2)],
+    [...installmentDates].reverse(),
+  ]) {
+    assert.throws(() => validateBookingTemplate({...template,installment_dates}), error => {
+      assert.equal(error.status,400);
+      assert.match(error.message,/four valid installment dates/);
+      return true;
+    });
+  }
+});
 
 test('Booking Form Studio publication, isolation and permission boundaries', async t => {
   const f = await drawFixture();
@@ -32,16 +70,24 @@ test('Booking Form Studio publication, isolation and permission boundaries', asy
     });
     await t.test('drafts stay private until publication; stale writes cannot replace a design', async () => {
       assert.equal((await call(studio.getPublishedForm)).data.template, null);
-      const saved = await call(studio.saveFormDraft,{body:{template,revision:0}});
+      const allotmentTemplate = {...template,form_type:'booking_allotment',installment_dates:installmentDates};
+      const saved = await call(studio.saveFormDraft,{body:{template:allotmentTemplate,revision:0}});
       assert.equal(saved.status,200,JSON.stringify(saved.data)); assert.equal(saved.data.revision,1);
+      const storedDraft = (await call(studio.getFormStudio)).data.template.draft;
+      assert.equal(storedDraft.form_type,'booking_allotment');
+      assert.deepEqual(storedDraft.installment_dates,installmentDates);
       assert.equal((await call(studio.getPublishedForm)).data.template,null);
       assert.equal((await call(studio.saveFormDraft,{body:{template,revision:0}})).status,409);
       assert.equal((await call(studio.publishForm,{body:{revision:2}})).status,409);
       assert.equal((await call(studio.publishForm,{body:{revision:1}})).status,200);
       assert.equal((await call(studio.getPublishedForm)).data.template.brand_name,'Site A');
+      assert.equal((await call(studio.getPublishedForm)).data.template.form_type,'booking_allotment');
+      assert.deepEqual((await call(studio.getPublishedForm)).data.template.installment_dates,installmentDates);
       assert.equal((await call(studio.getPublishedForm,{params:{siteId:2}})).data.template,null);
       const draft = await call(studio.saveFormDraft,{body:{template:{...template,brand_name:'Unpublished'},revision:1}});
       assert.equal(draft.data.revision,2);
+      assert.equal(Object.hasOwn(draft.data.draft,'form_type'),false);
+      assert.equal(Object.hasOwn(draft.data.draft,'installment_dates'),false);
       assert.equal((await call(studio.getPublishedForm)).data.template.brand_name,'Site A');
       await call(studio.saveFormDraft,{body:{template:{...template,terms:''},revision:2}});
       assert.equal((await call(studio.publishForm,{body:{revision:3}})).status,400);
@@ -60,6 +106,19 @@ test('Booking Form Studio publication, isolation and permission boundaries', asy
       await f.query(`UPDATE user_permissions SET can_write=true WHERE module='booking_document_studio'`);
       assert.equal((await call(studio.saveFormDraft,{user:agent,body:{template,revision:0}})).status,409);
       assert.equal((await call(studio.saveFormDraft,{user:agent,body:{template,revision:3}})).status,403);
+    });
+    await t.test('allotment drafts may omit dates but publishing requires the complete schedule; legacy forms still publish', async () => {
+      assert.equal((await call(studio.saveFormDraft,{body:{template,revision:3}})).status,200);
+      assert.equal((await call(studio.publishForm,{body:{revision:4}})).status,200);
+      const draft = await call(studio.saveFormDraft,{body:{template:{...template,form_type:'booking_allotment'},revision:4}});
+      assert.equal(draft.status,200);
+      assert.equal(Object.hasOwn(draft.data.draft,'installment_dates'),false);
+      const result = await call(studio.publishForm,{body:{revision:5}});
+      assert.equal(result.status,400);
+      assert.match(result.data.message,/Complete all four installment dates/);
+      const published = (await call(studio.getPublishedForm)).data;
+      assert.equal(published.revision,4);
+      assert.equal(Object.hasOwn(published.template,'form_type'),false);
     });
   } finally { await f.close(); }
 });
