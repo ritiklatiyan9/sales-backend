@@ -1,7 +1,5 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { verifyCheckoutSignature } from './websiteRazorpay.js';
-import kycCaseModel from '../models/KycCase.model.js';
-import { addMemberType } from './memberRoles.service.js';
 
 export const WEBSITE_MODULE = 'booking_website_management';
 export const WEBSITE_PLOT_NUMBERS = Object.freeze([
@@ -107,10 +105,12 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
   async function plots() {
     const id = linkedSiteId();
     const [settings, { groups }, held] = await Promise.all([
-      settingsFor(id), inventory(id), db.query(`SELECT plot_id FROM website_booking_requests WHERE site_id=$1
-        AND (status='PAYMENT_REVIEW' OR (status IN ('ORDER_CREATING','AWAITING_PAYMENT') AND hold_expires_at>now()))`, [id]),
+      settingsFor(id), inventory(id), db.query(`SELECT plot_id,status FROM website_booking_requests WHERE site_id=$1
+        AND (status='PAYMENT_REVIEW' OR (status='APPROVED' AND booking_id IS NULL)
+          OR (status IN ('ORDER_CREATING','AWAITING_PAYMENT') AND hold_expires_at>now()))`, [id]),
     ]);
     const heldIds = new Set(held.rows.map((row) => String(row.plot_id)));
+    const approvedIds = new Set(held.rows.filter(row => row.status==='APPROVED').map(row => String(row.plot_id)));
     return { site_id: id, status_display_enabled: settings.status_display_enabled, updated_at: clock().toISOString(),
       plots: WEBSITE_PLOT_NUMBERS.map((number) => {
         const candidates = groups.get(number) || [];
@@ -119,7 +119,7 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
         const current = candidates.filter(plot => !['RESALE', 'CANCELLED', 'TRANSFERRED'].includes(String(plot.status || '').trim().toUpperCase()));
         const plot = current.length === 1 ? current[0] : null;
         const ledgerStatus = plot ? normalizeWebsiteStatus(plot.status) : 'UNKNOWN';
-        const status = plot?.has_active_booking && ledgerStatus === 'COMPANY' ? 'BOOKED' : ledgerStatus;
+        const status = (plot?.has_active_booking || approvedIds.has(String(plot?.id))) && ledgerStatus === 'COMPANY' ? 'BOOKED' : ledgerStatus;
         const isHeld = !!plot && heldIds.has(String(plot.id));
         return { number, status: settings.status_display_enabled ? status : 'UNKNOWN',
           bookable: candidates.length === 1 && !!plot && settings.booking_enabled && settings.status_display_enabled && gateway.ready && Number(settings.booking_amount)>0 && status==='COMPANY' && !isHeld,
@@ -222,7 +222,7 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
       const booked = await client.query("SELECT id FROM bookings WHERE plot_id=$1 AND status<>'CANCELLED' LIMIT 1",[plot.id]);
       if (booked.rows.length) throw websiteError('This plot already has a booking in progress. Contact the office.',409,'PLOT_UNAVAILABLE');
       await client.query("UPDATE website_booking_requests SET status='EXPIRED',updated_at=now() WHERE plot_id=$1 AND status IN ('ORDER_CREATING','AWAITING_PAYMENT') AND hold_expires_at<=now()",[plot.id]);
-      const active = await client.query('SELECT id FROM website_booking_requests WHERE plot_id=$1 AND status=ANY($2) LIMIT 1',[plot.id,ACTIVE]);
+      const active = await client.query("SELECT id FROM website_booking_requests WHERE plot_id=$1 AND (status=ANY($2) OR (status='APPROVED' AND booking_id IS NULL)) LIMIT 1",[plot.id,ACTIVE]);
       if (active.rows.length) throw websiteError('Another booking request is holding this plot. Please choose a different plot or try later.',409,'PLOT_HELD');
       const { rows } = await client.query(`INSERT INTO website_booking_requests(site_id,plot_id,plot_number,request_token_hash,idempotency_key_hash,payload_hash,buyer_name,buyer_phone,buyer_email,buyer_address,terms_snapshot,amount_paise,hold_expires_at,gateway_receipt)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now()+$13*interval '1 minute',$14) RETURNING *`,
@@ -272,7 +272,7 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
       if (current.razorpay_payment_id && current.razorpay_payment_id!==payment.id) throw websiteError('A different payment is already linked to this request',409,'PAYMENT_REPLAY');
       if (current.status==='APPROVED') return publicRequest({...current,booking_no:row.booking_no,booking_status:row.booking_status});
       await client.query("UPDATE website_booking_requests SET status='EXPIRED',updated_at=now() WHERE plot_id=$1 AND id<>$2 AND status IN ('ORDER_CREATING','AWAITING_PAYMENT') AND hold_expires_at<=now()",[row.plot_id,row.id]);
-      const other = await client.query('SELECT id FROM website_booking_requests WHERE plot_id=$1 AND id<>$2 AND status=ANY($3)',[row.plot_id,row.id,ACTIVE]);
+      const other = await client.query("SELECT id FROM website_booking_requests WHERE plot_id=$1 AND id<>$2 AND (status=ANY($3) OR (status='APPROVED' AND booking_id IS NULL))",[row.plot_id,row.id,ACTIVE]);
       const conflicting = other.rows.length>0 || normalizeWebsiteStatus(plots[0]?.status)!=='COMPANY';
       let status = current.status==='REJECTED' ? 'REJECTED' : conflicting ? 'PAYMENT_CONFLICT' : 'PAYMENT_REVIEW';
       const result = await client.query(`UPDATE website_booking_requests SET status=$2,razorpay_payment_id=$3,payment_verified_at=COALESCE(payment_verified_at,now()),payment_method=$4,refund_required=$5,updated_at=now() WHERE id=$1 RETURNING *`,
@@ -355,31 +355,12 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
       if(mapped.length!==1 || Number(mapped[0].id)!==Number(row.plot_id)) throw websiteError('Plot mapping changed. Resolve the duplicate plot records before approval.',409,'PLOT_MAPPING_CONFLICT');
       const existing = await client.query("SELECT id FROM bookings WHERE plot_id=$1 AND status<>'CANCELLED' LIMIT 1",[row.plot_id]);
       if (existing.rows.length) throw websiteError('This plot already has a booking. Review it before proceeding.',409,'PLOT_UNAVAILABLE');
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`member_quick_add:${row.site_id}:${row.buyer_phone}`]);
-      const { rows: members } = await client.query("SELECT * FROM members WHERE site_id=$1 AND RIGHT(regexp_replace(COALESCE(phone,''),'\\D','','g'),10)=$2 ORDER BY id LIMIT 1",[row.site_id,row.buyer_phone]);
-      let member = members[0];
-      if (member && String(member.full_name).trim().toLowerCase()!==row.buyer_name.trim().toLowerCase()) throw websiteError('This mobile number belongs to a different member. Confirm customer identity in Members before approval.',409,'MEMBER_IDENTITY_CONFLICT');
-      if (member) member = await addMemberType(member,'CLIENT',client);
-      if (!member) {
-        const result = await client.query(`INSERT INTO members(site_id,member_type,status,full_name,phone,email,address,notes,created_by) VALUES($1,'CLIENT','ACTIVE',$2,$3,$4,$5,$6,$7) RETURNING *`,[row.site_id,row.buyer_name,row.buyer_phone,row.buyer_email,row.buyer_address,`Website booking request ${row.id}`,user.id]);
-        member = result.rows[0];
-      }
-      const staff = await requireManager(user,row.site_id,client);
-      const { rows: bookings } = await client.query(`INSERT INTO bookings(site_id,plot_id,client_member_id,sale_price,token_amount,payment_plan,status,kyc_status,buyer_name,booked_by,notes,created_by,token_payment_from,token_payment_date,token_bank_details,token_narration,token_received_by)
-        VALUES($1,$2,$3,$4,$5,'FULL','KYC_PENDING','NOT_STARTED',$6,$7,$8,$9,'RAZORPAY',CURRENT_DATE,$10,$11,$7) RETURNING *`,[row.site_id,row.plot_id,member.id,Number(plot.sale_price)||0,Number(row.amount_paise)/100,row.buyer_name,staff.user.name,`Website request ${row.id}. ${reviewNotes}`,user.id,row.razorpay_payment_id,`Razorpay ${row.razorpay_payment_id}, order ${row.razorpay_order_id}`]);
-      const booking = bookings[0];
-      const bookingNo = `BK-${clock().getFullYear()}-${String(booking.id).padStart(6,'0')}`;
-      await client.query('UPDATE bookings SET booking_no=$2 WHERE id=$1',[booking.id,bookingNo]);
-      await kycCaseModel.adoptForBooking(booking,client);
-      // Shared accounting approval remains authoritative: received online funds
-      // are inserted once as a pending BANK instrument, never as an invented cash receipt.
-      const { rows: payments } = await client.query(`INSERT INTO plot_payments(plot_id,site_id,date,payment_from,payment_type,bank_details,narration,received_by,amount,created_by,status,buyer_name,booked_by)
-        VALUES($1,$2,CURRENT_DATE,'RAZORPAY','BANK',$3,$4,$5,$6,$7,'pending',$8,$5) RETURNING id`,[row.plot_id,row.site_id,row.razorpay_payment_id,`Website booking ${bookingNo}; Razorpay order ${row.razorpay_order_id}`,staff.user.name,Number(row.amount_paise)/100,user.id,row.buyer_name]);
-      await client.query('UPDATE bookings SET token_payment_id=$2 WHERE id=$1',[booking.id,payments[0].id]);
-      await client.query("UPDATE plots SET status='BOOKED',buyer_name=$2,booking_by=$3,booking_date=CURRENT_DATE,updated_at=now() WHERE id=$1",[row.plot_id,row.buyer_name,staff.user.name]);
-      const result = await client.query("UPDATE website_booking_requests SET status='APPROVED',booking_id=$2,plot_payment_id=$3,reviewed_by=$4,reviewed_at=now(),review_notes=$5,refund_required=false,updated_at=now() WHERE id=$1 RETURNING *",[row.id,booking.id,payments[0].id,user.id,reviewNotes]);
-      await event(client,row.id,'REQUEST_APPROVED',user.id,{ booking_id:booking.id,plot_payment_id:payments[0].id });
-      return { ...publicRequest({...result.rows[0],booking_no:bookingNo}),booking_id:booking.id,plot_payment_id:payments[0].id };
+      // Website approval stays in the website request ledger. Accounts owns its
+      // buyers, bookings, plot status and receipts independently.
+      await requireManager(user,row.site_id,client);
+      const result = await client.query("UPDATE website_booking_requests SET status='APPROVED',reviewed_by=$2,reviewed_at=now(),review_notes=$3,refund_required=false,updated_at=now() WHERE id=$1 RETURNING *",[row.id,user.id,reviewNotes]);
+      await event(client,row.id,'REQUEST_APPROVED',user.id,{ accounts_linked:false });
+      return { ...publicRequest(result.rows[0]),booking_id:null,plot_payment_id:null };
     });
   }
   async function reject(user,id,notes) {
@@ -389,7 +370,7 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
     return tx(async(client) => {
       await client.query('SELECT id FROM plots WHERE id=$1 FOR UPDATE',[row.plot_id]);
       const { rows } = await client.query('SELECT * FROM website_booking_requests WHERE id=$1 FOR UPDATE',[row.id]);
-      if (rows[0].status==='APPROVED') throw websiteError('An approved booking must be cancelled through the booking workflow',409,'REQUEST_CLOSED');
+      if (rows[0].status==='APPROVED' && rows[0].booking_id) throw websiteError('An approved booking must be cancelled through the booking workflow',409,'REQUEST_CLOSED');
       if (rows[0].status==='REJECTED') return publicRequest(rows[0]);
       const result = await client.query("UPDATE website_booking_requests SET status='REJECTED',reviewed_by=$2,reviewed_at=now(),review_notes=$3,refund_required=(payment_verified_at IS NOT NULL AND amount_refunded_paise<amount_paise),updated_at=now() WHERE id=$1 RETURNING *",[row.id,user.id,reason]);
       await event(client,row.id,'REQUEST_REJECTED',user.id,{ refund_required:result.rows[0].refund_required });
@@ -419,7 +400,7 @@ export function createWebsiteBookingService({ db, gateway, siteId, tokenSecret, 
       if (payment.id!==row.razorpay_payment_id || payment.order_id!==row.razorpay_order_id || Number(payment.amount)!==Number(row.amount_paise) || payment.currency!=='INR') throw websiteError('Refund payment mismatch',409,'PAYMENT_MISMATCH');
       await tx(async(client)=>{
         await client.query('UPDATE website_booking_requests SET amount_refunded_paise=$2,refund_required=($2<amount_paise AND (refund_required OR status IN (\'REJECTED\',\'PAYMENT_CONFLICT\'))),updated_at=now() WHERE id=$1',[row.id,Number(payment.amount_refunded)||0]);
-        await event(client,row.id,'PAYMENT_REFUND_UPDATED',null,{ amount_refunded_paise:Number(payment.amount_refunded)||0,requires_accounting_review:row.status==='APPROVED' });
+        await event(client,row.id,'PAYMENT_REFUND_UPDATED',null,{ amount_refunded_paise:Number(payment.amount_refunded)||0,requires_accounting_review:row.status==='APPROVED' && !!row.plot_payment_id });
       });
     }
     await db.query('INSERT INTO website_payment_webhooks(event_id,event_type) VALUES($1,$2) ON CONFLICT DO NOTHING',[eventId,String(payload.event).slice(0,60)]);

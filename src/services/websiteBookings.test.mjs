@@ -241,7 +241,7 @@ test('signature, exact amount, currency and captured status protect verification
   }finally{await f.close();}
 });
 
-test('approval creates member, KYC booking and shared BANK payment atomically once; refund is rechecked',async()=>{
+test('website approval is idempotent and never creates Accounts buyers, bookings, payments or status changes',async()=>{
   const f=await fixture();try{
     await f.enable();const order=await f.service.createOrder(buyer());const body=f.capture(order);
     await f.service.verifyPayment(body);
@@ -249,16 +249,19 @@ test('approval creates member, KYC booking and shared BANK payment atomically on
     await assert.rejects(f.service.approve(admin,order.request_id,'Checked'),{code:'PAYMENT_REFUNDED'});
     f.payments.get(body.razorpay_payment_id).amount_refunded=0;
     const outcomes=await Promise.all([f.service.approve(admin,order.request_id,'Verified with Razorpay'),f.service.approve(admin,order.request_id,'Retry')]);
-    assert.equal(outcomes[0].booking_id,outcomes[1].booking_id);
-    assert.equal((await f.db.query('SELECT count(*)::int AS count FROM bookings')).rows[0].count,1);
-    assert.equal((await f.db.query('SELECT count(*)::int AS count FROM members')).rows[0].count,1);
-    const pay=(await f.db.query('SELECT * FROM plot_payments')).rows[0];
-    assert.equal(pay.amount,'1000');assert.equal(pay.payment_type,'BANK');assert.equal(pay.payment_from,'RAZORPAY');assert.equal(pay.status,'pending');
-    const booking=(await f.db.query('SELECT * FROM bookings')).rows[0];
-    assert.equal(booking.status,'KYC_PENDING');assert.equal(booking.token_payment_id,pay.id);
-    assert.equal((await f.db.query('SELECT status FROM plots WHERE id=1')).rows[0].status,'BOOKED');
-    assert.equal((await f.service.requestStatus(order.request_token)).booking_no,booking.booking_no);
-    await assert.rejects(f.service.reject(admin,order.request_id,'reject approved'),{code:'REQUEST_CLOSED'});
+    for(const result of outcomes) {
+      assert.equal(result.status,'APPROVED');assert.equal(result.booking_id,null);assert.equal(result.plot_payment_id,null);
+    }
+    for(const table of ['bookings','members','plot_payments','kyc_cases']) {
+      assert.equal((await f.db.query(`SELECT count(*)::int AS count FROM ${table}`)).rows[0].count,0);
+    }
+    assert.equal((await f.db.query('SELECT status FROM plots WHERE id=1')).rows[0].status,'Company');
+    const request=await f.service.requestStatus(order.request_token);
+    assert.equal(request.status,'APPROVED');assert.equal(request.booking_no,null);assert.equal(request.payment_verified,true);
+    assert.equal((await f.db.query("SELECT count(*)::int AS count FROM website_booking_events WHERE event_type='REQUEST_APPROVED'")).rows[0].count,1);
+    const websitePlot=(await f.service.plots()).plots.find(plot=>plot.number==='A-1');
+    assert.equal(websitePlot.status,'BOOKED');assert.equal(websitePlot.bookable,false);
+    await assert.rejects(f.service.createOrder(buyer('A-1','another_approved_key_0001')),{code:'PLOT_HELD'});
   }finally{await f.close();}
 });
 
@@ -337,10 +340,33 @@ test('manual and draw model creation cannot bypass website hold; duplicate mappi
   }finally{await f.close();}
 });
 
-test('captured receipt remains immutable and survives booking cancellation',async()=>{
+test('standalone website booking cancellation preserves the payment audit and releases only the website reservation',async()=>{
   const f=await fixture();try{
     await f.enable();const order=await f.service.createOrder(buyer());await f.service.verifyPayment(f.capture(order));
-    const approved=await f.service.approve(admin,order.request_id);
+    await f.service.approve(admin,order.request_id);
+    await f.service.reject(admin,order.request_id,'Customer cancelled the website booking');
+    const request=await f.service.requestStatus(order.request_token);
+    assert.equal(request.status,'REJECTED');assert.equal(request.payment_verified,true);assert.equal(request.refund_required,true);
+    assert.equal((await f.db.query('SELECT count(*)::int AS count FROM plot_payments')).rows[0].count,0);
+    assert.equal((await f.db.query('SELECT status FROM plots WHERE id=1')).rows[0].status,'Company');
+    assert.equal((await f.service.plots()).plots.find(plot=>plot.number==='A-1').bookable,true);
+  }finally{await f.close();}
+});
+
+test('existing linked website receipts remain immutable and survive legacy booking cancellation',async()=>{
+  const f=await fixture();try{
+    await f.enable();const order=await f.service.createOrder(buyer());await f.service.verifyPayment(f.capture(order));
+    // Existing installations retain their historic links; unlinking new requests
+    // must not make already-posted receipts editable or erase their audit trail.
+    await f.service.approve(admin,order.request_id);
+    await f.engine.exec(`INSERT INTO members(id,site_id,full_name) VALUES(1,5,'Test Buyer');
+      INSERT INTO bookings(id,site_id,plot_id,client_member_id,status,token_amount,token_payment_id,booking_no) VALUES(1,5,1,1,'KYC_PENDING',1000,1,'BK-LEGACY');
+      INSERT INTO plot_payments(id,plot_id,site_id,amount,payment_from,payment_type,status) VALUES(1,1,5,1000,'RAZORPAY','BANK','pending');
+      INSERT INTO kyc_cases(id,booking_id,site_id,client_member_id) VALUES(1,1,5,1);
+      UPDATE website_booking_requests SET booking_id=1,plot_payment_id=1 WHERE id=1;
+      UPDATE plots SET status='BOOKED' WHERE id=1;`);
+    const approved={booking_id:1};
+    await assert.rejects(f.service.reject(admin,order.request_id,'reject legacy approved'),{code:'REQUEST_CLOSED'});
     assert.equal((await f.db.query('SELECT count(*)::int AS count FROM kyc_cases')).rows[0].count,1);
     await assert.rejects(bookingModel.update(approved.booking_id,{token_amount:0},f.db),{code:'WEBSITE_PAYMENT_LOCKED'});
     await assert.rejects(bookingModel.update(approved.booking_id,{plot_id:2},f.db),{code:'WEBSITE_PAYMENT_LOCKED'});
