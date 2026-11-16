@@ -31,7 +31,7 @@ import { DOCUMENTS, formatDate, money } from './whatsappDocuments.js';
 
 // Accounting labels every unit 'plot' and plot_no already carries the block ('A1').
 // The site's Document Settings "Property type" wins; draw allotments are shops.
-const BOOKING_SQL = `SELECT b.booking_no, m.full_name, m.phone, m.whatsapp, ${memberCodeSql('m')} AS member_code,
+const BOOKING_SQL = `SELECT b.booking_no, b.site_id, m.full_name, m.phone, m.whatsapp, ${memberCodeSql('m')} AS member_code,
        s.name AS site_name, p.plot_no,
        COALESCE(NULLIF(btrim(to_jsonb(ps)->'document_config'->>'property_type'), ''),
                 CASE WHEN EXISTS (SELECT 1 FROM draw_registrations r WHERE r.booking_id = b.id) THEN 'Shop' ELSE 'Plot' END) AS unit_label
@@ -95,7 +95,7 @@ export const EVENTS = {
       '🆔 *Member ID:* {member_id}\n📄 *KYC Status:* Pending',
       'Please quote this Member ID for your KYC, payments and booking.',
     ),
-    sql: `SELECT m.full_name, m.phone, m.whatsapp, s.name AS site_name, ${memberCodeSql('m')} AS member_code
+    sql: `SELECT s.id AS site_id, m.full_name, m.phone, m.whatsapp, s.name AS site_name, ${memberCodeSql('m')} AS member_code
             FROM members m JOIN sites s ON s.id = m.site_id
            WHERE m.id = $1 AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))`,
   },
@@ -112,7 +112,7 @@ export const EVENTS = {
       'Your account is now officially verified and ready to use.',
       '🤝 We are delighted to welcome you to the *Defence Garden family*, where trust builds lasting relationships.',
     ),
-    sql: `SELECT m.full_name, m.phone, m.whatsapp, s.name AS site_name, ${memberCodeSql('m')} AS member_code
+    sql: `SELECT s.id AS site_id, m.full_name, m.phone, m.whatsapp, s.name AS site_name, ${memberCodeSql('m')} AS member_code
             FROM kyc_cases k
             JOIN members m ON m.id = k.client_member_id AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))
             JOIN sites s ON s.id = COALESCE(k.site_id, m.site_id)
@@ -135,7 +135,7 @@ export const EVENTS = {
                  dp.bank_details, dp.bank_name, dp.branch, dp.received_by, dp.narration, u.name AS created_by_name,
                  r.registration_no, r.scheme_name, r.required_amount::float AS required_amount, r.draw_opening_date,
                  r.status AS registration_status, m.full_name, m.phone, m.whatsapp, ${memberCodeSql('m')} AS member_code,
-                 s.name AS site_name, to_jsonb(ps) AS settings
+                 s.id AS site_id, s.name AS site_name, to_jsonb(ps) AS settings
             FROM draw_payments dp
             JOIN draw_registrations r ON r.id = dp.draw_registration_id
             JOIN members m ON m.id = r.client_member_id AND 'CLIENT' = ANY(COALESCE(m.member_types, ARRAY[m.member_type]))
@@ -327,25 +327,35 @@ export async function sendWhatsAppTemplate(to, template, params = [], { lang: la
   return messageId;
 }
 
-async function stageSettings(event, db = pool) {
+export const WHATSAPP_SITE_STAGE_PREFIX = 'booking_whatsapp_stage_v1:';
+const requestedSite = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id <= 0) throw studioError('Choose a valid project');
+  return id;
+};
+async function stageSettings(event, db = pool, siteId = null) {
   const { rows: [row] } = await db.query('SELECT enabled, attachment, template_name FROM whatsapp_stage_settings WHERE event = $1', [event]);
-  return row || { enabled: true, attachment: EVENTS[event]?.attachment || null, template_name: null };
+  const shared = row || { enabled: true, attachment: EVENTS[event]?.attachment || null, template_name: null };
+  if (!siteId) return shared;
+  const { rows: [saved] } = await db.query('SELECT setting_value FROM application_settings WHERE site_id=$1 AND setting_key=$2', [siteId, `${WHATSAPP_SITE_STAGE_PREFIX}${event}`]);
+  return saved ? { ...shared, ...saved.setting_value } : shared;
 }
 
 /** Only the applied, approved and non-archived version can send; there is no fallback. */
-async function activeTemplate(event, db = pool) {
+async function activeTemplate(event, db = pool, siteId = null, settings = null) {
+  const selected = settings || await stageSettings(event, db, siteId);
   const { rows: [row] } = await db.query(
     `SELECT t.name, t.fields, t.has_document FROM whatsapp_templates t
-      JOIN whatsapp_stage_settings s ON s.event = t.event AND s.template_name = t.name
-      WHERE t.event = $1 AND t.status = 'APPROVED' AND t.archived_at IS NULL`,
-    [event],
+      WHERE t.event = $1 AND t.name = $2 AND t.status = 'APPROVED' AND t.archived_at IS NULL`,
+    [event, selected.template_name],
   );
   return row || null;
 }
 
 // The stage's chosen document, when it can follow this stage.
-async function stageDocument(event, db) {
-  const { attachment } = await stageSettings(event, db);
+async function stageDocument(event, db, siteId = null, settings = null) {
+  const { attachment } = settings || await stageSettings(event, db, siteId);
   const doc = DOCUMENTS[attachment];
   return doc?.events.includes(event) ? doc : null;
 }
@@ -387,16 +397,17 @@ async function deliver(row, { db, send, upload }) {
     } else {
       spec = EVENTS[row.event];
       if (!spec) return await finish('SKIPPED', `Unknown event ${row.event}`);
-      if (!(await stageSettings(row.event, db)).enabled) return await finish('SKIPPED', 'Stage is turned off in WhatsApp Studio');
-      template = await activeTemplate(row.event, db);
-      if (!template) return await finish('SKIPPED', 'No approved template applied to this stage');
       data = await lookup(spec);
+      const settings = await stageSettings(row.event, db, data?.site_id);
+      if (!settings.enabled) return await finish('SKIPPED', 'Stage is turned off in WhatsApp Studio');
+      template = await activeTemplate(row.event, db, data?.site_id, settings);
+      if (!template) return await finish('SKIPPED', 'No approved template applied to this stage');
       if (!phone) return await finish('SKIPPED', data ? 'No valid Indian mobile on the client' : 'No matching client record');
       if (template.has_document) {
-        const doc = await stageDocument(row.event, db);
+        const doc = await stageDocument(row.event, db, data.site_id, settings);
         if (!doc) return await finish('SKIPPED', 'This template sends a document: choose an attachment in WhatsApp Studio');
         const filename = doc.filename(data);
-        media = { type: 'document', id: await upload(await doc.render(data), filename), filename };
+        media = { type: 'document', id: await upload(await doc.render(data, { db }), filename), filename };
       }
     }
     const params = template.fields.map((name) => clean(spec.fields[name].value(data)));
@@ -548,6 +559,10 @@ async function transaction(db, action) {
 async function ensureTemplateUnused(name, db) {
   const { rows: assigned } = await db.query('SELECT event FROM whatsapp_stage_settings WHERE template_name = $1', [name]);
   if (assigned.length) throw studioError('This template is applied to a module. Unapply it before archiving or deleting.', 409);
+  const { rows: siteAssignments } = await db.query(`SELECT 1 FROM application_settings
+    WHERE setting_key = ANY($1::text[]) AND setting_value->>'template_name'=$2 LIMIT 1`,
+  [Object.keys(EVENTS).map(event => `${WHATSAPP_SITE_STAGE_PREFIX}${event}`), name]);
+  if (siteAssignments.length) throw studioError('This template is applied to a project. Unapply it before archiving or deleting.', 409);
   // A worker may already have selected this stage's version before an admin unapplied
   // it. The final template name is recorded after sending, so protect the entire event
   // until any in-flight transactional message completes.
@@ -595,6 +610,7 @@ export async function deleteTemplate(name, db = pool, { marketingSiteId } = {}) 
 export async function saveStage(event, input = {}, userId = null, db = pool) {
   const spec = EVENTS[event];
   if (!spec) throw studioError('Unknown stage', 404);
+  const siteId = requestedSite(input.site_id);
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw studioError('enabled must be true or false');
   if (input.attachment !== undefined && input.attachment !== null && !DOCUMENTS[input.attachment]?.events.includes(event)) {
     throw studioError('That document cannot be attached to this stage');
@@ -603,9 +619,20 @@ export async function saveStage(event, input = {}, userId = null, db = pool) {
     throw studioError('template_name must be a template name or null');
   }
   return transaction(db, async (client) => {
-    await client.query(`INSERT INTO whatsapp_stage_settings (event, attachment, template_assignment_initialized)
-      VALUES ($1, $2, TRUE) ON CONFLICT (event) DO NOTHING`, [event, spec.attachment || null]);
-    const { rows: [saved] } = await client.query(`SELECT enabled, attachment, template_name FROM whatsapp_stage_settings WHERE event = $1 FOR UPDATE`, [event]);
+    let saved;
+    if (siteId) {
+      if (!(await client.query('SELECT id FROM sites WHERE id=$1', [siteId])).rows.length) throw studioError('Project not found', 404);
+      const inherited = await stageSettings(event, client);
+      await client.query(`INSERT INTO application_settings(site_id,setting_key,setting_value,updated_by,updated_at)
+        VALUES($1,$2,$3,$4,now()) ON CONFLICT(site_id,setting_key) DO NOTHING`,
+      [siteId, `${WHATSAPP_SITE_STAGE_PREFIX}${event}`, inherited, userId]);
+      saved = (await client.query('SELECT setting_value FROM application_settings WHERE site_id=$1 AND setting_key=$2 FOR UPDATE',
+        [siteId, `${WHATSAPP_SITE_STAGE_PREFIX}${event}`])).rows[0].setting_value;
+    } else {
+      await client.query(`INSERT INTO whatsapp_stage_settings (event, attachment, template_assignment_initialized)
+        VALUES ($1, $2, TRUE) ON CONFLICT (event) DO NOTHING`, [event, spec.attachment || null]);
+      saved = (await client.query(`SELECT enabled, attachment, template_name FROM whatsapp_stage_settings WHERE event = $1 FOR UPDATE`, [event])).rows[0];
+    }
     const enabled = input.enabled ?? saved.enabled;
     const attachment = input.attachment === undefined ? saved.attachment : input.attachment;
     const templateName = input.template_name === undefined ? saved.template_name : input.template_name;
@@ -618,6 +645,12 @@ export async function saveStage(event, input = {}, userId = null, db = pool) {
         throw studioError('Choose an attachment before applying a document template', 409);
       }
     }
+    if (siteId) {
+      const settings = { enabled, attachment, template_name: templateName };
+      await client.query(`UPDATE application_settings SET setting_value=$3,updated_by=$4,updated_at=now() WHERE site_id=$1 AND setting_key=$2`,
+        [siteId, `${WHATSAPP_SITE_STAGE_PREFIX}${event}`, settings, userId]);
+      return { event, site_id: siteId, ...settings };
+    }
     const { rows: [row] } = await client.query(`UPDATE whatsapp_stage_settings
       SET enabled = $2, attachment = $3, template_name = $4, template_assignment_initialized = TRUE,
           updated_by = $5, updated_at = now()
@@ -627,27 +660,39 @@ export async function saveStage(event, input = {}, userId = null, db = pool) {
 }
 
 /** Send a stage's approved template, filled with sample values, to one number. */
-export async function sendTestMessage(event, phone, db = pool) {
+export async function whatsAppDocumentSample(doc, siteId, db = pool) {
+  if (!siteId) return doc.sample;
+  const { rows: [site] } = await db.query('SELECT s.name,to_jsonb(ps) AS settings FROM sites s LEFT JOIN project_settings ps ON ps.site_id=s.id WHERE s.id=$1', [siteId]);
+  if (!site) throw studioError('Project not found', 404);
+  return { ...doc.sample, site_id: siteId, site_name: site.name, scheme_name: site.name, settings: site.settings || {} };
+}
+
+export async function sendTestMessage(event, phone, db = pool, { siteId: selectedSite } = {}) {
   const spec = EVENTS[event];
   if (!spec) throw studioError('Unknown stage', 404);
+  const siteId = requestedSite(selectedSite);
   const to = toE164(phone);
   if (!to) throw studioError('Enter a valid 10-digit Indian mobile number');
-  const template = await activeTemplate(event, db);
+  const settings = await stageSettings(event, db, siteId);
+  const template = await activeTemplate(event, db, siteId, settings);
   if (!template) throw studioError('This stage has no approved template applied', 409);
   let media = null;
   if (template.has_document) {
-    const doc = await stageDocument(event, db);
+    const doc = await stageDocument(event, db, siteId, settings);
     if (!doc) throw studioError('Choose an attachment for this stage first', 409);
-    const filename = doc.filename(doc.sample);
-    media = { type: 'document', id: await viaAws(uploadWhatsAppMedia(await doc.render(doc.sample), filename)), filename };
+    const sample = await whatsAppDocumentSample(doc, siteId, db);
+    const filename = doc.filename(sample);
+    media = { type: 'document', id: await viaAws(uploadWhatsAppMedia(await doc.render(sample, { db }), filename)), filename };
   }
-  const params = template.fields.map((name) => clean(spec.fields[name].sample));
+  const project = siteId ? (await db.query('SELECT name FROM sites WHERE id=$1', [siteId])).rows[0]?.name : null;
+  const params = template.fields.map((name) => clean(name === 'project' && project ? project : spec.fields[name].sample));
   const messageId = await viaAws(sendWhatsAppTemplate(to, template.name, params, { media }));
   return { to, template: template.name, message_id: messageId };
 }
 
 /** Everything the Studio page shows. Refreshes Meta review statuses first. */
-export async function studioState(db = pool) {
+export async function studioState(db = pool, { siteId: selectedSite } = {}) {
+  const siteId = requestedSite(selectedSite);
   const configured = Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID);
   let info = null;
   let error = null;
@@ -662,19 +707,31 @@ export async function studioState(db = pool) {
   const { rows: templates } = await db.query(`SELECT event, version, name, title, body, fields, has_document, status, category, rejected_reason, archived_at, created_at
     FROM whatsapp_templates WHERE status <> 'DELETED' ORDER BY version DESC`);
   const { rows: settings } = await db.query('SELECT event, enabled, attachment, template_name FROM whatsapp_stage_settings');
+  const overrides = siteId ? (await db.query('SELECT setting_key,setting_value FROM application_settings WHERE site_id=$1 AND setting_key=ANY($2::text[])',
+    [siteId, Object.keys(EVENTS).map(event => `${WHATSAPP_SITE_STAGE_PREFIX}${event}`)])).rows : [];
   const { rows: recent } = await db.query(`SELECT id, event, ref_id, status, phone, template, error, created_at
-    FROM whatsapp_messages ORDER BY id DESC LIMIT 30`);
+    FROM whatsapp_messages w ${siteId ? `WHERE CASE w.event
+      WHEN 'REGISTERED' THEN (SELECT site_id FROM members WHERE id=w.ref_id)
+      WHEN 'KYC_VERIFIED' THEN (SELECT COALESCE(k.site_id,m.site_id) FROM kyc_cases k JOIN members m ON m.id=k.client_member_id WHERE k.id=w.ref_id)
+      WHEN 'PAYMENT_RECEIVED' THEN (SELECT r.site_id FROM draw_payments p JOIN draw_registrations r ON r.id=p.draw_registration_id WHERE p.id=w.ref_id)
+      WHEN 'BOOKING_CREATED' THEN (SELECT site_id FROM bookings WHERE id=w.ref_id)
+      WHEN 'ALLOTTED' THEN (SELECT site_id FROM bookings WHERE id=w.ref_id)
+      END=$1` : ''} ORDER BY id DESC LIMIT 30`, siteId ? [siteId] : []);
   return {
+    site_id: siteId,
     enabled: process.env.WHATSAPP_ENABLED === 'true',
     configured,
     error,
     media_bucket: Boolean(process.env.WHATSAPP_MEDIA_BUCKET),
     sender: info && { number: info.number, name: info.name, quality: info.quality },
     stages: Object.entries(EVENTS).map(([key, spec]) => {
-      const saved = settings.find((s) => s.event === key);
+      const override = overrides.find(setting => setting.setting_key === `${WHATSAPP_SITE_STAGE_PREFIX}${key}`);
+      const saved = override ? { ...settings.find((s) => s.event === key), ...override.setting_value } : settings.find((s) => s.event === key);
       const stageTemplates = templates.filter((t) => t.event === key);
       return {
         key, label: spec.label, description: spec.description, default_body: spec.body,
+        site_id: siteId,
+        scope: override ? 'site' : 'shared',
         module: spec.module, submodule: spec.submodule, trigger: spec.trigger,
         fields: Object.entries(spec.fields).map(([name, f]) => ({ name, label: f.label, sample: f.sample })),
         documents: Object.entries(DOCUMENTS).filter(([, d]) => d.events.includes(key)).map(([docKey, d]) => ({ key: docKey, label: d.label })),

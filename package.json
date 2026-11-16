@@ -76,7 +76,7 @@
     "migrate:whatsapp-marketing": "node src/migrations/041_whatsapp_marketing.js",
     "migrate:whatsapp-template-management": "node src/migrations/042_whatsapp_template_management.js",
     "whatsapp": "node src/scripts/whatsapp.js",
-    "test:whatsapp": "node --test src/services/whatsapp.service.test.mjs src/services/whatsappMarketing.test.mjs",
+    "test:whatsapp": "node --test src/services/whatsapp.service.test.mjs src/services/whatsappMarketing.test.mjs src/services/receiptSignature.service.test.mjs src/services/whatsappSiteSettings.test.mjs",
     "test:security": "node --test src/security/security.test.mjs src/security/authSecurity.test.mjs src/services/realtimeAccess.test.mjs",
     "test:access-control": "node --test src/services/subAdminPermissions.test.mjs src/services/bookingWorkspaceAccess.test.mjs src/controllers/navigationSettings.controller.test.mjs src/controllers/headerAccess.controller.test.mjs",
     "migrate:broker-mobile-auth": "node src/migrations/044_broker_mobile_auth.js",

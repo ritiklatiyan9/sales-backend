@@ -3,7 +3,8 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import upload from '../middlewares/multer.middleware.js';
 import { DOCUMENTS } from '../services/whatsappDocuments.js';
-import { deleteTemplate, saveStage, sendTestMessage, studioState, submitTemplate, updateTemplate } from '../services/whatsapp.service.js';
+import { deleteTemplate, saveStage, sendTestMessage, studioState, submitTemplate, updateTemplate, whatsAppDocumentSample } from '../services/whatsapp.service.js';
+import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
 import {
   addOptOut, cancelCampaign, deleteMarketingTemplate, updateMarketingTemplate, marketingCustomers, marketingState, removeOptOut, sendMarketingTest, startCampaign, submitMarketingTemplate,
 } from '../services/whatsappMarketing.js';
@@ -14,8 +15,12 @@ router.use(authMiddleware);
 router.use((req, res, next) => (['admin', 'super_admin'].includes(req.user?.role)
   ? next() : res.status(403).json({ message: 'Only admins manage WhatsApp messages' })));
 
-router.get('/studio', asyncHandler(async (req, res) => res.json(await studioState())));
-router.put('/stages/:event', asyncHandler(async (req, res) => res.json(await saveStage(req.params.event, req.body || {}, req.user.id))));
+const siteFor = async (req, value) => value === undefined ? null : (await requireSiteAccess(req.user, value)).id;
+router.get('/studio', asyncHandler(async (req, res) => res.json(await studioState(undefined, { siteId: await siteFor(req, req.query.site_id) }))));
+router.put('/stages/:event', asyncHandler(async (req, res) => {
+  await siteFor(req, req.body?.site_id);
+  res.json(await saveStage(req.params.event, req.body || {}, req.user.id));
+}));
 router.post('/templates', asyncHandler(async (req, res) => res.status(201).json(await submitTemplate({
   event: req.body?.event, title: req.body?.title, body: req.body?.body, hasDocument: req.body?.has_document === true, userId: req.user.id,
 }))));
@@ -24,12 +29,13 @@ router.delete('/templates/:name', asyncHandler(async (req, res) => {
   await deleteTemplate(req.params.name);
   res.json({ deleted: req.params.name });
 }));
-router.post('/test', asyncHandler(async (req, res) => res.json(await sendTestMessage(req.body?.event, req.body?.phone))));
+router.post('/test', asyncHandler(async (req, res) => res.json(await sendTestMessage(req.body?.event, req.body?.phone, undefined, { siteId: await siteFor(req, req.body?.site_id) }))));
 // Sample PDF (made-up data) so admins can see the attachment before it goes to customers.
 router.get('/documents/:key/sample', asyncHandler(async (req, res) => {
   const doc = DOCUMENTS[req.params.key];
   if (!doc) return res.status(404).json({ message: 'Unknown document' });
-  res.type('application/pdf').set('Content-Disposition', `inline; filename="${doc.filename(doc.sample)}"`).send(await doc.render(doc.sample));
+  const sample = await whatsAppDocumentSample(doc, await siteFor(req, req.query.site_id));
+  res.type('application/pdf').set('Content-Disposition', `inline; filename="${doc.filename(sample)}"`).send(await doc.render(sample));
 }));
 
 // WhatsApp Marketing: template changes and campaigns are scoped to an accessible site.

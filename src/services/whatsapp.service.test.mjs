@@ -8,6 +8,7 @@ import { migrateWhatsAppMarketing } from '../migrations/041_whatsapp_marketing.j
 import { migrateWhatsAppTemplateManagement } from '../migrations/042_whatsapp_template_management.js';
 import { createServer } from 'node:http';
 import { SocialMessagingClient, ListWhatsAppMessageTemplatesCommand } from '@aws-sdk/client-socialmessaging';
+import sharp from 'sharp';
 import { EVENTS, compileBody, deleteTemplate, drainWhatsApp, queueWhatsApp, saveStage, studioState, toE164, updateTemplate, whatsappAwsConfig } from './whatsapp.service.js';
 import { SAMPLE_RECEIPT, amountInWords, money, receiptTerms, renderDrawReceipt } from './whatsappDocuments.js';
 
@@ -93,11 +94,18 @@ test('WhatsApp outbox on isolated PostgreSQL: stages, approved versions, attachm
   const sent = [];
   const uploads = [];
   const fake = async (to, template, params, { media } = {}) => { sent.push({ to, template, params, ...(media ? { media } : {}) }); return `m-${sent.length}`; };
-  const upload = async (buffer, filename) => { uploads.push({ pdf: buffer.subarray(0, 5).toString(), filename }); return `media-${uploads.length}`; };
+  const upload = async (buffer, filename) => {
+    assert.match(buffer.toString('latin1'), /\/Subtype \/Image/, 'the outbox uploads the site signature inside the receipt PDF');
+    uploads.push({ pdf: buffer.subarray(0, 5).toString(), filename }); return `media-${uploads.length}`;
+  };
   const row = async (key) => (await f.query('SELECT status, error, phone, provider_message_id FROM whatsapp_messages WHERE dedupe_key = $1', [key])).rows[0];
   const statuses = async () => (await f.query('SELECT dedupe_key, status FROM whatsapp_messages ORDER BY id')).rows
     .map((r) => `${r.dedupe_key}=${r.status}`);
   try {
+    const signature = await sharp({ create: { width: 200, height: 50, channels: 3, background: '#123456' } }).png().toBuffer();
+    await f.query('INSERT INTO application_settings(site_id,setting_key,setting_value) VALUES(1,$1,$2)', ['receipt_signature_v1', {
+      enabled: true, image_data_url: `data:image/png;base64,${signature.toString('base64')}`,
+    }]);
     await f.db.exec('ALTER TABLE members ADD COLUMN whatsapp TEXT');
     for (const migrate of [migrateWhatsAppMessages, migrateWhatsAppMessages, migrateWhatsAppStudio, migrateWhatsAppStudio, migrateWhatsAppMarketing, migrateWhatsAppMarketing]) await migrate(f.pool);
     // The four templates submitted before the Studio are adopted as version 1; Meta approves them.

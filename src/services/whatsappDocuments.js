@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import PDFDocument from 'pdfkit';
+import { drawReceiptSignature } from './receiptSignature.service.js';
 
 /**
  * PDFs that WhatsApp Studio can attach to a stage's message. Each document renders from
@@ -66,9 +67,10 @@ async function fetchLogo(url) {
 const C = { ink: '#13231a', body: '#2b3a31', muted: '#5d6b63', line: '#dbe3dd', soft: '#f3f7f4', accent: '#1e5d3b', dark: '#143f28', gold: '#b8893a', white: '#ffffff' };
 
 /** A4 customer copy of a draw payment receipt, laid out like the web receipt. */
-export async function renderDrawReceipt(d) {
+export async function renderDrawReceipt(d, { db } = {}) {
   const s = d.settings || {};
   const config = s.document_config || {};
+  const signature = await drawReceiptSignature(d.site_id || s.site_id, db);
   const logo = await fetchLogo(s.logo_url);
   const reference = d.receipt_no || `Payment #${d.id}`;
   const company = s.company_legal_name || s.company_brand_name || d.site_name;
@@ -256,8 +258,15 @@ export async function renderDrawReceipt(d) {
     const half = (width - 28) / 2;
     const signX = L + half + 28;
     text('R', 8, C.muted, `For ${company || 'the company'}`, signX, y, { width: half, align: 'center' });
-    rule(y + 40, signX + 10, R - 10, '#9aa79e');
-    text('S', 9.5, C.ink, config.signatory_name || config.office_signature || 'Authorised signatory', signX, y + 46, { width: half, align: 'center' });
+    const signLineY = y + Math.max(40, signature ? 14 + signature.height : 0);
+    if (signature) {
+      const imageWidth = Math.min(half - 20, signature.width);
+      doc.image(signature.bytes, signX + (half - imageWidth) / 2, y + 12, {
+        fit: [imageWidth, signature.height], align: 'center', valign: 'bottom',
+      });
+    }
+    rule(signLineY, signX + 10, R - 10, '#9aa79e');
+    text('S', 9.5, C.ink, config.signatory_name || config.office_signature || 'Authorised signatory', signX, signLineY + 6, { width: half, align: 'center' });
     text('R', 7.5, C.muted, config.signatory_designation || 'Signature / office seal', signX, doc.y + 1, { width: half, align: 'center' });
     text('S', 11, C.dark, 'Thank you for your payment.', L, y + 30, { width: half });
     text('R', 8, C.muted, 'Please retain this customer copy.', L, doc.y + 2, { width: half });
