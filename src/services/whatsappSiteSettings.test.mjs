@@ -5,7 +5,7 @@ import { migrateWhatsAppMessages } from '../migrations/039_whatsapp_messages.js'
 import { migrateWhatsAppStudio } from '../migrations/040_whatsapp_studio.js';
 import { migrateWhatsAppMarketing } from '../migrations/041_whatsapp_marketing.js';
 import { migrateWhatsAppTemplateManagement } from '../migrations/042_whatsapp_template_management.js';
-import { compileBody, drainWhatsApp, saveStage, studioState, updateTemplate } from './whatsapp.service.js';
+import { activateRequestedSiteTemplates, compileBody, drainWhatsApp, saveStage, studioState, updateTemplate } from './whatsapp.service.js';
 
 test('project overrides route only that project to its professional template, with explicit pause and unapply', async () => {
   const f = await drawFixture();
@@ -48,6 +48,20 @@ test('project overrides route only that project to its professional template, wi
     assert.deepEqual((await f.query('SELECT * FROM whatsapp_stage_settings ORDER BY event')).rows, sharedBefore);
     await assert.rejects(saveStage('KYC_VERIFIED', { site_id: '1x' }, 1, f.pool), /valid project/);
     await assert.rejects(saveStage('KYC_VERIFIED', { site_id: 999 }, 1, f.pool), /Project not found/);
+    await f.query(`INSERT INTO whatsapp_templates(event,version,name,body,fields,status)
+      VALUES('KYC_VERIFIED',3,'professional_pending',$1,$2,'PENDING')`, [body, compileBody('KYC_VERIFIED', body).fields]);
+    await saveStage('KYC_VERIFIED', { site_id: 1, template_name: 'dgg_kyc_verified', requested_template_name: 'professional_pending' }, 1, f.pool);
+    assert.equal(await activateRequestedSiteTemplates(f.pool), 0, 'a pending template must never send');
+    assert.equal((await studioState(f.pool, { siteId: 1 })).stages.find(s => s.key === 'KYC_VERIFIED').requested_template.name, 'professional_pending');
+    await assert.rejects(updateTemplate('professional_pending', { archived: true }, f.pool), /applied to a project/);
+    await f.query("UPDATE whatsapp_templates SET status='APPROVED' WHERE name='professional_pending'");
+    assert.equal(await activateRequestedSiteTemplates(f.pool), 1);
+    assert.equal((await studioState(f.pool, { siteId: 1 })).stages.find(s => s.key === 'KYC_VERIFIED').active_template.name, 'professional_pending');
+    assert.equal(await activateRequestedSiteTemplates(f.pool), 0, 'activation is idempotent');
+    await saveStage('KYC_VERIFIED', { site_id: 1, requested_template_name: 'professional_site_1' }, 1, f.pool);
+    await saveStage('KYC_VERIFIED', { site_id: 1, enabled: false }, 1, f.pool);
+    assert.equal(await activateRequestedSiteTemplates(f.pool), 0, 'pausing cancels a pending replacement');
+    assert.deepEqual((await f.query('SELECT * FROM whatsapp_stage_settings ORDER BY event')).rows, sharedBefore);
   } finally {
     if (savedPhone === undefined) delete process.env.WHATSAPP_PHONE_NUMBER_ID; else process.env.WHATSAPP_PHONE_NUMBER_ID = savedPhone;
     await f.close();

@@ -488,6 +488,7 @@ export async function refreshTemplates(db = pool) {
       );
     }
   }
+  await activateRequestedSiteTemplates(db);
 }
 
 // AWS/Meta refusals are actionable for the admin (approval, IAM, bucket), so show them.
@@ -556,11 +557,32 @@ async function transaction(db, action) {
   }
 }
 
+/** Apply an explicitly requested project replacement only after Meta approves it. */
+export async function activateRequestedSiteTemplates(db = pool) {
+  const keys = Object.keys(EVENTS).map(event => `${WHATSAPP_SITE_STAGE_PREFIX}${event}`);
+  const { rows } = await db.query(`SELECT site_id,setting_key FROM application_settings
+    WHERE setting_key=ANY($1::text[]) AND setting_value->>'requested_template_name' IS NOT NULL`, [keys]);
+  let activated = 0;
+  for (const row of rows) activated += await transaction(db, async client => {
+    const saved = (await client.query('SELECT setting_value FROM application_settings WHERE site_id=$1 AND setting_key=$2 FOR UPDATE', [row.site_id, row.setting_key])).rows[0]?.setting_value;
+    if (!saved?.requested_template_name) return 0;
+    const event = row.setting_key.slice(WHATSAPP_SITE_STAGE_PREFIX.length);
+    const user = (await client.query("SELECT id FROM users WHERE id=$1 AND is_active AND role IN ('admin','super_admin')", [saved.requested_by])).rows[0];
+    if (!user) return 0;
+    const template = (await client.query("SELECT has_document FROM whatsapp_templates WHERE name=$1 AND event=$2 AND status='APPROVED' AND archived_at IS NULL", [saved.requested_template_name, event])).rows[0];
+    if (!template || template.has_document && !DOCUMENTS[saved.attachment]?.events.includes(event)) return 0;
+    const next = { enabled: saved.enabled, attachment: saved.attachment, template_name: saved.requested_template_name };
+    await client.query('UPDATE application_settings SET setting_value=$3,updated_by=$4,updated_at=now() WHERE site_id=$1 AND setting_key=$2', [row.site_id, row.setting_key, next, saved.requested_by]);
+    return 1;
+  });
+  return activated;
+}
+
 async function ensureTemplateUnused(name, db) {
   const { rows: assigned } = await db.query('SELECT event FROM whatsapp_stage_settings WHERE template_name = $1', [name]);
   if (assigned.length) throw studioError('This template is applied to a module. Unapply it before archiving or deleting.', 409);
   const { rows: siteAssignments } = await db.query(`SELECT 1 FROM application_settings
-    WHERE setting_key = ANY($1::text[]) AND setting_value->>'template_name'=$2 LIMIT 1`,
+    WHERE setting_key = ANY($1::text[]) AND (setting_value->>'template_name'=$2 OR setting_value->>'requested_template_name'=$2) LIMIT 1`,
   [Object.keys(EVENTS).map(event => `${WHATSAPP_SITE_STAGE_PREFIX}${event}`), name]);
   if (siteAssignments.length) throw studioError('This template is applied to a project. Unapply it before archiving or deleting.', 409);
   // A worker may already have selected this stage's version before an admin unapplied
@@ -611,6 +633,9 @@ export async function saveStage(event, input = {}, userId = null, db = pool) {
   const spec = EVENTS[event];
   if (!spec) throw studioError('Unknown stage', 404);
   const siteId = requestedSite(input.site_id);
+  if (input.requested_template_name !== undefined && (!siteId || input.requested_template_name !== null && (typeof input.requested_template_name !== 'string' || !input.requested_template_name.trim()))) {
+    throw studioError('Choose a project and a replacement template to apply after approval');
+  }
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw studioError('enabled must be true or false');
   if (input.attachment !== undefined && input.attachment !== null && !DOCUMENTS[input.attachment]?.events.includes(event)) {
     throw studioError('That document cannot be attached to this stage');
@@ -647,6 +672,15 @@ export async function saveStage(event, input = {}, userId = null, db = pool) {
     }
     if (siteId) {
       const settings = { enabled, attachment, template_name: templateName };
+      const pendingName = input.requested_template_name !== undefined ? input.requested_template_name
+        : input.template_name !== undefined || input.enabled === false ? null : saved.requested_template_name;
+      if (pendingName) {
+        const pending = (await client.query("SELECT status,has_document FROM whatsapp_templates WHERE name=$1 AND event=$2 AND archived_at IS NULL", [pendingName, event])).rows[0];
+        if (!pending || !['PENDING', 'APPROVED'].includes(pending.status)) throw studioError('Choose an approved template or one awaiting Meta approval', 409);
+        if (pending.has_document && !DOCUMENTS[attachment]?.events.includes(event)) throw studioError('Choose an attachment before requesting this document template', 409);
+        settings.requested_template_name = pendingName;
+        settings.requested_by = input.requested_template_name !== undefined ? userId : saved.requested_by;
+      }
       await client.query(`UPDATE application_settings SET setting_value=$3,updated_by=$4,updated_at=now() WHERE site_id=$1 AND setting_key=$2`,
         [siteId, `${WHATSAPP_SITE_STAGE_PREFIX}${event}`, settings, userId]);
       return { event, site_id: siteId, ...settings };
@@ -738,6 +772,7 @@ export async function studioState(db = pool, { siteId: selectedSite } = {}) {
         settings: saved ? { enabled: saved.enabled, attachment: saved.attachment, template_name: saved.template_name }
           : { enabled: true, attachment: spec.attachment || null, template_name: null },
         active_template: stageTemplates.find((t) => t.name === saved?.template_name && t.status === 'APPROVED' && !t.archived_at) || null,
+        requested_template: stageTemplates.find(t => t.name === saved?.requested_template_name) || null,
         templates: stageTemplates,
       };
     }),
