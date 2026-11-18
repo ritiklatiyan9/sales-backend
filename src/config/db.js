@@ -46,22 +46,29 @@ export const connectDB = async () => {
 // Lock-free catalog read. `ADD COLUMN IF NOT EXISTS` takes ACCESS EXCLUSIVE even when the
 // column exists, so callers run their idempotent DDL only when this returns false.
 // Names resolve through search_path exactly like the DDL they guard.
-export const schemaHas = async ({ relations = [], columns = [] }, db = pool) => {
+export const schemaHas = async ({ relations = [], columns = [], triggers = [] }, db = pool) => {
   const { rows: [row] } = await db.query(`SELECT
       (SELECT count(*) FROM unnest($1::text[]) r WHERE to_regclass(r) IS NOT NULL)
     + (SELECT count(*) FROM unnest($2::text[], $3::text[]) c(rel, col)
-        WHERE EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = to_regclass(c.rel) AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped)) AS n`,
-  [relations, columns.map(([rel]) => rel), columns.map(([, col]) => col)]);
-  return Number(row.n) === relations.length + columns.length;
+        WHERE EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = to_regclass(c.rel) AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped))
+    + (SELECT count(*) FROM unnest($4::text[], $5::text[]) t(rel, name)
+        WHERE EXISTS (SELECT 1 FROM pg_trigger p WHERE p.tgrelid = to_regclass(t.rel) AND p.tgname = t.name AND p.tgenabled IN ('O','A'))) AS n`,
+  [relations, columns.map(([rel]) => rel), columns.map(([, col]) => col), triggers.map(([rel]) => rel), triggers.map(([, name]) => name)]);
+  return Number(row.n) === relations.length + columns.length + triggers.length;
 };
 
-// Every object boot migrations 051, 047 and 048 create; server.js runs them only when one is missing.
-// ponytail: hand-kept list; a boot migration added to server.js must add its objects here (db.test.mjs drops each one).
+export const memberCodeSchema = {
+  columns: [['members', 'code_id']],
+  triggers: [['members', 'trg_member_stable_code']],
+};
+
+// server.js runs the boot migrations only when one of their required objects is missing.
 export const bootSchemaReady = (db = pool) => schemaHas({
   relations: ['login_otps', 'booking_broker_push_devices', 'booking_broker_push_events', 'booking_broker_push_deliveries',
     'booking_broker_push_devices_account_idx', 'booking_broker_push_event_pending_idx', 'booking_broker_push_delivery_pending_idx'],
-  columns: [['members', 'booking_name'], ['users', 'can_login_accounts'], ['users', 'can_login_booking'],
+  columns: [...memberCodeSchema.columns, ['members', 'booking_name'], ['users', 'can_login_accounts'], ['users', 'can_login_booking'],
     ['users', 'can_login_booking_accounts'], ['login_otps', 'app_context']],
+  triggers: memberCodeSchema.triggers,
 }, db);
 
 export default pool;

@@ -9,8 +9,6 @@ import { memberHasType } from './memberRoles.service.js';
  */
 export const brokerCode = (brokerId) => `BRK-${String(brokerId).padStart(5, '0')}`;
 
-const PHONE10 = (alias) => `RIGHT(REGEXP_REPLACE(COALESCE(${alias}.phone, ''), '[^0-9]', '', 'g'), 10)`;
-
 /**
  * Dealers of the given teams with per-site counts. A booking is a plot at the
  * selected site whose "Booking by" is this dealer (Accounting's dealer field — the
@@ -21,18 +19,18 @@ export async function listDealers(teamIds, siteId, db) {
   if (!teamIds.length) return [];
   const { rows } = await db.query(`
     SELECT td.broker_id, td.member_id, td.team_id, td.parent_broker_id, td.joined_at,
-           m.full_name AS name, m.phone, m.photo, COALESCE(m.status, 'ACTIVE') AS status, ${PHONE10('m')} AS phone10
+           m.full_name AS name, m.phone, m.photo, COALESCE(m.status, 'ACTIVE') AS status, ${canonicalMemberIdSql('m')} AS code_id
       FROM team_dealers td JOIN members m ON m.id = td.member_id
      WHERE td.team_id = ANY($1::int[])
      ORDER BY td.team_id, td.parent_broker_id NULLS FIRST, m.full_name, td.broker_id`, [teamIds.map(Number)]);
   const bookings = new Map(), draws = new Map(), names = new Map();
   if (siteId && rows.length) {
-    // One scan each: the dealer's broker names (same person = same mobile), the
+    // One scan each: the names on the dealer's registrations, the
     // site's plots grouped by "Booking by", and the site's draws grouped by broker.
-    const phones = rows.map((r) => r.phone10).filter((p) => p.length === 10);
+    const codeIds = [...new Set(rows.map((row) => row.code_id))];
     const [named, plots, drawn] = await Promise.all([
-      db.query(`SELECT x.id, ${PHONE10('x')} AS phone10, UPPER(TRIM(x.full_name)) AS name FROM members x
-        WHERE 'BROKER' = ANY(COALESCE(x.member_types, ARRAY[x.member_type])) AND (x.id = ANY($1::int[]) OR ${PHONE10('x')} = ANY($2::text[]))`, [rows.map((r) => r.member_id), phones]),
+      db.query(`SELECT ${canonicalMemberIdSql('x')} AS code_id, UPPER(TRIM(x.full_name)) AS name FROM members x
+        WHERE 'BROKER' = ANY(COALESCE(x.member_types, ARRAY[x.member_type])) AND ${canonicalMemberIdSql('x')} = ANY($1::int[])`, [codeIds]),
       db.query(`SELECT UPPER(TRIM(booking_by)) AS name, count(*)::int AS n FROM plots
         WHERE site_id = $1 AND booking_by IS NOT NULL AND UPPER(TRIM(COALESCE(status, ''))) NOT IN ('', 'AVAILABLE', 'COMPANY', 'CANCELLED')
         GROUP BY 1`, [Number(siteId)]),
@@ -41,14 +39,14 @@ export async function listDealers(teamIds, siteId, db) {
     ]);
     for (const p of plots.rows) bookings.set(p.name, p.n);
     for (const d of drawn.rows) draws.set(Number(d.broker_id), d.n);
-    for (const r of rows) {
-      names.set(r.broker_id, new Set(named.rows
-        .filter((x) => x.id === r.member_id || (r.phone10.length === 10 && x.phone10 === r.phone10)).map((x) => x.name)));
+    for (const { code_id: codeId, name } of named.rows) {
+      if (!names.has(codeId)) names.set(codeId, new Set());
+      names.get(codeId).add(name);
     }
   }
-  return rows.map(({ phone10, ...row }) => ({
+  return rows.map(({ code_id: codeId, ...row }) => ({
     ...row, code: brokerCode(row.broker_id),
-    booking_count: [...(names.get(row.broker_id) || [])].reduce((sum, name) => sum + (bookings.get(name) || 0), 0),
+    booking_count: [...(names.get(codeId) || [])].reduce((sum, name) => sum + (bookings.get(name) || 0), 0),
     draw_count: draws.get(row.broker_id) || 0,
   }));
 }

@@ -2,7 +2,7 @@ import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import { getVisibleUserIds } from '../services/agentNetwork.service.js';
 import { requireSiteAccess } from '../services/bookingWorkspaceAccess.js';
-import { canonicalMemberIdSql, memberCodeSql } from '../services/memberCodes.js';
+import { memberCodeSql } from '../services/memberCodes.js';
 import { memberHasType, memberTypesSql } from '../services/memberRoles.service.js';
 import { getDrawSettings } from '../models/ProjectSettings.model.js';
 import { drawEnrollmentState, drawEntriesLateral, drawPermsSql } from '../services/drawEnrollment.js';
@@ -21,7 +21,7 @@ import {
 const lookupSql = byPhone => `
   SELECT m.id, m.site_id, m.full_name, ${memberPhoneSql('m')} AS phone, m.city, m.photo, m.member_type,
          ${memberTypesSql('m')} AS member_types, m.created_at, m.aadhar_no, m.pan_no,
-         ${canonicalMemberIdSql('m')}::int AS code_id,
+         m.code_id,
          COALESCE(broker.full_name, u.name) AS referred_by_name,
          CASE WHEN broker.id IS NOT NULL THEN COALESCE(m.referred_by_member_code, ${memberCodeSql('broker')}) ELSE u.referral_code END AS referred_by_code,
          ${kycVerifiedSql('m')} AS kyc_verified,
@@ -31,7 +31,7 @@ const lookupSql = byPhone => `
     FROM (SELECT 1) one
     LEFT JOIN LATERAL (
       SELECT c.id, c.site_id, c.full_name, c.phone, c.city, c.photo, c.member_type, c.member_types, c.created_at,
-             c.aadhar_no, c.pan_no, c.referred_by_user_id, c.referred_by_member_id, c.referred_by_member_code
+             c.aadhar_no, c.pan_no, c.referred_by_user_id, c.referred_by_member_id, c.referred_by_member_code, c.code_id
         FROM members c
        WHERE c.site_id = $1 AND ${byPhone ? `${memberPhoneSql('c')} = $2` : 'c.id = $2'}
        ORDER BY c.id DESC LIMIT 1) m ON true

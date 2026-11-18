@@ -11,6 +11,7 @@ import { startBrokerMobilePushWorker } from './services/brokerMobilePush.service
 import { migrateBookingAccountsLoginAccess } from './migrations/047_booking_accounts_login_access.js';
 import { migrateBrokerMobilePush } from './migrations/048_broker_mobile_push.js';
 import { migrateMemberBookingName } from './migrations/051_member_booking_name.js';
+import { migrateMemberCodeIds } from './migrations/053_member_code_ids.js';
 
 validateProductionSecurity();
 
@@ -32,6 +33,7 @@ async function start() {
       await migrateMemberBookingName(pool);
       await migrateBookingAccountsLoginAccess(pool);
       await migrateBrokerMobilePush(pool);
+      await migrateMemberCodeIds(pool);
     }
     console.log(`[booking-api] migrations checked ${uptimeMs()} ms`);
   } catch (err) {

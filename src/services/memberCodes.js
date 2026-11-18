@@ -5,10 +5,7 @@ export const parseMemberCode = value => {
   const id = match ? Number(match[2]) : 0;
   return match && ROLES[match[1]] && Number.isSafeInteger(id) && id > 0 ? { role:ROLES[match[1]],id } : null;
 };
-export const canonicalMemberIdSql = (alias='m') => `COALESCE((SELECT MIN(code_person.id) FROM members code_person
-  WHERE LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(${alias}.phone, ''), '[^0-9]', '', 'g'), 10)) = 10
-    AND RIGHT(REGEXP_REPLACE(COALESCE(code_person.phone, ''), '[^0-9]', '', 'g'), 10)
-      = RIGHT(REGEXP_REPLACE(COALESCE(${alias}.phone, ''), '[^0-9]', '', 'g'), 10)), ${alias}.id)`;
+export const canonicalMemberIdSql = (alias='m') => `${alias}.code_id`;
 export const memberCodeSql = (alias='m') => `(CASE ${alias}.member_type ${Object.entries(MEMBER_CODE_PREFIXES).map(([role,prefix])=>`WHEN '${role}' THEN '${prefix}'`).join(' ')} ELSE 'OTH' END || '-' || LPAD((${canonicalMemberIdSql(alias)})::text, GREATEST(5,LENGTH((${canonicalMemberIdSql(alias)})::text)), '0'))`;
 export async function findMemberByCode(code,siteId,db,{activeOnly=false}={}) {
   const parsed=parseMemberCode(code);

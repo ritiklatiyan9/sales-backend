@@ -2,9 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawFixture } from '../test/drawFixture.mjs';
 import { migrateMemberBookingName } from '../migrations/051_member_booking_name.js';
+import { migrateMemberCodeIds } from '../migrations/053_member_code_ids.js';
 import drawModel from '../models/Draw.model.js';
 import { migrateClientRegistry } from '../migrations/030_client_registry.js';
 import { normalizeClientIdentity, normalizeClientPhone } from './clientRegistry.service.js';
+import { brokerFromMember, listDealers, resolveDrawBroker } from './dealerTeams.js';
+import { lookupClient } from '../controllers/clientLookup.controller.js';
 import { resolvePaymentCollector } from './paymentCollector.js';
 import * as controller from '../controllers/booking.controller.js';
 
@@ -13,7 +16,12 @@ const agent = { id: 2, role: 'agent' };
 const stranger = { id: 3, role: 'agent' };
 const subAdmin = { id: 4, role: 'sub_admin' };
 const call = (handler, { user = admin, body = {}, query = {}, params = {}, file } = {}) => new Promise((resolve) => {
-  const res = { statusCode: 200, status(value) { this.statusCode = value; return this; }, json(data) { resolve({ status: this.statusCode, data }); } };
+  const res = {
+    statusCode: 200,
+    status(value) { this.statusCode = value; return this; },
+    set() { return this; },
+    json(data) { resolve({ status: this.statusCode, data }); },
+  };
   handler({ user, body, query, params, file }, res, (error) => resolve({ status: error.status || 500, data: { message: error.message, code: error.code } }));
 });
 
@@ -29,7 +37,7 @@ test('client registry normalizes mobile and validates optional identity fields',
 });
 
 test('reusable client registration and bounded site directory on isolated PostgreSQL', async (t) => {
-  const fixture = await drawFixture();
+  const fixture = await drawFixture({ migrateCodes: false });
   let member;
   try {
     await fixture.db.exec(`
@@ -55,6 +63,11 @@ test('reusable client registration and bounded site directory on isolated Postgr
       await fixture.query("UPDATE members SET phone='77777 77777',full_name='Legacy Updated' WHERE id=1");
       await fixture.query("INSERT INTO members(site_id,member_type,full_name,phone) VALUES(2,'CLIENT','Separate Site','7777777777')");
     });
+
+    const { rows: [firstBroker, brokerToEdit] } = await fixture.query(`INSERT INTO members (site_id, member_type, status, full_name, phone)
+      VALUES (2, 'BROKER', 'ACTIVE', 'Broker name on past bookings', '9111000000'),
+             (1, 'BROKER', 'ACTIVE', 'Broker name', '+91 91110 00000') RETURNING id`);
+    assert.equal(await migrateMemberCodeIds(fixture.pool), true);
 
     await t.test('member lookup preserves one canonical code ID across formatted mobiles and site copies', async () => {
       const sameSite = await call(controller.searchClients, { query: { site_id: 1, q: '7777777777' } });
@@ -333,6 +346,55 @@ test('reusable client registration and bounded site directory on isolated Postgr
       assert.equal((await fixture.query('SELECT member_type FROM members WHERE id=$1',[local.id])).rows[0].member_type,'MEMBER');
       await fixture.query("UPDATE members SET status='INACTIVE' WHERE id=$1",[local.id]);
       assert.equal((await call(controller.lookupClientReferral,{query:{site_id:1,code}})).status,400);
+    });
+
+    await t.test('a broker phone edit keeps the issued code usable in client and dealer lookups', async () => {
+      const codeId = firstBroker.id;
+      const brokerId = brokerToEdit.id;
+      const code = `BRK-${String(codeId).padStart(5, '0')}`;
+      const { rows: [team] } = await fixture.query("INSERT INTO teams (name, site_id) VALUES ('Dealer team', 1) RETURNING id");
+      await fixture.query('INSERT INTO team_dealers (team_id, member_id, broker_id) VALUES ($1, $2, $3)', [team.id, brokerId, codeId]);
+      await fixture.query("UPDATE plots SET booking_by='Broker name on past bookings', status='BOOKED' WHERE id=1");
+
+      const before = await call(controller.lookupClientReferral, { query: { site_id: 1, code } });
+      assert.equal(before.data.member_id, brokerId);
+      const updated = await call(controller.updateClient, { params: { id: brokerId }, body: { phone: '9111000001', code_id: 999 } });
+      assert.equal(updated.status, 200, JSON.stringify(updated.data));
+      assert.equal(updated.data.phone, '9111000001');
+      assert.equal(updated.data.code_id, codeId);
+      assert.equal(await migrateMemberCodeIds(fixture.pool), false);
+      assert.equal((await call(controller.getClient, { params: { id: brokerId } })).data.code_id, codeId);
+      const found = await call(controller.searchClients, { query: { site_id: 1, q: code } });
+      assert.deepEqual(found.data.map(row => [row.id, row.code_id]), [[brokerId, codeId]]);
+      const directory = await call(controller.listClients, { query: { site_id: 1, q: code, member_type: 'BROKER' } });
+      assert.equal(directory.status, 200, JSON.stringify(directory.data));
+      assert.deepEqual(directory.data.items.map(row => [row.id, row.code_id]), [[brokerId, codeId]]);
+      const lookup = await call(lookupClient, { query: { site_id: 1, phone: '9111000001' } });
+      assert.equal(lookup.status, 200, JSON.stringify(lookup.data));
+      assert.equal(lookup.data.client.code_id, codeId);
+      const referred = await call(controller.lookupClientReferral, { query: { site_id: 1, code } });
+      assert.equal(referred.data.referral_code, code);
+      assert.equal(referred.data.member_id, brokerId);
+      assert.equal((await resolveDrawBroker(code, 1, fixture.pool)).broker_id, codeId);
+      assert.equal((await resolveDrawBroker(code, 2, fixture.pool)).broker_member_id, firstBroker.id);
+      assert.equal((await brokerFromMember(brokerId, fixture.pool)).broker_id, codeId);
+      const [dealer] = await listDealers([team.id], 1, fixture.pool);
+      assert.equal(dealer.code, code);
+      assert.equal(dealer.booking_count, 1);
+    });
+
+    await t.test('new brokers keep their own code when editing to a number in use at another site', async () => {
+      const created = await call(controller.createClient, {
+        body: { site_id: 2, member_type: 'BROKER', full_name: 'New broker', phone: '9111000002' },
+      });
+      assert.equal(created.status, 201, JSON.stringify(created.data));
+      const { id, code_id: codeId } = created.data;
+      assert.equal(codeId, id);
+      const updated = await call(controller.updateClient, { params: { id }, body: { phone: '9111000001' } });
+      assert.equal(updated.status, 200, JSON.stringify(updated.data));
+      assert.equal(updated.data.code_id, codeId);
+      const code = `BRK-${String(codeId).padStart(5, '0')}`;
+      assert.equal((await resolveDrawBroker(code, 2, fixture.pool)).broker_member_id, id);
     });
 
     await t.test('an employee registers as a client on the same profile and becomes searchable as a client', async () => {

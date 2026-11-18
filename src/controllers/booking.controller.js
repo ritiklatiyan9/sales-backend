@@ -1,4 +1,4 @@
-import { parseMemberCode, canonicalMemberIdSql, memberCodeSql, memberReferral } from '../services/memberCodes.js';
+import { parseMemberCode, memberCodeSql, memberReferral } from '../services/memberCodes.js';
 import { allotDrawBooking } from './draw.controller.js';
 import { ensureBookingCreditFields, listBookingDrawCredits } from '../services/bookingDrawCredits.js';
 import { money } from '../services/drawWorkflow.js';
@@ -625,11 +625,7 @@ export const deleteBooking = asyncHandler(async (req, res) => {
 // Identity lookups are shared within an authorised site. Case/documents retain
 // their separate network ownership; list/search never expose complete KYC IDs.
 const clientLookupSelect = `
-  SELECT m.id,
-         COALESCE((SELECT MIN(person.id) FROM members person
-           WHERE LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(m.phone, ''), '[^0-9]', '', 'g'), 10)) = 10
-             AND RIGHT(REGEXP_REPLACE(COALESCE(person.phone, ''), '[^0-9]', '', 'g'), 10)
-               = RIGHT(REGEXP_REPLACE(COALESCE(m.phone, ''), '[^0-9]', '', 'g'), 10)), m.id)::int AS code_id,
+  SELECT m.id, m.code_id,
          m.site_id, m.full_name, m.phone, m.email, m.city, m.aadhar_no, m.pan_no,
          m.photo, m.occupation, m.father_name, m.created_at,
          m.member_type, m.member_type AS registration_role, m.member_type AS role,
@@ -827,15 +823,13 @@ const requireClientMember = async (user, id, db = pool) => {
 };
 
 export const getClient = asyncHandler(async (req, res) => {
-  // requireClientMember's checks inlined so code_id rides on the member read and the site
-  // gate overlaps memberReferral (whose result is only used once the gate has passed).
+  // Overlap the site check and referral lookup for the member.
   const memberId = Number(req.params.id);
   if (!Number.isInteger(memberId) || memberId <= 0) throw clientRegistryError('Enter a valid client ID');
-  const { rows: [row] } = await pool.query(`SELECT m.*, ${canonicalMemberIdSql()}::int AS code_id FROM members m WHERE m.id = $1`, [memberId]);
-  if (!row) throw clientRegistryError('Member not found', 404);
-  const { code_id: codeId, ...member } = row;
+  const { rows: [member] } = await pool.query('SELECT * FROM members WHERE id = $1', [memberId]);
+  if (!member) throw clientRegistryError('Member not found', 404);
   const [, agent] = await allInOrder([requireSiteAccess(req.user, member.site_id), memberReferral(member, pool)]);
-  res.json({ ...await withMemberPhoto(member), ...memberTypePayload(member), code_id:codeId || member.id, referred_by_name: agent?.name || null,
+  res.json({ ...await withMemberPhoto(member), ...memberTypePayload(member), referred_by_name: agent?.name || null,
     referred_by_code: agent?.referral_code || null, referral_agent_name: agent?.name || null,
     referral_code: agent?.referral_code || null });
 });

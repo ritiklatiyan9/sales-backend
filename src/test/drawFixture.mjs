@@ -5,11 +5,12 @@ import { migrateBookingWorkflow } from '../migrations/021_booking_workflow.js';
 import { migrateMemberCodeReferrals } from '../migrations/036_member_code_referrals.js';
 import { migrateDrawEnrollment } from '../migrations/031_draw_enrollment.js';
 import { migrateDealerTeams } from '../migrations/038_dealer_teams.js';
+import { migrateMemberCodeIds } from '../migrations/053_member_code_ids.js';
 
 export const TEST_BROKER_CODE = 'BRK-00900';
 
 /** Isolated PostgreSQL engine; never connects to the configured/live database. */
-export async function drawFixture({ broker = false } = {}) {
+export async function drawFixture({ broker = false, migrateCodes = true } = {}) {
   const db = new PGlite();
   const query = async (sql, values) => {
     const result = await db.query(sql, values);
@@ -24,7 +25,7 @@ export async function drawFixture({ broker = false } = {}) {
   pool.query = query;
   pool.connect = async () => client;
   await db.exec(`
-    CREATE TABLE sites (id SERIAL PRIMARY KEY, name TEXT, address TEXT, city TEXT, state TEXT);
+    CREATE TABLE sites (id SERIAL PRIMARY KEY, name TEXT, address TEXT, city TEXT, state TEXT, organization_id INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE application_settings (id SERIAL PRIMARY KEY, site_id INTEGER, setting_key TEXT, setting_value JSONB, updated_by INTEGER, updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(site_id,setting_key));
     CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, role TEXT, referral_code TEXT, is_active BOOLEAN DEFAULT true, can_login_booking BOOLEAN DEFAULT true, parent_user_id INTEGER, team_id INTEGER, phone TEXT, photo TEXT);
     CREATE TABLE team_members (team_id INTEGER, user_id INTEGER, is_head BOOLEAN);
@@ -78,6 +79,7 @@ export async function drawFixture({ broker = false } = {}) {
   await migrateMemberCodeReferrals(pool);
   await migrateDealerTeams(pool);
   await migrateDealerTeams(pool);
+  if (migrateCodes) await migrateMemberCodeIds(pool);
   // Draw enrollment requires a broker code; the fixed id keeps TEST_BROKER_CODE stable.
   if (broker) await db.exec(`INSERT INTO members (id, site_id, member_type, status, full_name, phone) VALUES (900, 1, 'BROKER', 'ACTIVE', 'Test Broker', '9000000900')`);
   return {
