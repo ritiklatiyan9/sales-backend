@@ -5,6 +5,26 @@ import MasterModel from './MasterModel.js';
 // ponytail: only a positive to_regclass answer is kept; the table is never dropped, so no invalidation.
 const websiteRequestsReady = new WeakMap();
 
+const WORKFLOW_BROKER_NAME_SQL = `COALESCE(NULLIF(BTRIM(draw_broker.full_name), ''), NULLIF(BTRIM(broker_member.full_name), ''),
+  NULLIF(BTRIM(registration_broker.name), ''), NULLIF(BTRIM(booking_broker.name), ''))`;
+const WORKFLOW_BROKER_JOINS_SQL = `
+  LEFT JOIN bookings b ON b.id = r.booking_id AND b.site_id = r.site_id
+  LEFT JOIN members broker_member ON broker_member.id = b.booking_agent_id AND broker_member.site_id = r.site_id
+  LEFT JOIN members draw_broker ON draw_broker.id = r.broker_member_id
+  LEFT JOIN users registration_broker ON registration_broker.id = r.agent_user_id
+  LEFT JOIN users booking_broker ON booking_broker.id = b.agent_user_id`;
+
+function drawListScope(siteId, visibleUserIds) {
+  const where = [];
+  const params = [];
+  if (siteId) { params.push(siteId); where.push(`r.site_id = $${params.length}`); }
+  if (Array.isArray(visibleUserIds)) {
+    params.push(visibleUserIds);
+    where.push(`(r.agent_user_id = ANY($${params.length}) OR r.created_by = ANY($${params.length}))`);
+  }
+  return { where, params };
+}
+
 class DrawModel extends MasterModel {
   constructor() {
     super('draw_registrations');
@@ -49,15 +69,13 @@ class DrawModel extends MasterModel {
   /** List with joined client/site/agent labels + paid rollup.
    * `visibleUserIds` (array | null) scopes rows to an agent's own network —
    * registrations they own (agent_user_id) or personally created (same rule as bookings). */
-  async list({ siteId, status, q, clientMemberId, visibleUserIds }, pool) {
-    const where = [];
-    const params = [];
-    if (siteId) { params.push(siteId); where.push(`r.site_id = $${params.length}`); }
+  async list({ siteId, status, q, clientMemberId, brokerIds, visibleUserIds }, pool) {
+    const { where, params } = drawListScope(siteId, visibleUserIds);
     if (status) { params.push(status); where.push(`r.status = $${params.length}`); }
     if (clientMemberId) { params.push(clientMemberId); where.push(`r.client_member_id = $${params.length}`); }
-    if (Array.isArray(visibleUserIds)) {
-      params.push(visibleUserIds);
-      where.push(`(r.agent_user_id = ANY($${params.length}) OR r.created_by = ANY($${params.length}))`);
+    if (brokerIds?.length) {
+      params.push(brokerIds);
+      where.push(`r.broker_id = ANY($${params.length}::int[])`);
     }
     if (q) {
       params.push(`%${q}%`);
@@ -90,10 +108,25 @@ class DrawModel extends MasterModel {
     return rows;
   }
 
+  async listBrokers({ siteId, visibleUserIds }, db) {
+    const { where, params } = drawListScope(siteId, visibleUserIds);
+    where.push('r.broker_id IS NOT NULL');
+    const { rows } = await db.query(`
+      SELECT r.broker_id AS id,
+             MIN(NULLIF(BTRIM(r.broker_code), '')) AS code,
+             MIN(NULLIF(BTRIM(bm.full_name), '')) AS name
+        FROM draw_registrations r
+        LEFT JOIN members bm ON bm.id = r.broker_member_id AND bm.site_id = r.site_id
+       WHERE ${where.join(' AND ')}
+       GROUP BY r.broker_id
+       ORDER BY name, id`, params);
+    return rows;
+  }
+
   /** Bounded workflow queue: scoped counts and one page, never all customer dossiers. */
   /**
    * Booking Payments queue. Filters (all optional): q, registration date range
-   * (IST), broker (code or name), scheme, kyc VERIFIED|PENDING, payment
+   * (IST), brokers (codes or names), scheme, kyc VERIFIED|PENDING, payment
    * PAID|PARTIAL|UNPAID, method DIRECT|WEBSITE; stage splits what remains. Stage
    * counts and totals respect every filter except stage. pageSize 'all' → up to
    * 5000 rows (statements).
@@ -123,18 +156,13 @@ class DrawModel extends MasterModel {
         r.draw_opening_date, r.booking_id, r.created_at, r.broker_code,
         (r.created_at AT TIME ZONE 'Asia/Kolkata')::date AS registered_on,
         ${bookingMethod} AS booking_method,
-        COALESCE(NULLIF(BTRIM(draw_broker.full_name), ''), NULLIF(BTRIM(broker_member.full_name), ''),
-          NULLIF(BTRIM(registration_broker.name), ''), NULLIF(BTRIM(booking_broker.name), '')) AS broker_name,
+        ${WORKFLOW_BROKER_NAME_SQL} AS broker_name,
         m.full_name AS client_name, m.phone AS client_phone,
         kyc.status AS kyc_status, COALESCE(pay.total_paid, 0) AS total_paid,
         ${WORKFLOW_STAGE_SQL} AS stage
       FROM draw_registrations r
       JOIN members m ON m.id = r.client_member_id
-      LEFT JOIN bookings b ON b.id = r.booking_id AND b.site_id = r.site_id
-      LEFT JOIN members broker_member ON broker_member.id = b.booking_agent_id AND broker_member.site_id = r.site_id
-      LEFT JOIN members draw_broker ON draw_broker.id = r.broker_member_id
-      LEFT JOIN users registration_broker ON registration_broker.id = r.agent_user_id
-      LEFT JOIN users booking_broker ON booking_broker.id = b.agent_user_id
+      ${WORKFLOW_BROKER_JOINS_SQL}
       LEFT JOIN LATERAL (${this.kycCaseLateral}) kyc ON true
       LEFT JOIN LATERAL (SELECT SUM(amount) AS total_paid FROM draw_payments WHERE draw_registration_id = r.id) pay ON true
       WHERE ${where.join(' AND ')}
@@ -144,7 +172,7 @@ class DrawModel extends MasterModel {
     const add = (value, sql) => { params.push(value); scoped.push(sql.replaceAll('$?', `$${params.length}`)); };
     if (filters.date_from) add(filters.date_from, 'registered_on >= $?::date');
     if (filters.date_to) add(filters.date_to, 'registered_on <= $?::date');
-    if (filters.broker) add(filters.broker, 'COALESCE(broker_code, broker_name) = $?');
+    if (filters.brokers?.length) add(filters.brokers, 'COALESCE(broker_code, broker_name) = ANY($?::text[])');
     if (filters.scheme) add(filters.scheme, "upper(regexp_replace(btrim(COALESCE(scheme_name, '')), '\\s+', ' ', 'g')) = upper($?)");
     if (filters.method) add(filters.method, 'booking_method = $?');
     if (filters.kyc === 'VERIFIED') scoped.push("kyc_status = 'VERIFIED'");
@@ -169,7 +197,12 @@ class DrawModel extends MasterModel {
         'required_amount', COALESCE(SUM(required_amount), 0)) FROM filtered WHERE stage <> 'CANCELLED') AS totals,
       (SELECT COALESCE(json_object_agg(stage, count), '{}'::json) FROM (SELECT stage, count(*)::int FROM scoped GROUP BY stage) counts) AS counts,
       (SELECT json_build_object(
-        'brokers', COALESCE((SELECT json_agg(b ORDER BY b->>'name') FROM (SELECT DISTINCT jsonb_build_object('value', COALESCE(broker_code, broker_name), 'name', broker_name, 'code', broker_code) AS b FROM queue WHERE broker_name IS NOT NULL) x), '[]'::json),
+        'brokers', COALESCE((SELECT json_agg(b ORDER BY b->>'name', b->>'value') FROM (
+          SELECT jsonb_build_object('value', COALESCE(broker_code, broker_name), 'name', MIN(broker_name), 'code', MIN(broker_code)) AS b
+          FROM queue
+          WHERE COALESCE(broker_code, broker_name) IS NOT NULL
+          GROUP BY COALESCE(broker_code, broker_name)
+        ) x), '[]'::json),
         'schemes', COALESCE((SELECT json_agg(DISTINCT scheme_name ORDER BY scheme_name) FROM queue WHERE scheme_name IS NOT NULL), '[]'::json)
       )) AS options`, values);
     return { ...rows[0], page, page_size: limit };
@@ -187,18 +220,18 @@ class DrawModel extends MasterModel {
     if (q) add(`%${q.slice(0, 100)}%`, '(m.full_name ILIKE $? OR m.phone ILIKE $? OR r.registration_no ILIKE $? OR r.slip_no ILIKE $? OR dp.receipt_no ILIKE $?)');
     if (filters.date_from) add(filters.date_from, 'dp.payment_date >= $?::date');
     if (filters.date_to) add(filters.date_to, 'dp.payment_date <= $?::date');
-    if (filters.broker) add(filters.broker, 'COALESCE(r.broker_code, broker.full_name) = $?');
+    if (filters.brokers?.length) add(filters.brokers, `COALESCE(r.broker_code, ${WORKFLOW_BROKER_NAME_SQL}) = ANY($?::text[])`);
     if (filters.scheme) add(filters.scheme, "upper(regexp_replace(btrim(COALESCE(r.scheme_name, '')), '\\s+', ' ', 'g')) = upper($?)");
     if (filters.mode === 'CASH') where.push("upper(COALESCE(dp.payment_from, 'CASH')) = 'CASH'");
     if (filters.mode === 'BANK') where.push("upper(COALESCE(dp.payment_from, 'CASH')) <> 'CASH'");
     const { rows } = await db.query(`
       SELECT dp.id, dp.receipt_no, dp.payment_date, dp.amount::float AS amount, dp.payment_from, dp.bank_name,
              dp.bank_details, dp.cheque_no, dp.narration, r.registration_no, r.slip_no, r.scheme_name,
-             r.broker_code, broker.full_name AS broker_name, m.full_name AS client_name, m.phone AS client_phone
+             r.broker_code, ${WORKFLOW_BROKER_NAME_SQL} AS broker_name, m.full_name AS client_name, m.phone AS client_phone
         FROM draw_payments dp
         JOIN draw_registrations r ON r.id = dp.draw_registration_id
         JOIN members m ON m.id = r.client_member_id
-        LEFT JOIN members broker ON broker.id = r.broker_member_id
+        ${WORKFLOW_BROKER_JOINS_SQL}
        WHERE ${where.join(' AND ')}
        ORDER BY dp.payment_date ASC, dp.id ASC
        LIMIT 5000`, params);

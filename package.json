@@ -34,7 +34,7 @@
     "migrate:draw-kyc-backfill": "node src/migrations/022_backfill_draw_kyc_cases.js",
     "migrate:document-settings": "node src/migrations/023_document_settings.js",
     "test:document-settings": "node --test src/services/documentSettings.test.mjs",
-    "test:booking-workflow": "node --test src/services/drawWorkflow.test.mjs src/services/drawInstallmentPlan.test.mjs src/controllers/drawWorkflow.controller.test.mjs src/controllers/drawCollectionsDelete.controller.test.mjs src/models/Draw.bookingMethod.test.mjs src/models/Draw.consultant.test.mjs",
+    "test:booking-workflow": "node --test src/services/drawWorkflow.test.mjs src/services/drawInstallmentPlan.test.mjs src/controllers/drawWorkflow.controller.test.mjs src/controllers/drawBrokers.controller.test.mjs src/controllers/drawCollectionsDelete.controller.test.mjs src/models/Draw.bookingMethod.test.mjs src/models/Draw.consultant.test.mjs",
     "migrate:booking-first-installment": "node src/migrations/024_booking_first_installment.js",
     "test:booking-draw-credits": "node --test src/controllers/bookingDrawCredits.test.mjs",
     "migrate:form-studio-attendance": "node src/migrations/025_form_studio_attendance.js",

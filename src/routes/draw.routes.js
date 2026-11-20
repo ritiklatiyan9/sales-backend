@@ -2,7 +2,7 @@ import { subAdminPermission } from '../middlewares/subAdminPermission.middleware
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
-  listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
+  listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, listDrawBrokers, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
   issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
   getDrawSettingsHandler, setDrawSettings, saveApplicationSignatures, getApplicationSigningContext,
 } from '../controllers/draw.controller.js';
@@ -14,6 +14,7 @@ router.get('/', subAdminPermission("booking_draws", 'can_read'), listDraws);
 router.post('/', subAdminPermission("booking_draws", 'can_write'), createDraw);
 // NB: fixed paths must be registered before '/:id' so they aren't parsed as ids.
 router.post('/scan', subAdminPermission("booking_draws", 'can_read'), scanDraw);
+router.get('/brokers', subAdminPermission("booking_draws", 'can_read'), listDrawBrokers);
 router.get('/workflow', subAdminPermission("booking_draws", 'can_read'), listWorkflow);
 router.get('/payments-statement', subAdminPermission("booking_draws", 'can_read'), paymentStatement);
 router.post('/:id/start-kyc', subAdminPermission("booking_draws", 'can_update'), startDrawKyc);

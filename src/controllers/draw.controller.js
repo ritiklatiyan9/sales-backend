@@ -1,6 +1,6 @@
 import { applicationSigningContext } from '../services/applicationFormSnapshot.js';
 import { resolvePaymentCollector } from '../services/paymentCollector.js';
-import { resolveDrawBroker } from '../services/dealerTeams.js';
+import { brokerCode, resolveDrawBroker } from '../services/dealerTeams.js';
 import { ensureBookingCreditFields } from '../services/bookingDrawCredits.js';
 import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import crypto from 'crypto';
@@ -421,17 +421,29 @@ export const createDraw = asyncHandler(async (req, res) => {
   res.status(201).json(detail);
 });
 
-/** GET /draws?site_id=&status=&q=&client_member_id= — network-scoped like bookings. */
+/** GET /draws?site_id=&status=&q=&client_member_id=&broker_ids=1,2 — network-scoped like bookings. */
 export const listDraws = asyncHandler(async (req, res) => {
-  const { site_id, status, q, client_member_id } = req.query;
+  const { site_id, status, q, client_member_id, broker_ids } = req.query;
+  if (broker_ids !== undefined && typeof broker_ids !== 'string') throw workflowError('Invalid broker filter');
+  const brokerIds = broker_ids ? broker_ids.split(',').map(Number) : [];
+  if (brokerIds.some((id) => !Number.isInteger(id) || id < 1 || id > 2147483647)) throw workflowError('Invalid broker filter');
+  const siteId = brokerIds.length ? (await requireSiteAccess(req.user, site_id)).id : site_id;
   const visibleUserIds = await getVisibleUserIds(req.user); // null = unrestricted
   const rows = await drawModel.list(
-    { siteId: site_id, status, q, clientMemberId: client_member_id, visibleUserIds },
+    { siteId, status, q, clientMemberId: client_member_id, brokerIds, visibleUserIds },
     pool
   );
   // Member photos live in a private bucket; the raw URL 403s in <img>.
   await Promise.all(rows.map(async (r) => { if (r.client_photo) r.client_photo = await signMemberDocumentUrl(r.client_photo); }));
   res.json(rows);
+});
+
+/** GET /draws/brokers?site_id= — brokers with visible registrations at this site. */
+export const listDrawBrokers = asyncHandler(async (req, res) => {
+  const { id: siteId } = await requireSiteAccess(req.user, req.query.site_id);
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  const rows = await drawModel.listBrokers({ siteId, visibleUserIds }, pool);
+  res.json(rows.map((row) => ({ ...row, code: row.code || brokerCode(row.id) })));
 });
 
 /** GET /draws/:id — registration + Draw Payment Ledger + audit events + rollups. */
@@ -1198,8 +1210,12 @@ function workflowFilters(query) {
     return value;
   };
   const text = (key) => (query[key] ? String(query[key]).trim().slice(0, 150) || undefined : undefined);
+  const broker = query.broker ?? [];
+  const brokerValues = Array.isArray(broker) ? broker : [broker];
+  if (brokerValues.some((value) => typeof value !== 'string')) throw workflowError('Invalid broker filter');
   return {
-    date_from: date('date_from'), date_to: date('date_to'), broker: text('broker'), scheme: text('scheme'),
+    date_from: date('date_from'), date_to: date('date_to'), scheme: text('scheme'),
+    brokers: [...new Set(brokerValues.map((value) => value.trim()).filter(Boolean))],
     kyc: oneOf('kyc', ['VERIFIED', 'PENDING']), payment: oneOf('payment', ['PAID', 'PARTIAL', 'UNPAID']),
     method: oneOf('method', ['DIRECT', 'WEBSITE']), mode: oneOf('mode', ['CASH', 'BANK']),
   };
