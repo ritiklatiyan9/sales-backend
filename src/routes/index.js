@@ -31,7 +31,11 @@ import { publicVerifyLimit } from '../middlewares/rateLimit.middleware.js';
 
 const router = express.Router();
 
-router.get('/health', (req, res) => res.json({ status: 'ok', service: 'booking-api' }));
+router.get('/health', (_req, res) => {
+  const revision = process.env.RENDER_GIT_COMMIT;
+  if (/^[a-f0-9]{40}$/i.test(revision || '')) res.set('X-Booking-Revision', revision);
+  res.json({ status: 'ok', service: 'booking-api' });
+});
 // Dedicated client realm: mount before the catch-all staff lookup middleware.
 router.use('/api/mobile', mobilePortalRoutes);
 router.use('/api/broker-mobile', brokerMobileRoutes);

@@ -2,7 +2,7 @@ import { subAdminPermission } from '../middlewares/subAdminPermission.middleware
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
-  listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, listDrawBrokers, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
+  listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, listDrawBrokers, getDraw, updateDraw, addDrawPayment, updateDrawPayment, deleteDrawPayment,
   issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
   getDrawSettingsHandler, setDrawSettings, saveApplicationSignatures, getApplicationSigningContext,
 } from '../controllers/draw.controller.js';
@@ -26,6 +26,7 @@ router.put('/:id/signatures', subAdminPermission("booking_draws", 'can_update'),
 router.patch('/:id', subAdminPermission("booking_draws", 'can_update'), updateDraw);
 router.delete('/:id', subAdminPermission("booking_draws", 'can_delete'), deleteDraw);
 router.post('/:id/payments', subAdminPermission("booking_draws", 'can_write'), addDrawPayment);
+router.patch('/:id/payments/:paymentId', subAdminPermission("booking_draws", 'can_update'), updateDrawPayment);
 router.delete('/:id/payments/:paymentId', subAdminPermission("booking_draws", 'can_delete'), deleteDrawPayment);
 router.post('/:id/issue-slip', subAdminPermission("booking_draws", 'can_update'), issueSlip);
 router.post('/:id/winner', subAdminPermission("booking_draws", 'can_update'), markWinner);
