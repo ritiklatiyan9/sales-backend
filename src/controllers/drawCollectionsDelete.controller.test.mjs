@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawFixture } from '../test/drawFixture.mjs';
 import { migrateFormStudioAttendance } from '../migrations/025_form_studio_attendance.js';
-import { deleteDraw } from './draw.controller.js';
+import { deleteDraw, deleteDrawPayment } from './draw.controller.js';
 
 const admin={id:1,role:'admin'};
 const call=(id,{user=admin,withPayments=false}={})=>new Promise(resolve=>{
@@ -65,6 +65,36 @@ test('collection entry deletion respects site, receipts, issued slips and Accoun
       assert.match(result.data.message,/Accounting/);
       assert.equal(await exists(id),1);
       assert.equal((await fixture.query('SELECT count(*)::int AS n FROM draw_payments WHERE draw_registration_id=$1',[id])).rows[0].n,1);
+    });
+    await t.test('individual receipt deletion updates totals and eligibility and preserves an issued slip', async () => {
+      const { rows: [draw] } = await fixture.query(`INSERT INTO draw_registrations
+        (site_id,client_member_id,status,qr_token,registration_no,slip_no,required_amount)
+        VALUES(1,$1,'SLIP_ISSUED','receipt-deletion-fixture','REG-001','SLIP-001',500.10) RETURNING id`, [member]);
+      const { rows: [first, second] } = await fixture.query(`INSERT INTO draw_payments(draw_registration_id,receipt_no,amount)
+        VALUES($1,'RECEIPT-001',40.20),($1,'RECEIPT-002',500.10) RETURNING id`, [draw.id]);
+      const remove = (paymentId, user = admin) => new Promise(resolve => {
+        const res = { statusCode: 200, status(code) { this.statusCode = code; return this; },
+          json(data) { resolve({ status: this.statusCode, data }); } };
+        deleteDrawPayment({ user, params: { id: draw.id, paymentId } }, res,
+          error => resolve({ status: error.status || 500, data: { message: error.message } }));
+      });
+      assert.equal((await remove(first.id,{id:2,role:'agent'})).status,403);
+      assert.equal((await remove(first.id,{id:3,role:'sub_admin'})).status,403);
+      assert.match((await remove(second.id)).data.message,/below the minimum for the issued slip/);
+      const afterFirst = await remove(first.id);
+      assert.equal(afterFirst.status,200);
+      assert.equal(afterFirst.data.total_paid,500.10);
+      assert.equal(afterFirst.data.slip_no,'SLIP-001');
+      assert.deepEqual(afterFirst.data.payments.map(payment => payment.id),[second.id]);
+      assert.equal((await remove(first.id)).status,404);
+
+      await fixture.query("UPDATE draw_registrations SET status='ELIGIBLE',slip_no=NULL WHERE id=$1",[draw.id]);
+      const afterSecond = await remove(second.id);
+      assert.equal(afterSecond.status,200);
+      assert.equal(afterSecond.data.status,'REGISTERED');
+      assert.equal(afterSecond.data.total_paid,0);
+      assert.equal(afterSecond.data.balance_due,500.10);
+      assert.equal(afterSecond.data.events.find(event => event.event_type === 'PAYMENT_DELETED').detail.receipt_no,'RECEIPT-001');
     });
   } finally {await fixture.close();}
 });

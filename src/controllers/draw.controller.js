@@ -570,56 +570,88 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
   res.status(201).json(detail);
 });
 
-/** DELETE /draws/:id/payments/:paymentId — ledger correction. Admin only. */
+/** DELETE /draws/:id/payments/:paymentId — remove one receipt and its pending Accounting entry. */
 export const deleteDrawPayment = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
     return res.status(403).json({ message: 'Only admins can remove ledger entries' });
   }
+  const registrationId = Number(req.params.id);
+  const paymentId = Number(req.params.paymentId);
+  if (![registrationId, paymentId].every(id => Number.isInteger(id) && id > 0 && id <= 2147483647)) {
+    throw workflowError('A valid draw registration and receipt are required.');
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows: regRows } = await client.query(
-      'SELECT * FROM draw_registrations WHERE id = $1 FOR UPDATE',
-      [req.params.id]
+    const { rows: [registration] } = await client.query(
+      'SELECT id, site_id, status, required_amount FROM draw_registrations WHERE id = $1 FOR UPDATE',
+      [registrationId]
     );
-    const registration = regRows[0];
-    if (!registration) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Draw registration not found' });
-    }
-    if (['ALLOTTED', 'CANCELLED'].includes(registration.status)) throw workflowError('This ledger is closed. Correct an allotted payment in Accounting.', 409);
-    const { rows: deleted } = await client.query(
-      'DELETE FROM draw_payments WHERE id = $1 AND draw_registration_id = $2 RETURNING id, amount',
-      [req.params.paymentId, registration.id]
-    );
-    if (!deleted[0]) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Payment not found on this registration' });
+    if (!registration) throw workflowError('Draw registration not found.', 404);
+    await requireSiteAccess(req.user, registration.site_id, client);
+    if (['ALLOTTED', 'CANCELLED'].includes(registration.status)) {
+      throw workflowError('This draw ledger is closed. Review the receipt in Accounting.', 409);
     }
 
-    // Past the slip stage the entry is already in (or through) the lottery — never
-    // let a ledger correction silently strand an ineligible slip in the draw pool.
+    const { rows: [payment] } = await client.query(
+      'SELECT id, receipt_no, amount, plot_payment_id FROM draw_payments WHERE id = $1 AND draw_registration_id = $2 FOR UPDATE',
+      [paymentId, registrationId]
+    );
+    if (!payment) throw workflowError('Payment not found on this registration.', 404);
+    if (payment.plot_payment_id !== null) {
+      throw workflowError('This payment was transferred to a plot. Correct it in Accounting.', 409);
+    }
+
+    // An issued slip requires the remaining receipts to cover the draw amount.
     if (!['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
-      const remaining = await drawModel.getTotalPaid(registration.id, client);
-      if (remaining < Number(registration.required_amount || 0)) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          message: `Removing this entry would drop the ledger below the required amount while the slip is already issued (status ${registration.status}). Cancel the registration instead.`,
-        });
+      const paid = await drawModel.getTotalPaid(registrationId, client);
+      const remainingPaise = Math.round(paid * 100) - Math.round(Number(payment.amount) * 100);
+      if (remainingPaise < Math.round(Number(registration.required_amount || 0) * 100)) {
+        throw workflowError('Deleting this receipt would take the payment total below the minimum for the issued slip. Cancel the registration first.', 409);
       }
     }
 
-    await drawModel.logEvent(registration.id, 'PAYMENT_DELETED', { amount: Number(deleted[0].amount), payment_id: deleted[0].id }, req.user?.id, client);
+    const { rows: [accounting] } = await client.query(`
+      SELECT set_config('app.current_user_id', $1, true),
+        to_regprocedure('delete_draw_payment_with_accounting(integer,integer,integer)') IS NOT NULL AS can_delete,
+        to_regclass('pool_money_receipts') IS NOT NULL AS has_pool_money
+    `, [String(req.user.id)]);
+    if (accounting.can_delete) {
+      const { rows: [{ deleted }] } = await client.query(
+        'SELECT delete_draw_payment_with_accounting($1, $2, $3) AS deleted',
+        [registrationId, paymentId, req.user.id]
+      );
+      if (!deleted) throw workflowError('Payment not found on this registration.', 404);
+    } else {
+      if (accounting.has_pool_money) {
+        const { rows: [linked] } = await client.query(
+          "SELECT 1 FROM pool_money_receipts WHERE source_kind = 'draw' AND source_id = $1",
+          [paymentId]
+        );
+        if (linked) throw workflowError('Accounting must be updated before this receipt can be deleted here.', 409);
+      }
+      await client.query('DELETE FROM draw_payments WHERE id = $1 AND draw_registration_id = $2', [paymentId, registrationId]);
+    }
+
+    await drawModel.logEvent(registrationId, 'PAYMENT_DELETED', {
+      amount: Number(payment.amount), payment_id: payment.id, receipt_no: payment.receipt_no,
+    }, req.user.id, client);
     await reconcileEligibility(registration, req.user?.id, client);
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.constraint === 'draw_payment_delete_conflict' || err.constraint === 'loyalty_vault_holder_funds') {
+      throw workflowError(err.message, 409);
+    }
+    if (err.code === '23503') {
+      throw workflowError('This receipt is linked to another record. Review it in Accounting before deleting it.', 409);
+    }
     throw err;
   } finally {
     client.release();
   }
 
-  const detail = await buildDetail(req.params.id, pool);
+  const detail = await buildDetail(registrationId, pool);
   res.json(detail);
 });
 
