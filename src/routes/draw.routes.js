@@ -2,8 +2,8 @@ import { subAdminPermission } from '../middlewares/subAdminPermission.middleware
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
-  listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, listDrawBrokers, getDraw, updateDraw, addDrawPayment, deleteDrawPayment,
-  issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
+  listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, listDrawBrokers, getDraw, updateDraw, addDrawPayment, updateDrawPayment, deleteDrawPayment,
+  overrideDrawEligibility, issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
   getDrawSettingsHandler, setDrawSettings, saveApplicationSignatures, getApplicationSigningContext,
 } from '../controllers/draw.controller.js';
 
@@ -24,8 +24,10 @@ router.get('/:id', subAdminPermission("booking_draws", 'can_read'), getDraw);
 router.get('/:id/signing-context', subAdminPermission("booking_draws", 'can_read'), getApplicationSigningContext);
 router.put('/:id/signatures', subAdminPermission("booking_draws", 'can_update'), saveApplicationSignatures);
 router.patch('/:id', subAdminPermission("booking_draws", 'can_update'), updateDraw);
+router.post('/:id/eligibility-override', subAdminPermission("booking_draws", 'can_update'), overrideDrawEligibility);
 router.delete('/:id', subAdminPermission("booking_draws", 'can_delete'), deleteDraw);
 router.post('/:id/payments', subAdminPermission("booking_draws", 'can_write'), addDrawPayment);
+router.patch('/:id/payments/:paymentId', subAdminPermission("booking_draws", 'can_update'), updateDrawPayment);
 router.delete('/:id/payments/:paymentId', subAdminPermission("booking_draws", 'can_delete'), deleteDrawPayment);
 router.post('/:id/issue-slip', subAdminPermission("booking_draws", 'can_update'), issueSlip);
 router.post('/:id/winner', subAdminPermission("booking_draws", 'can_update'), markWinner);

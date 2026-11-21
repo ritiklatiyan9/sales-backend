@@ -99,9 +99,22 @@ export function validatePayment(body) {
     );
   return amount;
 }
+
+export const ELIGIBILITY_OVERRIDE_EVENT = 'ELIGIBILITY_OVERRIDDEN';
+
+export const eligibilityOverrideExists = (registrationIdSql) => `EXISTS (
+  SELECT 1 FROM draw_events e
+  WHERE e.draw_registration_id = ${registrationIdSql} AND e.event_type = '${ELIGIBILITY_OVERRIDE_EVENT}'
+)`;
+
+export function isDrawEligible(registration, total, overridden = false) {
+  const required = Number(registration.required_amount);
+  return overridden || (required > 0 && total >= required);
+}
+
 export function validateWinner(
   registration,
-  { total, kycStatus, slipNumber, now = new Date() },
+  { total, overridden, kycStatus, slipNumber, now = new Date() },
 ) {
   if (registration.status !== 'SLIP_ISSUED')
     throw workflowError('Only an issued draw slip can be selected', 409);
@@ -126,10 +139,7 @@ export function validateWinner(
       'KYC must still be verified before recording a draw result',
       409,
     );
-  if (
-    Number(registration.required_amount) <= 0 ||
-    total < Number(registration.required_amount)
-  )
+  if (!isDrawEligible(registration, total, overridden))
     throw workflowError('The booking amount is not fully paid', 409);
 }
 
@@ -138,6 +148,7 @@ export const WORKFLOW_STAGE_SQL = `CASE
   WHEN r.status = 'ALLOTTED' THEN 'BOOKED'
   WHEN r.status = 'WINNER' THEN 'ALLOTMENT'
   WHEN r.slip_no IS NOT NULL THEN 'DRAW'
-  WHEN COALESCE(pay.total_paid, 0) < r.required_amount OR r.required_amount <= 0 THEN 'PAYMENT'
+  WHEN (COALESCE(pay.total_paid, 0) < r.required_amount OR r.required_amount <= 0)
+    AND NOT ${eligibilityOverrideExists('r.id')} THEN 'PAYMENT'
   WHEN COALESCE(kyc.status, '') <> 'VERIFIED' THEN 'KYC'
   ELSE 'DOCUMENTS' END`;

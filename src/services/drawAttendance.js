@@ -5,8 +5,10 @@ import { isFullAdmin } from './subAdminPermissions.js';
 
 const dateOnly = value => value instanceof Date ? value.toISOString().slice(0,10) : String(value).slice(0,10);
 export const ATTENDANCE_MODULE = 'booking_draw_attendance';
+const CORRECTION_EMAIL = 'meritiklatiyan@gmail.com';
 // Tokens that belong on a draw-day roster (alias r = draw_registrations).
 export const ISSUED_TOKEN = `r.slip_no IS NOT NULL AND r.status IN ('SLIP_ISSUED','WINNER','ALLOTTED')`;
+export const isAttendanceCorrectionAccount = user => user?.email?.toLowerCase() === CORRECTION_EMAIL;
 export function attendanceDate(value) {
   if (!validDate(value)) throw workflowError('Select a valid draw date');
   return value;
@@ -25,32 +27,39 @@ export function attendanceToken(value) {
 }
 
 export async function checkInDraw({ user, siteId, date, token, now = new Date() }, db = pool) {
-  await requireWorkspaceAccess(user, siteId, ATTENDANCE_MODULE, 'can_write', db);
+  const site = await requireWorkspaceAccess(user, siteId, ATTENDANCE_MODULE, 'can_write', db);
   attendanceDate(date);
   if (date !== todayIST(now)) throw workflowError('Attendance can only be marked on the draw day (India time)', 409);
   const code = attendanceToken(token);
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const { rows } = await client.query(`SELECT id,slip_no,draw_opening_date,status FROM draw_registrations WHERE site_id=$1 AND (qr_token=$2 OR upper(slip_no)=$3) FOR UPDATE`, [siteId,code,code.toUpperCase()]);
+    const { rows } = await client.query(`SELECT r.id,r.registration_no,r.slip_no,r.draw_opening_date,r.status,
+      m.full_name AS client_name,m.phone AS client_phone,m.photo AS client_photo
+      FROM draw_registrations r JOIN members m ON m.id=r.client_member_id
+      WHERE r.site_id=$1 AND (r.qr_token=$2 OR upper(r.slip_no)=$3) FOR UPDATE OF r`, [site.id,code,code.toUpperCase()]);
     const draw = rows[0];
     if (!draw) throw workflowError('No issued token matches this site. Check the token and selected project.', 404);
-    if (!draw.slip_no || !['SLIP_ISSUED','WINNER','ALLOTTED'].includes(draw.status)) throw workflowError('This token is cancelled or has not been issued',409);
-    if (dateOnly(draw.draw_opening_date) !== date) throw workflowError(draw.draw_opening_date ? `This token is for the ${dateOnly(draw.draw_opening_date)} draw, not today's` : 'This token has no draw date yet', 409);
-    const saved = await client.query(`INSERT INTO draw_attendance(draw_registration_id,attendance_date,checked_in_by) VALUES($1,$2,$3)
+    const { status, draw_opening_date, ...registration } = draw;
+    if (!registration.slip_no || !['SLIP_ISSUED','WINNER','ALLOTTED'].includes(status)) throw workflowError('This token is cancelled or has not been issued',409);
+    if (dateOnly(draw_opening_date) !== date) throw workflowError(draw_opening_date ? `This token is for the ${dateOnly(draw_opening_date)} draw, not today's` : 'This token has no draw date yet', 409);
+    const saved = await client.query(`WITH checked_in AS (
+      INSERT INTO draw_attendance(draw_registration_id,attendance_date,checked_in_by) VALUES($1,$2,$3)
       ON CONFLICT(draw_registration_id,attendance_date) DO UPDATE SET present=true,checked_in_at=now(),checked_in_by=EXCLUDED.checked_in_by,updated_at=now()
-      WHERE draw_attendance.present=false RETURNING *`, [draw.id,date,user.id]);
+      WHERE draw_attendance.present=false RETURNING *
+    ), logged AS (
+      INSERT INTO draw_attendance_events(attendance_id,action,actor_id) SELECT id,'CHECKED_IN',checked_in_by FROM checked_in
+    ) SELECT * FROM checked_in`, [registration.id,date,user.id]);
     const already_present = !saved.rows.length;
-    const attendance = saved.rows[0] || (await client.query('SELECT * FROM draw_attendance WHERE draw_registration_id=$1 AND attendance_date=$2',[draw.id,date])).rows[0];
-    if (!already_present) await client.query("INSERT INTO draw_attendance_events(attendance_id,action,actor_id) VALUES($1,'CHECKED_IN',$2)", [attendance.id,user.id]);
-    const person = (await client.query(`SELECT r.id,r.registration_no,r.slip_no,m.full_name AS client_name,m.phone AS client_phone,m.photo AS client_photo FROM draw_registrations r JOIN members m ON m.id=r.client_member_id WHERE r.id=$1`,[draw.id])).rows[0];
+    const attendance = saved.rows[0] || (await client.query('SELECT * FROM draw_attendance WHERE draw_registration_id=$1 AND attendance_date=$2',[registration.id,date])).rows[0];
     await client.query('COMMIT');
-    return { already_present, attendance, registration:person };
+    return { already_present, attendance, registration };
   } catch (error) { await client.query('ROLLBACK'); throw error; }
   finally { client.release(); }
 }
 
 export async function correctAttendance({ user, siteId, id, reason, now = new Date() }, db = pool) {
+  if (!isAttendanceCorrectionAccount(user)) throw workflowError('This account cannot correct draw attendance', 403);
   await requireWorkspaceAccess(user, siteId, ATTENDANCE_MODULE, 'can_update', db);
   if (typeof reason !== 'string' || !reason.trim() || reason.length > 300) throw workflowError('Give a correction reason (up to 300 characters)');
   const client = await db.connect();

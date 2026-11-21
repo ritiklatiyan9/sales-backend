@@ -2,12 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawFixture } from '../test/drawFixture.mjs';
 import { migrateFormStudioAttendance } from '../migrations/025_form_studio_attendance.js';
-import { deleteDraw, deleteDrawPayment } from './draw.controller.js';
+import { deleteDraw, deleteDrawPayment, updateDraw, updateDrawPayment } from './draw.controller.js';
 
 const admin={id:1,role:'admin'};
 const call=(id,{user=admin,withPayments=false}={})=>new Promise(resolve=>{
   const res={statusCode:200,status(code){this.statusCode=code;return this;},json(data){resolve({status:this.statusCode,data});}};
   deleteDraw({user,params:{id},query:withPayments?{with_payments:'true'}:{}},res,error=>resolve({status:error.status||500,data:{message:error.message}}));
+});
+const update=(handler,params,body,user=admin)=>new Promise(resolve=>{
+  const res={statusCode:200,status(code){this.statusCode=code;return this;},json(data){resolve({status:this.statusCode,data});}};
+  handler({user,params,body},res,error=>resolve({status:error.status||500,data:{message:error.message}}));
 });
 
 test('collection entry deletion respects site, receipts, issued slips and Accounting on isolated PostgreSQL',async t=>{
@@ -95,6 +99,71 @@ test('collection entry deletion respects site, receipts, issued slips and Accoun
       assert.equal(afterSecond.data.total_paid,0);
       assert.equal(afterSecond.data.balance_due,500.10);
       assert.equal(afterSecond.data.events.find(event => event.event_type === 'PAYMENT_DELETED').detail.receipt_no,'RECEIPT-001');
+    });
+    await t.test('assigned sub-admins can edit draw details while required amounts stay restricted',async()=>{
+      const id=await entry();
+      const sales={id:2,role:'sub_admin'};
+      assert.equal((await update(updateDraw,{id},{notes:'outside site'},{id:3,role:'sub_admin'})).status,403);
+      assert.equal((await update(updateDraw,{id},{required_amount:1000},sales)).status,403);
+      const result=await update(updateDraw,{id},{notes:'Updated registration'},sales);
+      assert.equal(result.status,200);
+      assert.equal(result.data.notes,'Updated registration');
+      assert.equal(Number(result.data.required_amount),500);
+    });
+    await t.test('receipt edits recompute totals and preserve the receipt number and actor history',async()=>{
+      const id=await entry({status:'ELIGIBLE',paid:500});
+      const { rows:[payment] }=await fixture.query('SELECT id,receipt_no FROM draw_payments WHERE draw_registration_id=$1',[id]);
+      const params={id,paymentId:payment.id};
+      const body={amount:245.50,payment_from:'UPI',bank_account_id:1,bank_details:'TRX-245',narration:'Corrected amount'};
+      assert.equal((await update(updateDrawPayment,params,body,{id:3,role:'sub_admin'})).status,403);
+      assert.equal((await update(updateDrawPayment,params,{...body,bank_account_id:2})).status,409);
+      const result=await update(updateDrawPayment,params,body);
+      assert.equal(result.status,200);
+      assert.equal(result.data.status,'REGISTERED');
+      assert.equal(result.data.total_paid,245.50);
+      assert.equal(result.data.balance_due,254.50);
+      assert.equal(result.data.payments[0].receipt_no,payment.receipt_no);
+      assert.equal(result.data.payments[0].bank_name,'ICICI BANK');
+      assert.equal(result.data.events.find(event=>event.event_type==='PAYMENT_UPDATED').detail.after.amount,245.50);
+      const retry=await update(updateDrawPayment,params,body);
+      assert.equal(retry.status,200);
+      assert.equal(retry.data.events.filter(event=>event.event_type==='PAYMENT_UPDATED').length,1);
+    });
+    await t.test('paid registration deletion uses the Accounting bridge and rolls back on a protected receipt',async()=>{
+      await fixture.db.exec(`
+        CREATE TABLE pool_money_receipts (source_kind text NOT NULL,source_id integer NOT NULL,posted boolean NOT NULL DEFAULT false);
+        CREATE FUNCTION test_guard_draw_payment() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF EXISTS(SELECT 1 FROM pool_money_receipts WHERE source_kind='draw' AND source_id=OLD.id) THEN
+              RAISE EXCEPTION 'A draw receipt has a live Accounting projection';
+            END IF;
+            RETURN OLD;
+          END $$;
+        CREATE TRIGGER test_guard BEFORE DELETE ON draw_payments FOR EACH ROW EXECUTE FUNCTION test_guard_draw_payment();
+        CREATE FUNCTION delete_draw_payment_with_accounting(registration_id integer,payment_id integer,actor_id integer) RETURNS boolean LANGUAGE plpgsql AS $$
+          BEGIN
+            IF EXISTS(SELECT 1 FROM pool_money_receipts WHERE source_kind='draw' AND source_id=payment_id AND posted) THEN
+              RAISE EXCEPTION 'This receipt has already been processed in Accounting' USING ERRCODE='23514',CONSTRAINT='draw_payment_delete_conflict';
+            END IF;
+            DELETE FROM pool_money_receipts WHERE source_kind='draw' AND source_id=payment_id;
+            DELETE FROM draw_payments WHERE draw_registration_id=registration_id AND id=payment_id;
+            RETURN FOUND;
+          END $$;
+      `);
+      const id=await entry({status:'ELIGIBLE',paid:500});
+      await fixture.query("INSERT INTO draw_payments(draw_registration_id,receipt_no,amount) VALUES($1,'ADDITIONAL-PENDING',100)",[id]);
+      await fixture.query("INSERT INTO pool_money_receipts(source_kind,source_id,posted) SELECT 'draw',id,receipt_no='ADDITIONAL-PENDING' FROM draw_payments WHERE draw_registration_id=$1",[id]);
+      const countLinks=async()=>(await fixture.query('SELECT count(*)::int AS n FROM pool_money_receipts')).rows[0].n;
+      assert.equal((await call(id)).status,409);
+      const blocked=await call(id,{withPayments:true});
+      assert.equal(blocked.status,409);
+      assert.match(blocked.data.message,/already been processed/);
+      assert.equal(await exists(id),1);
+      assert.equal(await countLinks(),2);
+      await fixture.query('UPDATE pool_money_receipts SET posted=false');
+      assert.equal((await call(id,{withPayments:true})).status,200);
+      assert.equal(await exists(id),0);
+      assert.equal(await countLinks(),0);
     });
   } finally {await fixture.close();}
 });

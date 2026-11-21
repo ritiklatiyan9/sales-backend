@@ -4,7 +4,7 @@ import { brokerCode, resolveDrawBroker } from '../services/dealerTeams.js';
 import { ensureBookingCreditFields } from '../services/bookingDrawCredits.js';
 import { syncTokenPayment } from '../services/tokenPaymentSync.js';
 import crypto from 'crypto';
-import { DEFAULT_DRAW_TERMS, money, openingDate, todayIST, validDate, validatePayment, validateWinner, workflowError } from '../services/drawWorkflow.js';
+import { DEFAULT_DRAW_TERMS, ELIGIBILITY_OVERRIDE_EVENT, isDrawEligible, money, openingDate, todayIST, validDate, validatePayment, validateWinner, workflowError } from '../services/drawWorkflow.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import { signMemberDocumentUrl } from '../utils/memberDocumentUrls.js';
 import pool from '../config/db.js';
@@ -13,6 +13,7 @@ import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
+import { drawPaymentAccounting, drawPaymentMutationError, editedDrawPayment, removeDrawPayment, saveDrawPaymentEdit } from '../services/drawPaymentMutations.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
 import { getDrawSettings, upsertDrawSettings } from '../models/ProjectSettings.model.js';
@@ -26,8 +27,8 @@ import { getDrawApplicationSignatures, saveDrawApplicationSignatures } from '../
 /**
  * Draw-based shop allotment module.
  *
- * Lifecycle: REGISTERED → ELIGIBLE (auto, when the Draw Payment Ledger total reaches
- * required_amount) → SLIP_ISSUED (official Draw Entry Slip / lottery coupon generated)
+ * Lifecycle: REGISTERED → ELIGIBLE (required_amount reached or manually approved)
+ * → SLIP_ISSUED (official Draw Entry Slip / lottery coupon generated)
  * → WINNER (marked after the lottery) → ALLOTTED (QR scanned at the office; a real
  * booking is created and the accounting plot flips to BOOKED via plotBookingSync).
  *
@@ -40,6 +41,7 @@ import { getDrawApplicationSignatures, saveDrawApplicationSignatures } from '../
 
 // Deciders: the subset of admins who set the draw money and award winners/shops.
 const isDeciderRole = (role) => ['admin', 'super_admin'].includes(String(role || '').toLowerCase());
+const ELIGIBILITY_APPROVER_EMAIL = 'meritiklatiyan@gmail.com';
 
 // Ledger capture fields shared by "create with first payment" and "add payment".
 // Mirrors the booking token-payment capture fields so the UI vocabulary matches.
@@ -80,27 +82,29 @@ const buildDetail = async (id, db = pool) => {
   if (!registration) return null;
   const totalPaid = payments.reduce((sum, p) => sum + Math.round(Number(p.amount || 0) * 100), 0) / 100;
   const required = Number(registration.required_amount || 0);
+  const eligibilityOverridden = events.some((event) => event.event_type === ELIGIBILITY_OVERRIDE_EVENT);
   return {
     ...registration,
     payments,
     events,
     total_paid: totalPaid,
     balance_due: Math.max(0, required - totalPaid),
-    is_eligible: totalPaid >= required && required > 0,
+    eligibility_overridden: eligibilityOverridden,
+    is_eligible: isDrawEligible(registration, totalPaid, eligibilityOverridden && registration.status !== 'CANCELLED'),
     verifyUrl: drawVerifyUrl(registration.qr_token),
   };
 };
 
 /**
- * Recompute the pre-slip status from the ledger inside a transaction.
+ * Recompute the pre-slip status using the ledger and any recorded approval.
  * Only ever moves between REGISTERED ↔ ELIGIBLE — later states are stage-gated
  * by their own endpoints and never regress from a ledger change.
  */
 const reconcileEligibility = async (registration, actorId, db) => {
   if (!['REGISTERED', 'ELIGIBLE'].includes(registration.status)) return registration.status;
-  const total = await drawModel.getTotalPaid(registration.id, db);
+  const { total, overridden } = await drawModel.getEligibilityState(registration.id, db);
   const required = Number(registration.required_amount || 0);
-  const next = required > 0 && total >= required ? 'ELIGIBLE' : 'REGISTERED';
+  const next = isDrawEligible(registration, total, overridden) ? 'ELIGIBLE' : 'REGISTERED';
   if (next !== registration.status) {
     await db.query('UPDATE draw_registrations SET status = $1, updated_at = now() WHERE id = $2', [next, registration.id]);
     await drawModel.logEvent(
@@ -469,6 +473,49 @@ export const getDraw = asyncHandler(async (req, res) => {
   res.json({ ...detail, application_signatures: savedSignatures });
 });
 
+/** POST /draws/:id/eligibility-override — approve entry before the full draw amount is paid. */
+export const overrideDrawEligibility = asyncHandler(async (req, res) => {
+  if (req.user?.email?.trim().toLowerCase() !== ELIGIBILITY_APPROVER_EMAIL) {
+    throw workflowError('Your account cannot override draw eligibility', 403);
+  }
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1 || id > 2147483647) throw workflowError('A valid draw registration is required');
+
+  const visibleUserIds = await getVisibleUserIds(req.user);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [registration] } = await client.query(
+      'SELECT * FROM draw_registrations WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    if (!registration) throw workflowError('Draw registration not found', 404);
+    if (visibleUserIds && !visibleUserIds.includes(registration.agent_user_id) && !visibleUserIds.includes(registration.created_by)) {
+      throw workflowError('This registration belongs to another network', 403);
+    }
+    await requireSiteAccess(req.user, registration.site_id, client);
+    if (registration.slip_no || !['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
+      throw workflowError('Eligibility can only be approved on an active registration before a slip is issued', 409);
+    }
+
+    const { total, overridden } = await drawModel.getEligibilityState(id, client);
+    if (!isDrawEligible(registration, total, overridden)) {
+      await client.query("UPDATE draw_registrations SET status = 'ELIGIBLE', updated_at = now() WHERE id = $1", [id]);
+      // This event also stores the approval used by the eligibility checks.
+      await drawModel.logEvent(id, ELIGIBILITY_OVERRIDE_EVENT, {
+        total_paid: total, required_amount: Number(registration.required_amount),
+      }, req.user.id, client);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  res.json(await buildDetail(id));
+});
+
 /** PUT /draws/:id/signatures — save the tablet's confirmed application drawing. */
 export const saveApplicationSignatures = asyncHandler(async (req, res) => {
   const application_signatures = await saveDrawApplicationSignatures({
@@ -570,11 +617,9 @@ export const addDrawPayment = asyncHandler(async (req, res) => {
   res.status(201).json(detail);
 });
 
-/** DELETE /draws/:id/payments/:paymentId — remove one receipt and its pending Accounting entry. */
-export const deleteDrawPayment = asyncHandler(async (req, res) => {
-  if (!isAdminRole(req.user?.role)) {
-    return res.status(403).json({ message: 'Only admins can remove ledger entries' });
-  }
+/** The registration lock serializes edits and receipt removal with slip issuance and allotment. */
+const mutateDrawReceipt = (remove) => asyncHandler(async (req, res) => {
+  if (!isAdminRole(req.user?.role)) throw workflowError('Only admins can change draw receipts', 403);
   const registrationId = Number(req.params.id);
   const paymentId = Number(req.params.paymentId);
   if (![registrationId, paymentId].every(id => Number.isInteger(id) && id > 0 && id <= 2147483647)) {
@@ -594,59 +639,48 @@ export const deleteDrawPayment = asyncHandler(async (req, res) => {
     }
 
     const { rows: [payment] } = await client.query(
-      'SELECT id, receipt_no, amount, plot_payment_id FROM draw_payments WHERE id = $1 AND draw_registration_id = $2 FOR UPDATE',
+      'SELECT * FROM draw_payments WHERE id = $1 AND draw_registration_id = $2 FOR UPDATE',
       [paymentId, registrationId]
     );
     if (!payment) throw workflowError('Payment not found on this registration.', 404);
-    if (payment.plot_payment_id !== null) {
+    if (payment.plot_payment_id != null) {
       throw workflowError('This payment was transferred to a plot. Correct it in Accounting.', 409);
     }
 
-    // An issued slip requires the remaining receipts to cover the draw amount.
-    if (!['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
-      const paid = await drawModel.getTotalPaid(registrationId, client);
-      const remainingPaise = Math.round(paid * 100) - Math.round(Number(payment.amount) * 100);
-      if (remainingPaise < Math.round(Number(registration.required_amount || 0) * 100)) {
-        throw workflowError('Deleting this receipt would take the payment total below the minimum for the issued slip. Cancel the registration first.', 409);
+    const patch = remove ? null : await editedDrawPayment(req.body, payment, registration.site_id, client);
+    const amountPaise = Math.round(Number(payment.amount) * 100);
+    const revisedPaise = patch ? Math.round(patch.amount * 100) : 0;
+    // A reduction cannot invalidate an issued slip unless entry with a balance was already approved.
+    if (revisedPaise < amountPaise && !['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
+      const { total, overridden } = await drawModel.getEligibilityState(registrationId, client);
+      const remainingPaise = Math.round(total * 100) - amountPaise + revisedPaise;
+      if (!overridden && remainingPaise < Math.round(Number(registration.required_amount || 0) * 100)) {
+        throw workflowError(`${remove ? 'Deleting' : 'Editing'} this receipt would take the payment total below the minimum for the issued slip. Cancel the registration first.`, 409);
       }
     }
 
-    const { rows: [accounting] } = await client.query(`
-      SELECT set_config('app.current_user_id', $1, true),
-        to_regprocedure('delete_draw_payment_with_accounting(integer,integer,integer)') IS NOT NULL AS can_delete,
-        to_regclass('pool_money_receipts') IS NOT NULL AS has_pool_money
-    `, [String(req.user.id)]);
-    if (accounting.can_delete) {
-      const { rows: [{ deleted }] } = await client.query(
-        'SELECT delete_draw_payment_with_accounting($1, $2, $3) AS deleted',
-        [registrationId, paymentId, req.user.id]
-      );
-      if (!deleted) throw workflowError('Payment not found on this registration.', 404);
-    } else {
-      if (accounting.has_pool_money) {
-        const { rows: [linked] } = await client.query(
-          "SELECT 1 FROM pool_money_receipts WHERE source_kind = 'draw' AND source_id = $1",
-          [paymentId]
-        );
-        if (linked) throw workflowError('Accounting must be updated before this receipt can be deleted here.', 409);
+    const before = patch && Object.fromEntries(Object.keys(patch).map(field => [field, field === 'amount' ? Number(payment.amount) : payment[field]]));
+    if (remove || Object.keys(patch).some(field => before[field] !== patch[field])) {
+      const actorId = req.user.id;
+      const accounting = await drawPaymentAccounting(client, actorId);
+      const identity = { registrationId, paymentId, actorId };
+      if (remove) {
+        await removeDrawPayment(client, accounting, identity);
+        await drawModel.logEvent(registrationId, 'PAYMENT_DELETED', {
+          amount: Number(payment.amount), payment_id: payment.id, receipt_no: payment.receipt_no,
+        }, actorId, client);
+      } else {
+        await saveDrawPaymentEdit(client, accounting, { ...identity, patch });
+        await drawModel.logEvent(registrationId, 'PAYMENT_UPDATED', {
+          payment_id: payment.id, receipt_no: payment.receipt_no, before, after: patch,
+        }, actorId, client);
       }
-      await client.query('DELETE FROM draw_payments WHERE id = $1 AND draw_registration_id = $2', [paymentId, registrationId]);
+      await reconcileEligibility(registration, actorId, client);
     }
-
-    await drawModel.logEvent(registrationId, 'PAYMENT_DELETED', {
-      amount: Number(payment.amount), payment_id: payment.id, receipt_no: payment.receipt_no,
-    }, req.user.id, client);
-    await reconcileEligibility(registration, req.user?.id, client);
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
-    if (err.constraint === 'draw_payment_delete_conflict' || err.constraint === 'loyalty_vault_holder_funds') {
-      throw workflowError(err.message, 409);
-    }
-    if (err.code === '23503') {
-      throw workflowError('This receipt is linked to another record. Review it in Accounting before deleting it.', 409);
-    }
-    throw err;
+    throw drawPaymentMutationError(err);
   } finally {
     client.release();
   }
@@ -655,10 +689,13 @@ export const deleteDrawPayment = asyncHandler(async (req, res) => {
   res.json(detail);
 });
 
+export const updateDrawPayment = mutateDrawReceipt(false);
+export const deleteDrawPayment = mutateDrawReceipt(true);
+
 /**
  * POST /draws/:id/issue-slip — generate the Official Draw Entry Slip (lottery coupon).
- * ADMIN ONLY: the slip certifies that the ledger covers required_amount and the
- * draw date is configured. KYC may continue after document issue, but is enforced
+ * ADMIN ONLY: requires eligibility and a configured draw date. KYC may continue
+ * after document issue, but is enforced
  * before a physical result can be recorded or a property can be allotted.
  */
 export const issueSlip = asyncHandler(async (req, res) => {
@@ -686,10 +723,9 @@ export const issueSlip = asyncHandler(async (req, res) => {
       return res.status(400).json({ message: `Cannot issue a slip while status is ${registration.status}` });
     }
 
-    // Re-verify eligibility from the ledger — the single source of truth.
-    const total = await drawModel.getTotalPaid(registration.id, client);
+    const { total, overridden } = await drawModel.getEligibilityState(registration.id, client);
     const required = Number(registration.required_amount || 0);
-    if (required <= 0 || total < required) {
+    if (!isDrawEligible(registration, total, overridden)) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         message: `Customer is not yet eligible: paid ₹${total} of the required ₹${required}`,
@@ -736,8 +772,8 @@ export const markWinner = asyncHandler(async (req, res) => {
     if (winner) {
       await client.query('SELECT id FROM kyc_cases WHERE client_member_id = $1 AND site_id = $2 FOR SHARE', [registration.client_member_id, registration.site_id]);
       const kyc = await drawModel.getDetail(registration.id, client);
-      const total = await drawModel.getTotalPaid(registration.id, client);
-      validateWinner(registration, { total, kycStatus: kyc.kyc_status, slipNumber: req.body.slip_no });
+      const { total, overridden } = await drawModel.getEligibilityState(registration.id, client);
+      validateWinner(registration, { total, overridden, kycStatus: kyc.kyc_status, slipNumber: req.body.slip_no });
       await client.query(`UPDATE draw_registrations SET is_winner = TRUE, winner_marked_at = now(), winner_marked_by = $1, status = 'WINNER', updated_at = now() WHERE id = $2`, [req.user.id, registration.id]);
       await drawModel.logEvent(registration.id, 'WINNER_MARKED', { slip_no: registration.slip_no, method: 'PHYSICAL_BUCKET' }, req.user.id, client);
     } else {
@@ -794,12 +830,13 @@ export const scanDraw = asyncHandler(async (req, res) => {
   // Best-effort audit — never holds the response back.
   drawModel.logEvent(hit.id, 'SCANNED', { by_role: req.user.role }, req.user.id, pool).catch(() => {});
 
+  const balanceBlocksAllotment = detail.eligibility_overridden && detail.balance_due > 0;
   res.json({
     valid: true,
     can_allot: detail.status === 'WINNER' && isDeciderRole(req.user.role),
     verdict:
       detail.status === 'ALLOTTED' ? 'Shop already allotted against this slip'
-        : detail.status === 'WINNER' ? 'Verified winner — ready for shop allotment'
+        : detail.status === 'WINNER' ? (balanceBlocksAllotment ? 'Verified winner. Collect the draw balance before allotment.' : 'Verified winner — ready for shop allotment')
           : detail.status === 'SLIP_ISSUED' ? 'Genuine slip, but not marked as a winner'
             : detail.status === 'CANCELLED' ? 'Registration was cancelled'
               : 'Genuine registration — draw slip not issued yet',
@@ -1018,11 +1055,10 @@ export const allotShop = asyncHandler(async (req, res) => {
  * printed coupon certifies a specific figure, and later stages never regress.
  */
 export const updateDraw = asyncHandler(async (req, res) => {
-  if (!isDeciderRole(req.user?.role)) {
-    return res.status(403).json({ message: 'Only Admin / Super Admin decide the draw amount' });
-  }
+  if (!isAdminRole(req.user?.role)) throw workflowError('Only admins can edit draw registrations', 403);
   const { required_amount, scheme_name, notes, draw_opening_date } = req.body;
   const hasAmount = required_amount !== undefined && required_amount !== null && required_amount !== '';
+  if (hasAmount && !isDeciderRole(req.user.role)) throw workflowError('Only Admin or Super Admin can change the draw amount', 403);
   const amount = hasAmount ? money(required_amount, 'Required amount') : null;
   if (draw_opening_date !== undefined && (!validDate(draw_opening_date) || draw_opening_date < todayIST())) throw workflowError('Select a current or future opening date');
   if (hasAmount && (!amount || amount <= 0)) {
@@ -1044,6 +1080,7 @@ export const updateDraw = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Draw registration not found' });
     }
+    await requireSiteAccess(req.user, registration.site_id, client);
     if (hasAmount && !['REGISTERED', 'ELIGIBLE'].includes(registration.status)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: `The draw amount is locked once the slip is issued (current status: ${registration.status})` });
@@ -1075,7 +1112,7 @@ export const updateDraw = asyncHandler(async (req, res) => {
         { from: Number(registration.required_amount), to: amount },
         req.user?.id, client
       );
-      // The new amount may flip eligibility either way — recompute from the ledger.
+      // The new amount can change automatic eligibility.
       await reconcileEligibility({ ...registration, required_amount: amount }, req.user?.id, client);
     }
     await client.query('COMMIT');
@@ -1133,33 +1170,34 @@ export const deleteDraw = asyncHandler(async (req, res) => {
       return res.status(404).json({ message: 'Draw registration not found' });
     }
     await requireSiteAccess(req.user, registration.site_id, client);
-    // Issued slips are always retained. Paid-but-unissued entries (e.g. test or
-    // mistaken registrations) may go only with an explicit ?with_payments=true and
-    // only while none of their receipts has been transferred to Accounting.
-    // A cancelled entry is out of the lottery pool, so its slip may go too (slip numbers derive from the id, never reused).
+    // Active issued slips must leave the pool through cancellation. A paid entry
+    // needs explicit receipt deletion so its eligible Accounting mirrors are removed atomically.
     if (registration.slip_no && registration.status !== 'CANCELLED') throw workflowError('This entry has an issued draw slip and must be retained. Cancel it instead.', 409);
-    const paid = await drawModel.getTotalPaid(registration.id, client);
-    if (paid > 0) {
-      if (req.query.with_payments !== 'true') throw workflowError('This entry has payments. Confirm deleting its receipts too, or cancel the entry instead.', 409);
-      const { rows: moved } = await client.query('SELECT 1 FROM draw_payments WHERE draw_registration_id = $1 AND plot_payment_id IS NOT NULL LIMIT 1', [registration.id]);
-      if (moved[0]) throw workflowError('Receipts of this entry are already in Accounting. Cancel the entry instead.', 409);
-    }
     if (!['REGISTERED', 'ELIGIBLE', 'CANCELLED'].includes(registration.status)) {
       await client.query('ROLLBACK');
       return res.status(409).json({
         message: `Cannot delete a registration with status ${registration.status} — it is already in the lottery. Cancel it instead.`,
       });
     }
+    const { rows: payments } = await client.query('SELECT id, amount, plot_payment_id FROM draw_payments WHERE draw_registration_id=$1 ORDER BY id FOR UPDATE', [registration.id]);
+    const paid = payments.reduce((cents, payment) => cents + Math.round(Number(payment.amount) * 100), 0) / 100;
+    if (payments.length) {
+      if (req.query.with_payments !== 'true') throw workflowError('This entry has payments. Confirm deleting its receipts too, or cancel the entry instead.', 409);
+      if (payments.some(payment => payment.plot_payment_id != null)) throw workflowError('A receipt was transferred to a plot. Correct it in Accounting before deleting this registration.', 409);
+      const accounting = await drawPaymentAccounting(client, req.user.id);
+      for (const payment of payments) {
+        await removeDrawPayment(client, accounting, { registrationId: registration.id, paymentId: payment.id, actorId: req.user.id });
+      }
+    }
     await client.query('DELETE FROM draw_attendance_events WHERE attendance_id IN (SELECT id FROM draw_attendance WHERE draw_registration_id = $1)', [registration.id]);
     await client.query('DELETE FROM draw_attendance WHERE draw_registration_id = $1', [registration.id]);
-    await client.query('DELETE FROM draw_payments WHERE draw_registration_id = $1', [registration.id]);
     await client.query('DELETE FROM draw_events WHERE draw_registration_id = $1', [registration.id]);
     await client.query('DELETE FROM draw_registrations WHERE id = $1', [registration.id]);
     await client.query('COMMIT');
     logActivity(req.user.id, null, 'DRAW_REGISTRATION_DELETED', { draw_registration_id: registration.id, with_payments: paid > 0, amount: paid });
   } catch (err) {
     await client.query('ROLLBACK');
-    throw err;
+    throw drawPaymentMutationError(err);
   } finally {
     client.release();
   }
@@ -1272,8 +1310,8 @@ export const startDrawKyc = asyncHandler(async (req, res) => {
     if (!registration) throw workflowError('Registration not found', 404);
     if (visibleUserIds && !visibleUserIds.includes(registration.agent_user_id) && !visibleUserIds.includes(registration.created_by)) throw workflowError('This registration belongs to another network', 403);
     if (registration.status === 'CANCELLED') throw workflowError('Registration is cancelled', 409);
-    const total = await drawModel.getTotalPaid(registration.id, client);
-    if (Number(registration.required_amount) <= 0 || total < Number(registration.required_amount)) throw workflowError('Collect the full booking amount before starting KYC', 409);
+    const { total, overridden } = await drawModel.getEligibilityState(registration.id, client);
+    if (!isDrawEligible(registration, total, overridden)) throw workflowError('Collect the full booking amount before starting KYC', 409);
     if (!registration.kyc_case_id) {
       const kycCase = await kycCaseModel.getOrCreateForMember({ memberId: registration.client_member_id, siteId: registration.site_id, createdBy: req.user.id, visibleUserIds }, client);
       await client.query('UPDATE draw_registrations SET kyc_case_id = $1, updated_at = now() WHERE id = $2', [kycCase.id, registration.id]);

@@ -1,4 +1,4 @@
-import { WORKFLOW_STAGE_SQL } from '../services/drawWorkflow.js';
+import { eligibilityOverrideExists, WORKFLOW_STAGE_SQL } from '../services/drawWorkflow.js';
 import MasterModel from './MasterModel.js';
 
 // Key by the query function so isolated databases do not inherit schema state (as drawApplicationSignatures.js).
@@ -309,6 +309,15 @@ class DrawModel extends MasterModel {
       [registrationId]
     );
     return rows[0].total;
+  }
+
+  async getEligibilityState(registrationId, db) {
+    const { rows: [state] } = await db.query(`
+      SELECT COALESCE(SUM(amount), 0)::float AS total,
+             ${eligibilityOverrideExists('$1')} AS overridden
+      FROM draw_payments WHERE draw_registration_id = $1
+    `, [registrationId]);
+    return state;
   }
 
   async getEvents(registrationId, pool) {

@@ -1,7 +1,7 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import { requireWorkspaceAccess } from '../services/bookingWorkspaceAccess.js';
-import { ATTENDANCE_MODULE, ISSUED_TOKEN, attendanceDate, checkInDraw, correctAttendance, setAttendance } from '../services/drawAttendance.js';
+import { ATTENDANCE_MODULE, ISSUED_TOKEN, attendanceDate, checkInDraw, correctAttendance, isAttendanceCorrectionAccount, setAttendance } from '../services/drawAttendance.js';
 import { todayIST, workflowError } from '../services/drawWorkflow.js';
 
 export const listDrawAttendance = asyncHandler(async (req,res) => {
@@ -26,7 +26,8 @@ export const listDrawAttendance = asyncHandler(async (req,res) => {
       AND ($4='' OR m.full_name ILIKE '%' || $4 || '%' OR m.phone ILIKE '%' || $4 || '%' OR r.slip_no ILIKE '%' || $4 || '%')
       ORDER BY ${order} LIMIT $5 OFFSET $6`,[site.id,date,status,search,limit,(page-1)*limit]),
   ]);
-  res.json({ site,date,today:todayIST(),can_mark:date===todayIST(),summary:counts.rows[0],items:roster.rows,total:roster.rows[0]?.matched_count||0,page,limit });
+  const today = todayIST();
+  res.json({ site,date,today,can_mark:date===today,can_correct:isAttendanceCorrectionAccount(req.user),summary:counts.rows[0],items:roster.rows,total:roster.rows[0]?.matched_count||0,page,limit });
 });
 // Draw dates that have issued tokens, newest first, for the date picker.
 export const listDrawAttendanceDates = asyncHandler(async (req,res) => {

@@ -532,6 +532,61 @@ test('booking journey on isolated PostgreSQL, including rollback and replay prot
         );
       },
     );
+    await t.test('only the designated email can approve an unpaid draw entry', async () => {
+      const email = 'meritiklatiyan@gmail.com';
+      const { rows: [approver] } = await fixture.query(
+        "INSERT INTO users (name, email, role) VALUES ('Draw Approver', $1, 'super_admin') RETURNING id, email, role",
+        [email],
+      );
+      const settings = await call(controller.setDrawSettings, {
+        body: { site_id: 1, required_amount: 100000, opening_date: todayIST() },
+      });
+      assert.equal(settings.status, 200);
+      const created = await call(controller.createDraw, {
+        body: {
+          site_id: 1, broker_code: TEST_BROKER_CODE, phone: '9876543211',
+          full_name: 'Manual approval test', scheme_name: 'Draw with approval',
+        },
+      });
+      assert.equal(created.status, 201, JSON.stringify(created.data));
+      const params = { id: created.data.id };
+      const denied = await call(controller.overrideDrawEligibility, { params, body: { email } });
+      assert.equal(denied.status, 403);
+      assert.equal((await call(controller.issueSlip, { params })).status, 400);
+
+      const approved = await call(controller.overrideDrawEligibility, { params, user: approver });
+      assert.equal(approved.status, 200, JSON.stringify(approved.data));
+      assert.equal(approved.data.status, 'ELIGIBLE');
+      assert.equal(approved.data.is_eligible, true);
+      assert.equal(approved.data.eligibility_overridden, true);
+      assert.equal(approved.data.total_paid, 0);
+      assert.equal(approved.data.balance_due, 100000);
+      assert.deepEqual(approved.data.payments, []);
+      const replay = await call(controller.overrideDrawEligibility, { params, user: approver });
+      const approvalEvents = replay.data.events.filter(event => event.event_type === 'ELIGIBILITY_OVERRIDDEN');
+      assert.equal(approvalEvents.length, 1);
+      assert.equal(approvalEvents[0].actor_user_id, approver.id);
+
+      const queue = await call(controller.listWorkflow, {
+        query: { site_id: 1, stage: 'KYC', payment: 'UNPAID', q: 'Manual approval test' },
+      });
+      assert.deepEqual(queue.data.items.map(row => row.id), [params.id]);
+      const partial = await call(controller.addDrawPayment, { params, body: { amount: 20000 } });
+      assert.equal(partial.status, 201);
+      assert.equal(partial.data.status, 'ELIGIBLE');
+      assert.equal(partial.data.balance_due, 80000);
+      assert.equal((await call(controller.startDrawKyc, { params })).status, 200);
+      const issued = await call(controller.issueSlip, { params });
+      assert.equal(issued.status, 200, JSON.stringify(issued.data));
+      const result = { params, body: { slip_no: issued.data.slip_no } };
+      assert.match((await call(controller.markWinner, result)).data.message, /KYC/);
+      await fixture.query("UPDATE kyc_cases SET status = 'VERIFIED' WHERE id = $1", [issued.data.kyc_case_id]);
+      const winner = await call(controller.markWinner, result);
+      assert.equal(winner.data.status, 'WINNER', JSON.stringify(winner.data));
+      const allotment = await call(controller.allotShop, { params, body: { plot_id: 2 } });
+      assert.equal(allotment.status, 409);
+      assert.match(allotment.data.message, /Ledger no longer covers/);
+    });
   } finally {
     await fixture.close();
   }

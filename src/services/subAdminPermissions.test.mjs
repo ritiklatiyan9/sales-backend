@@ -71,6 +71,18 @@ test('admins control sub-admin grants and APIs honor them without allowing self 
       }}finally{fixture.pool.query=base;}
       assert.equal(permissionQueries,0);
     });
+    await t.test('draw edit and delete grants cover both registrations and receipts',async()=>{
+      const token=signAccessToken({id:2,version:1,role:'sub_admin'});
+      for(const [method,flag] of [['PATCH','can_update'],['DELETE','can_delete']]){
+        const permission={module:'booking_draws',can_read:true,can_write:true,can_update:true,can_delete:true,[flag]:false};
+        assert.equal((await call(setUserPermission,{body:permission})).status,200);
+        for(const path of ['/1','/1/payments/1']){
+          const result=await request(drawRoutes,method,path,token);
+          assert.equal(result.status,403,`${method} ${path}: ${JSON.stringify(result.data)}`);
+          assert.equal(result.data.code,'MODULE_ACCESS_DENIED');
+        }
+      }
+    });
     await t.test('company and banking edits follow separate sub-admin Update grants',async()=>{
       await call(setUserPermission,{body:{module:'booking_company_details',can_read:true,can_write:true,can_update:true,can_delete:false}});
       await call(setUserPermission,{body:{module:'booking_payment_details',can_read:true,can_write:false,can_update:false,can_delete:false}});

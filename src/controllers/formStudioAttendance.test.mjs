@@ -11,6 +11,8 @@ import { listDrawAttendance, listDrawAttendanceDates } from './drawAttendance.co
 import { createDraw, setDrawSettings } from './draw.controller.js';
 
 const admin={id:1,role:'admin'},agent={id:2,role:'agent'};
+const correctionOwner={...admin,email:'meritiklatiyan@gmail.com'};
+const sales={...agent,role:'sub_admin',email:'sales@dg.com'};
 const call=(handler,{body={},params={},query={},user=admin}={})=>new Promise(resolve=>handler({body,params,query,user},{statusCode:200,status(value){this.statusCode=value;return this;},json(data){resolve({status:this.statusCode,data});}},error=>resolve({status:error.status||500,data:{message:error.message}})));
 import { DEFENCE_GARDEN_PAYMENT_PLAN } from '../../../sales-dg-frontend/src/lib/defenceGardenPaymentPlan.js';
 
@@ -94,9 +96,14 @@ test('site templates and attendance use isolated PostgreSQL',async t=>{
    assert.deepEqual((await roster()).data.summary,{total:1,present:1,remaining:0});
    assert.equal((await call(listDrawAttendance,{query:{site_id:1,date,status:'remaining'}})).data.items.length,0);
    assert.equal((await call(listDrawAttendance,{query:{site_id:1,date,q:'Test Applicant'}})).data.total,1);
-   await assert.rejects(()=>correctAttendance({user:agent,siteId:1,id:attendance.id,reason:'Incorrect scan'}),e=>e.status===403);
-   await assert.rejects(()=>correctAttendance({user:admin,siteId:1,id:attendance.id,reason:''}),e=>e.status===400);
-   await correctAttendance({user:admin,siteId:1,id:attendance.id,reason:'Incorrect scan'});
+   await f.query("UPDATE user_permissions SET can_update=true WHERE user_id=2 AND module='booking_draw_attendance'");
+   assert.equal((await call(listDrawAttendance,{query:{site_id:1,date},user:sales})).data.can_correct,false);
+   assert.equal((await call(listDrawAttendance,{query:{site_id:1,date},user:correctionOwner})).data.can_correct,true);
+   await assert.rejects(()=>correctAttendance({user:sales,siteId:1,id:attendance.id,reason:'Incorrect scan'}),e=>e.status===403);
+   await assert.rejects(()=>correctAttendance({user:admin,siteId:1,id:attendance.id,reason:'Incorrect scan'}),e=>e.status===403);
+   assert.equal((await roster()).data.summary.present,1);
+   await assert.rejects(()=>correctAttendance({user:correctionOwner,siteId:1,id:attendance.id,reason:''}),e=>e.status===400);
+   await correctAttendance({user:correctionOwner,siteId:1,id:attendance.id,reason:'Incorrect scan'});
    assert.deepEqual((await roster()).data.summary,{total:1,present:0,remaining:1});
    assert.equal((await f.query("SELECT reason FROM draw_attendance_events WHERE action='CORRECTED'")).rows[0].reason,'Incorrect scan');
    const second=await checkInDraw({user:agent,siteId:1,date,token:'test-qr'});assert.equal(second.already_present,false);
