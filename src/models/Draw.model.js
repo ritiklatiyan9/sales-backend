@@ -14,7 +14,7 @@ const WORKFLOW_BROKER_JOINS_SQL = `
   LEFT JOIN users registration_broker ON registration_broker.id = r.agent_user_id
   LEFT JOIN users booking_broker ON booking_broker.id = b.agent_user_id`;
 
-function drawListScope(siteId, visibleUserIds) {
+function drawListScope(siteId, visibleUserIds, view) {
   const where = [];
   const params = [];
   if (siteId) { params.push(siteId); where.push(`r.site_id = $${params.length}`); }
@@ -22,6 +22,8 @@ function drawListScope(siteId, visibleUserIds) {
     params.push(visibleUserIds);
     where.push(`(r.agent_user_id = ANY($${params.length}) OR r.created_by = ANY($${params.length}))`);
   }
+  if (view === 'active') where.push("r.status <> 'CANCELLED'");
+  if (view === 'bin') where.push("r.status = 'CANCELLED'");
   return { where, params };
 }
 
@@ -69,8 +71,8 @@ class DrawModel extends MasterModel {
   /** List with joined client/site/agent labels + paid rollup.
    * `visibleUserIds` (array | null) scopes rows to an agent's own network —
    * registrations they own (agent_user_id) or personally created (same rule as bookings). */
-  async list({ siteId, status, q, clientMemberId, brokerIds, visibleUserIds }, pool) {
-    const { where, params } = drawListScope(siteId, visibleUserIds);
+  async list({ siteId, status, q, clientMemberId, brokerIds, visibleUserIds, view }, pool) {
+    const { where, params } = drawListScope(siteId, visibleUserIds, view);
     if (status) { params.push(status); where.push(`r.status = $${params.length}`); }
     if (clientMemberId) { params.push(clientMemberId); where.push(`r.client_member_id = $${params.length}`); }
     if (brokerIds?.length) {
@@ -79,14 +81,14 @@ class DrawModel extends MasterModel {
     }
     if (q) {
       params.push(`%${q}%`);
-      where.push(`(r.registration_no ILIKE $${params.length} OR r.slip_no ILIKE $${params.length} OR r.scheme_name ILIKE $${params.length} OR m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length})`);
+      where.push(`(r.registration_no ILIKE $${params.length} OR r.slip_no ILIKE $${params.length} OR r.scheme_name ILIKE $${params.length} OR m.full_name ILIKE $${params.length} OR m.phone ILIKE $${params.length} OR b.booking_no ILIKE $${params.length})`);
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
     const { rows } = await pool.query(`
       SELECT r.*,
              m.full_name AS client_name, m.phone AS client_phone, m.photo AS client_photo,
-             s.name AS site_name,
+             s.name AS site_name, b.booking_no,
              au.name AS agent_name, au.referral_code AS agent_referral_code, bm.full_name AS broker_name,
              p.plot_no AS allotted_plot_no, p.block AS allotted_plot_block,
              kyc.id AS kyc_case_id, kyc.status AS kyc_status,
@@ -100,16 +102,17 @@ class DrawModel extends MasterModel {
       LEFT JOIN users  au ON au.id = r.agent_user_id
       LEFT JOIN members bm ON bm.id = r.broker_member_id
       LEFT JOIN plots   p ON p.id = r.allotted_plot_id
+      LEFT JOIN bookings b ON b.id = r.booking_id AND b.site_id = r.site_id
       LEFT JOIN LATERAL (${this.kycCaseLateral}) kyc ON true
       ${whereSql}
-      ORDER BY r.created_at DESC
+      ORDER BY ${view === 'bin' ? 'r.updated_at' : 'r.created_at'} DESC, r.id DESC
       LIMIT 500
     `, params);
     return rows;
   }
 
-  async listBrokers({ siteId, visibleUserIds }, db) {
-    const { where, params } = drawListScope(siteId, visibleUserIds);
+  async listBrokers({ siteId, visibleUserIds, view }, db) {
+    const { where, params } = drawListScope(siteId, visibleUserIds, view);
     where.push('r.broker_id IS NOT NULL');
     const { rows } = await db.query(`
       SELECT r.broker_id AS id,

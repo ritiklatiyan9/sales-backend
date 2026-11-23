@@ -76,9 +76,8 @@ const ACCOUNT_MEMBER_FIELDS = [...CLIENT_FIELDS, ...ROLE_SPECIFIC_MEMBER_FIELDS]
 const clean = (v) => (v === '' ? null : v);
 
 /**
- * A draw-allotted booking that gets cancelled/deleted must release its allotment:
- * the draw registration returns to WINNER (still a winner, shop freed) so the unit
- * can be re-allotted — otherwise ALLOTTED is a dead-end pointing at a dead booking.
+ * Deleting an active draw-allotted booking returns its registration to WINNER
+ * so it can be re-allotted.
  * Best-effort: tolerates deploys where migration 011 hasn't run (42P01).
  */
 const revertDrawAllotment = async (bookingId, actorId) => {
@@ -104,6 +103,43 @@ const revertDrawAllotment = async (bookingId, actorId) => {
     return 0;
   }
 };
+
+async function cancelBookingRecord(id, data, user) {
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    const { rows: [booking] } = await db.query('SELECT site_id FROM bookings WHERE id = $1 FOR UPDATE', [id]);
+    if (!booking) {
+      await db.query('ROLLBACK');
+      return {};
+    }
+    await requireSiteAccess(user, booking.site_id, db);
+    const updated = await bookingModel.update(id, { ...data, status: 'CANCELLED' }, db);
+    let drawCancelled = 0;
+    const { rows: [schema] } = await db.query("SELECT to_regclass('public.draw_registrations') AS draws");
+    if (schema.draws) {
+      const { rows } = await db.query(`
+        WITH cancelled AS (
+          UPDATE draw_registrations
+             SET status = 'CANCELLED', allotted_plot_id = NULL, allotted_at = NULL,
+                 allotted_by = NULL, updated_at = now()
+           WHERE booking_id = $1 AND site_id = $2 AND status = 'ALLOTTED'
+           RETURNING id, booking_id
+        )
+        INSERT INTO draw_events (draw_registration_id, event_type, detail, actor_user_id)
+        SELECT id, 'CANCELLED', jsonb_build_object('booking_id', booking_id), $3 FROM cancelled
+        RETURNING draw_registration_id`, [updated.id, updated.site_id, user.id]);
+      drawCancelled = rows.length;
+    }
+    await db.query('COMMIT');
+    return { updated, drawCancelled };
+  } catch (err) {
+    await db.query('ROLLBACK');
+    throw err;
+  } finally {
+    db.release();
+  }
+}
 
 /** GET /bookings?site_id=&status=&kyc_status=&q=&client_member_id=
  * Visibility is role-scoped server-side: admins see everything; agents/team heads
@@ -531,7 +567,9 @@ export const updateBooking = asyncHandler(async (req, res) => {
   for (const f of TOKEN_PAYMENT_FIELDS) if (data[f] === '') data[f] = null;
 
   const { rows: [before] } = await pool.query('SELECT plot_id, status FROM bookings WHERE id = $1', [req.params.id]);
-  const updated = await bookingModel.update(req.params.id, data, pool);
+  const updated = data.status === 'CANCELLED'
+    ? (await cancelBookingRecord(req.params.id, data, req.user)).updated
+    : await bookingModel.update(req.params.id, data, pool);
   if (!updated) return res.status(404).json({ message: 'Booking not found' });
 
   // Re-sync the accounting plot when a plot is assigned/changed or the agent override
@@ -555,18 +593,16 @@ export const updateBooking = asyncHandler(async (req, res) => {
   res.json({ ...updated, plot_sync, token_sync });
 });
 
-/** POST /bookings/:id/cancel — status change only (no deletion). Admin roles only. */
+/** POST /bookings/:id/cancel — cancel the booking and its linked draw entry. */
 export const cancelBooking = asyncHandler(async (req, res) => {
   if (!isAdminRole(req.user?.role)) {
     return res.status(403).json({ message: 'Only admins can cancel bookings' });
   }
-  const updated = await bookingModel.update(req.params.id, { status: 'CANCELLED' }, pool);
+  const { updated, drawCancelled } = await cancelBookingRecord(req.params.id, {}, req.user);
   if (!updated) return res.status(404).json({ message: 'Booking not found' });
   // Drop the still-pending token payment (CANCELLED ⇒ removal path). Approved rows kept.
   const token_sync = await syncTokenPayment(updated, pool);
-  // If this booking came from a draw allotment, free the allotment (draw → WINNER).
-  const draw_reverted = await revertDrawAllotment(updated.id, req.user?.id);
-  res.json({ ...updated, token_sync, draw_reverted });
+  res.json({ ...updated, token_sync, draw_reverted: drawCancelled });
 });
 
 /**

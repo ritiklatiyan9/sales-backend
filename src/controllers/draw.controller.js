@@ -425,16 +425,22 @@ export const createDraw = asyncHandler(async (req, res) => {
   res.status(201).json(detail);
 });
 
-/** GET /draws?site_id=&status=&q=&client_member_id=&broker_ids=1,2 — network-scoped like bookings. */
+function drawListView(view) {
+  if (view !== undefined && !['active', 'bin'].includes(view)) throw workflowError('Invalid draw list view');
+  return view;
+}
+
+/** GET /draws?site_id=&view=active|bin&status=&q=&client_member_id=&broker_ids=1,2 */
 export const listDraws = asyncHandler(async (req, res) => {
   const { site_id, status, q, client_member_id, broker_ids } = req.query;
+  const view = drawListView(req.query.view);
   if (broker_ids !== undefined && typeof broker_ids !== 'string') throw workflowError('Invalid broker filter');
   const brokerIds = broker_ids ? broker_ids.split(',').map(Number) : [];
   if (brokerIds.some((id) => !Number.isInteger(id) || id < 1 || id > 2147483647)) throw workflowError('Invalid broker filter');
-  const siteId = brokerIds.length ? (await requireSiteAccess(req.user, site_id)).id : site_id;
+  const siteId = view || brokerIds.length ? (await requireSiteAccess(req.user, site_id)).id : site_id;
   const visibleUserIds = await getVisibleUserIds(req.user); // null = unrestricted
   const rows = await drawModel.list(
-    { siteId, status, q, clientMemberId: client_member_id, brokerIds, visibleUserIds },
+    { siteId, status, q, clientMemberId: client_member_id, brokerIds, visibleUserIds, view },
     pool
   );
   // Member photos live in a private bucket; the raw URL 403s in <img>.
@@ -444,9 +450,10 @@ export const listDraws = asyncHandler(async (req, res) => {
 
 /** GET /draws/brokers?site_id= — brokers with visible registrations at this site. */
 export const listDrawBrokers = asyncHandler(async (req, res) => {
+  const view = drawListView(req.query.view);
   const { id: siteId } = await requireSiteAccess(req.user, req.query.site_id);
   const visibleUserIds = await getVisibleUserIds(req.user);
-  const rows = await drawModel.listBrokers({ siteId, visibleUserIds }, pool);
+  const rows = await drawModel.listBrokers({ siteId, visibleUserIds, view }, pool);
   res.json(rows.map((row) => ({ ...row, code: row.code || brokerCode(row.id) })));
 });
 
@@ -1134,13 +1141,16 @@ export const cancelDraw = asyncHandler(async (req, res) => {
   }
   const registration = await drawModel.findById(req.params.id, pool);
   if (!registration) return res.status(404).json({ message: 'Draw registration not found' });
+  await requireSiteAccess(req.user, registration.site_id);
   // Condition inside the UPDATE — a concurrent allotment can never be clobbered.
   const { rows: updated } = await pool.query(
     `UPDATE draw_registrations SET status = 'CANCELLED', updated_at = now()
-      WHERE id = $1 AND status <> 'ALLOTTED' RETURNING id`,
+      WHERE id = $1 AND status NOT IN ('ALLOTTED', 'CANCELLED') RETURNING id`,
     [registration.id]
   );
   if (!updated[0]) {
+    const detail = await buildDetail(req.params.id, pool);
+    if (detail?.status === 'CANCELLED') return res.json(detail);
     return res.status(400).json({ message: 'Cannot cancel after allotment — cancel the linked booking instead' });
   }
   await drawModel.logEvent(registration.id, 'CANCELLED', null, req.user.id, pool).catch(() => {});
