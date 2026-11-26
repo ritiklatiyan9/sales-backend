@@ -5,7 +5,7 @@ import express from 'express';
 import pool from '../config/db.js';
 import { createMobilePortalService, normalizeMobile, CLIENT_MOBILE_SESSION_DAYS } from '../services/mobilePortal.service.js';
 import { createMobilePushDevices } from '../services/mobilePush.service.js';
-import staffAuthMiddleware from '../middlewares/auth.middleware.js';
+import staffAuthMiddleware, { clientInvitationAuthMiddleware } from '../middlewares/auth.middleware.js';
 import { createMobileAccountProvisioner } from '../services/mobileAccountProvision.service.js';
 import { createClientInvitationService } from '../services/clientInvitation.service.js';
 
@@ -75,7 +75,8 @@ export function mobilePortalEnabled(env = process.env) {
 export function createMobilePortalRouter(service, {
   loginLimiter = createMobileLoginLimiter(), passwordLimiter = createMobilePasswordLimiter(), isEnabled = () => mobilePortalEnabled(),
   pushDevices = createMobilePushDevices(pool), pushLimiter = createMobilePushLimiter(),
-  staffAuth = staffAuthMiddleware, accountProvisioner = createMobileAccountProvisioner(pool),
+  staffAuth = staffAuthMiddleware, accountProvisionAuth = clientInvitationAuthMiddleware,
+  accountProvisioner = createMobileAccountProvisioner(pool),
   invitationService = createClientInvitationService(pool),
 } = {}) {
   const router = express.Router();
@@ -86,7 +87,7 @@ export function createMobilePortalRouter(service, {
   });
   router.use((_req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
   // Office-only account provisioning. Never return the Aadhaar or password hash.
-  router.post('/admin/accounts', staffAuth, run(async (req, res) => {
+  router.post('/admin/accounts', accountProvisionAuth, run(async (req, res) => {
     if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can create app access.' });
     const result = await accountProvisioner.provision({ memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actorId: Number(req.user.id), actorVersion: req.user.version });
     return res.json(result);

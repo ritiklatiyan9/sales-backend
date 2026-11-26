@@ -29,7 +29,7 @@ export async function currentStaffSession(token, db = pool, { allowAccountancyOn
   const user = rows[0];
   if (!user?.is_active || user.token_version !== decoded.version || user.role === 'client') throw invalidSession();
   if (accountsIntegration) {
-    // Only the explicit client-invitation route opts in. Never accept an
+    // Only explicit Accounts integrations opt in. Never accept an
     // Accounts session for Booking business, mobile staff or websocket APIs.
     if (user.role !== 'super_admin' || user.can_login_accounts !== true) throw invalidSession();
   } else {
