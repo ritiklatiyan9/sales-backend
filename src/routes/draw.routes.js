@@ -5,6 +5,7 @@ import {
   listWorkflow, paymentStatement, startDrawKyc, createDraw, listDraws, listDrawBrokers, getDraw, updateDraw, addDrawPayment, updateDrawPayment, deleteDrawPayment,
   overrideDrawEligibility, issueSlip, markWinner, scanDraw, allotShop, cancelDraw, deleteDraw,
   getDrawSettingsHandler, setDrawSettings, saveApplicationSignatures, getApplicationSigningContext,
+  getDrawShopBooking, createDrawShopBooking,
 } from '../controllers/draw.controller.js';
 
 const router = express.Router();
@@ -32,6 +33,8 @@ router.delete('/:id/payments/:paymentId', subAdminPermission("booking_draws", 'c
 router.post('/:id/issue-slip', subAdminPermission("booking_draws", 'can_update'), issueSlip);
 router.post('/:id/winner', subAdminPermission("booking_draws", 'can_update'), markWinner);
 router.post('/:id/allot', subAdminPermission("booking_draws", 'can_update'), allotShop);
+router.get('/:id/book-shop', subAdminPermission('booking_draws', 'can_update'), getDrawShopBooking);
+router.post('/:id/book-shop', subAdminPermission('booking_draws', 'can_update'), createDrawShopBooking);
 router.post('/:id/cancel', subAdminPermission("booking_draws", 'can_update'), cancelDraw);
 
 export default router;

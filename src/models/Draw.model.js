@@ -88,7 +88,7 @@ class DrawModel extends MasterModel {
     const { rows } = await pool.query(`
       SELECT r.*,
              m.full_name AS client_name, m.phone AS client_phone, m.photo AS client_photo,
-             s.name AS site_name, b.booking_no,
+             s.name AS site_name, (to_jsonb(s)->>'organization_id')::integer AS site_organization_id, b.booking_no,
              au.name AS agent_name, au.referral_code AS agent_referral_code, bm.full_name AS broker_name,
              p.plot_no AS allotted_plot_no, p.block AS allotted_plot_block,
              kyc.id AS kyc_case_id, kyc.status AS kyc_status,

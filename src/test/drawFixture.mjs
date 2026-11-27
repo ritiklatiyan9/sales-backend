@@ -8,6 +8,7 @@ import { migrateDealerTeams } from '../migrations/038_dealer_teams.js';
 import { migrateMemberCodeIds } from '../migrations/053_member_code_ids.js';
 
 export const TEST_BROKER_CODE = 'BRK-00900';
+let fixtureNumber = 0;
 
 /** Isolated PostgreSQL engine; never connects to the configured/live database. */
 export async function drawFixture({ broker = false, migrateCodes = true } = {}) {
@@ -69,7 +70,8 @@ export async function drawFixture({ broker = false, migrateCodes = true } = {}) 
   await db.exec(
     'ALTER TABLE bookings ADD COLUMN agent_user_id INTEGER, ADD COLUMN team_id INTEGER',
   );
-  const { ensureTable } = await import('../models/ProjectSettings.model.js');
+  // Production caches this schema check per process. Each fixture has a fresh database.
+  const { ensureTable } = await import(`../models/ProjectSettings.model.js?fixture=${++fixtureNumber}`);
   await ensureTable();
   await migrateBookingWorkflow(pool);
   await migrateBookingWorkflow(pool);

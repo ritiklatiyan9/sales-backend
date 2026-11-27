@@ -62,6 +62,10 @@ export function validateAgreementDesign(input) {
     if(key==='letterhead_logo_url'&&value&&!/^(https?:\/\/|\/[^/])/i.test(value))throw workflowError('Choose a valid application logo URL');
     out[key] = value.trim();
   }
+  if (input.reference_pdf != null) {
+    if (input.reference_pdf !== 'unn-allotment-bilingual-v1') throw workflowError('Unknown agreement PDF');
+    out.reference_pdf = input.reference_pdf;
+  }
   out.justify = input.justify === true;
   out.page_numbers = input.page_numbers !== false;
   for(const key of ['show_project_overview','show_applicant_photo'])if(input[key]!=null){

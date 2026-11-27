@@ -13,6 +13,7 @@ import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
+import { bookShopFromDraw, drawShopBookingOptions, supportsDrawShopBooking } from '../services/drawShopBooking.js';
 import { drawPaymentAccounting, drawPaymentMutationError, editedDrawPayment, removeDrawPayment, saveDrawPaymentEdit } from '../services/drawPaymentMutations.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
@@ -444,7 +445,10 @@ export const listDraws = asyncHandler(async (req, res) => {
     pool
   );
   // Member photos live in a private bucket; the raw URL 403s in <img>.
-  await Promise.all(rows.map(async (r) => { if (r.client_photo) r.client_photo = await signMemberDocumentUrl(r.client_photo); }));
+  await Promise.all(rows.map(async (r) => {
+    r.direct_shop_booking_enabled = supportsDrawShopBooking(r.site_id, r.site_name, r.site_organization_id, req.user);
+    if (r.client_photo) r.client_photo = await signMemberDocumentUrl(r.client_photo);
+  }));
   res.json(rows);
 });
 
@@ -1054,6 +1058,15 @@ export const allotShop = asyncHandler(async (req, res) => {
   const result = await allotDrawBooking({ registrationId: req.params.id, body: req.body, user: req.user });
   const detail = await buildDetail(req.params.id, pool);
   res.json({ ...detail, plot_sync: result.plot_sync, ledger_sync: result.ledger_sync });
+});
+
+export const getDrawShopBooking = asyncHandler(async (req, res) => {
+  res.json(await drawShopBookingOptions(req.params.id, req.user));
+});
+
+export const createDrawShopBooking = asyncHandler(async (req, res) => {
+  const result = await bookShopFromDraw(req.params.id, req.body || {}, req.user);
+  res.status(201).json(result);
 });
 
 /**

@@ -146,6 +146,7 @@ const autoCreateCommission = async ({ plot, agentId, createdBy }, db) => {
     totalCommission = Math.round(rate * size * 100) / 100;
   }
   if (totalCommission <= 0) return { created: false, reason: 'no_commission_amount' };
+  if (!plot.has_commissions) return { created: false, reason: 'commission_table_missing' };
 
   try {
     // Idempotency guard — never duplicate a (plot, agent) commission.
@@ -214,7 +215,9 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
     // Load the accounting plot.
     const plotRes = await db.query(
       `SELECT id, site_id, plot_no, status, buyer_member_id, buyer_name, booking_by, plot_size, plot_rate,
-              commission_rate, plot_commission, to_jsonb(p)->>'booking_cancelled_at' AS booking_cancelled_at
+              commission_rate, plot_commission, to_jsonb(p)->>'booking_cancelled_at' AS booking_cancelled_at,
+              to_regclass('public.plot_commissions_v2') IS NOT NULL AS has_commissions,
+              to_regclass('public.plot_commission_payments') IS NOT NULL AS has_commission_payments
          FROM plots p WHERE id = $1`,
       [parseInt(booking.plot_id)]
     );
@@ -247,7 +250,7 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
     }
 
     // Resolve "Booking By" + commission agent.
-    const managedAllocations = await hasManagedAllocations(plot.id, db);
+    const managedAllocations = plot.has_commissions && await hasManagedAllocations(plot.id, db);
     const { bookingByName, agentId, autoCreatedMember } = managedAllocations
       ? { bookingByName: plot.booking_by, agentId: null, autoCreatedMember: false }
       : await resolveBookingBy({ booking, plotSiteId: plot.site_id }, db);
@@ -282,8 +285,8 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
     // auto-commission (mirrors accounting's updatePlot behaviour) — but only when it
     // carries NO payments, so money is never lost.
     const prevBookingBy = (plot.booking_by || '').trim();
-    const managedNow = managedAllocations || await hasManagedAllocations(plot.id, db);
-    if (!managedNow && prevBookingBy && bookingByName && prevBookingBy.toUpperCase() !== bookingByName.trim().toUpperCase()) {
+    const managedNow = managedAllocations || (plot.has_commissions && await hasManagedAllocations(plot.id, db));
+    if (plot.has_commissions && plot.has_commission_payments && !managedNow && prevBookingBy && bookingByName && prevBookingBy.toUpperCase() !== bookingByName.trim().toUpperCase()) {
       await retirePreviousAutoCommission({ plotId: plot.id, siteId: plot.site_id, prevName: prevBookingBy }, db);
     }
 

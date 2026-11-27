@@ -9,6 +9,7 @@ const bookingAccessDenied = () => Object.assign(new Error('This ID is not allowe
 // that hasPermission reads instead of querying again. Never cached across requests, never
 // put in the JWT, so revocation (token_version, Access Control edits) applies on the next request.
 const sessionSql = grants => `SELECT u.id, u.email, u.role, u.token_version, u.is_active, u.can_login_booking,
+    (to_jsonb(u)->>'organization_id')::integer AS organization_id,
     (to_jsonb(u)->>'can_login_accounts')::boolean AS can_login_accounts,
     (to_jsonb(u)->>'can_login_booking_accounts')::boolean AS can_login_booking_accounts${grants ? `,
     (SELECT jsonb_object_agg(p.module, jsonb_build_array(p.can_read, p.can_write, p.can_update, p.can_delete))
@@ -36,7 +37,7 @@ export async function currentStaffSession(token, db = pool, { allowAccountancyOn
     if (!canSignInToBooking(user)) throw invalidSession();
     if (!allowAccountancyOnly && !canUseBooking(user)) throw bookingAccessDenied();
   }
-  return { ...decoded, email: user.email, role: user.role,
+  return { ...decoded, email: user.email, role: user.role, organization_id: user.organization_id ?? null,
     can_login_accounts: user.can_login_accounts === true,
     can_login_booking: user.can_login_booking !== false,
     can_login_booking_accounts: user.can_login_booking_accounts === true,

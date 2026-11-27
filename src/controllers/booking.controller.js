@@ -75,16 +75,34 @@ const ACCOUNT_MEMBER_FIELDS = [...CLIENT_FIELDS, ...ROLE_SPECIFIC_MEMBER_FIELDS]
 // Normalise '' → null so optional date/number-ish columns don't choke on empty strings.
 const clean = (v) => (v === '' ? null : v);
 
+// Plot payments belong to the booked shop. Moving or deleting the Booking row alone
+// would leave the draw's original receipts assigned to a different financial record.
+async function hasDirectShopReceipts(bookingId) {
+  try {
+    const { rows } = await pool.query(`SELECT 1 FROM draw_registrations r
+      WHERE r.booking_id=$1 AND EXISTS (SELECT 1 FROM draw_events e WHERE e.draw_registration_id=r.id
+        AND e.event_type='ALLOTTED' AND e.detail->>'method'='direct_shop_booking' AND e.detail->>'booking_id'=r.booking_id::text)
+        AND EXISTS (SELECT 1 FROM draw_payments p WHERE p.draw_registration_id=r.id AND p.plot_payment_id IS NOT NULL)
+      LIMIT 1`, [bookingId]);
+    return rows.length > 0;
+  } catch (error) {
+    if (error.code === '42P01' || error.code === '42703') return false;
+    throw error;
+  }
+}
+
 /**
- * Deleting an active draw-allotted booking returns its registration to WINNER
- * so it can be re-allotted.
+ * Restore the registration stage that preceded a direct shop booking or winner allotment.
  * Best-effort: tolerates deploys where migration 011 hasn't run (42P01).
  */
 const revertDrawAllotment = async (bookingId, actorId) => {
   try {
     const { rows } = await pool.query(
-      `UPDATE draw_registrations
-          SET status = 'WINNER', allotted_plot_id = NULL, allotted_at = NULL,
+      `UPDATE draw_registrations r
+          SET status = COALESCE((SELECT e.detail->>'previous_status' FROM draw_events e
+                WHERE e.draw_registration_id=r.id AND e.event_type='ALLOTTED'
+                  AND e.detail->>'booking_id'=r.booking_id::text AND e.detail->>'method'='direct_shop_booking'
+                ORDER BY e.id DESC LIMIT 1), 'WINNER'), allotted_plot_id = NULL, allotted_at = NULL,
               allotted_by = NULL, booking_id = NULL, updated_at = now()
         WHERE booking_id = $1 AND status = 'ALLOTTED'
         RETURNING id`,
@@ -567,6 +585,9 @@ export const updateBooking = asyncHandler(async (req, res) => {
   for (const f of TOKEN_PAYMENT_FIELDS) if (data[f] === '') data[f] = null;
 
   const { rows: [before] } = await pool.query('SELECT plot_id, status FROM bookings WHERE id = $1', [req.params.id]);
+  if (before && data.plot_id !== undefined && Number(data.plot_id) !== Number(before.plot_id) && await hasDirectShopReceipts(req.params.id)) {
+    return res.status(409).json({ code: 'DRAW_SHOP_RECEIPTS_LINKED', message: 'Draw receipts are assigned to this shop in Accounts. The booking must stay linked to this shop.' });
+  }
   const updated = data.status === 'CANCELLED'
     ? (await cancelBookingRecord(req.params.id, data, req.user)).updated
     : await bookingModel.update(req.params.id, data, pool);
@@ -618,6 +639,9 @@ export const deleteBooking = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const booking = await bookingModel.findById(id, pool);
   if (!booking) return res.status(404).json({ message: 'Booking not found' });
+  if (await hasDirectShopReceipts(booking.id)) {
+    return res.status(409).json({ code: 'DRAW_SHOP_RECEIPTS_LINKED', message: 'This booking holds draw receipts in Accounts. Use the booking cancellation workflow to keep its payment history.' });
+  }
   if(await websitePaymentForBooking(pool,booking.id))return res.status(409).json({message:'This booking has a captured website payment. Cancel it through the booking workflow and resolve any refund; its audit record cannot be deleted.',code:'WEBSITE_PAYMENT_LOCKED'});
 
   // KYC belongs to the CUSTOMER, not the booking: detach the booking's cases (with
