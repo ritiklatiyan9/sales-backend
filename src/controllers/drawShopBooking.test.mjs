@@ -49,13 +49,13 @@ async function fixture(t) {
   return f;
 }
 
-async function collect(db) {
-  await db.exec(`
+async function collect(db, bankAmount = 50000) {
+  await db.query(`
     INSERT INTO draw_payments(draw_registration_id,receipt_no,amount,payment_date,payment_from,received_by,
       bank_name,bank_account_id,bank_details,created_by,created_at) VALUES
       (301,'CASH-25',50000,'2026-11-07','CASH','Collector',NULL,NULL,NULL,2,'2026-11-07T10:00:00Z'),
-      (301,'BANK-45',50000,'2026-11-07','BANK','Collector','DRAW BANK',71,'BANK-REF',2,'2026-11-16T10:00:00Z');
-  `);
+      (301,'BANK-45',$1,'2026-11-07','BANK','Collector','DRAW BANK',71,'BANK-REF',2,'2026-11-16T10:00:00Z');
+  `, [bankAmount]);
 }
 
 const submit = async (override = {}) => {
@@ -268,12 +268,13 @@ test('a verified Naya Baazar winner allots an approved shop directly', { skip: !
   assert.deepEqual((await f.query('SELECT DISTINCT booked_by FROM plot_payments WHERE plot_id=$1', [shop])).rows, [{ booked_by: 'DRAW BROKER' }]);
 });
 
-test('Accounts adopts the original cash and bank entries and rolls everything back when the second transfer fails',
+test('Accounts keeps original receipt entries, rejects unusable receipts, and lets staff clear a booked cheque manually',
   { skip: !existsSync(accountsMigration) && 'Shared integration test requires the Accounts backend checkout' }, async t => {
     const f = await fixture(t);
     const { poolMoneySql } = await import(accountsMigration);
     const { migrationSql: directBookingSql } = await import(new URL('./258_direct_plot_status.js', accountsMigration));
-    const { postingPolicySql } = await import(new URL('./171_cheque_clearance_before_approval.js', accountsMigration));
+    const { postingPolicySql, approvalGuardSql } = await import(new URL('./171_cheque_clearance_before_approval.js', accountsMigration));
+    const { updateChequeStatusRecord } = await import(new URL('../services/chequeStatus.service.js', accountsMigration));
     await f.db.exec(`
       ALTER TABLE plots ADD COLUMN approved_by integer, ADD COLUMN approved_at timestamptz, ADD COLUMN approval_requested_by integer,
         ADD COLUMN approval_requested_at timestamptz, ADD COLUMN assigned_admin_id integer, ADD COLUMN created_by integer;
@@ -285,7 +286,8 @@ test('Accounts adopts the original cash and bank entries and rolls everything ba
       ALTER TABLE cash_flow_entries ADD COLUMN cash_flow_month_id integer, ADD COLUMN date date, ADD COLUMN particular text,
         ADD COLUMN debit numeric, ADD COLUMN credit numeric, ADD COLUMN cash_type text, ADD COLUMN remarks text, ADD COLUMN status text,
         ADD COLUMN created_by integer, ADD COLUMN created_at timestamptz, ADD COLUMN cheque_no text, ADD COLUMN cheque_status text,
-        ADD COLUMN approved_by integer, ADD COLUMN approved_at timestamptz, ADD COLUMN assigned_admin_id integer;
+        ADD COLUMN approved_by integer, ADD COLUMN approved_at timestamptz, ADD COLUMN assigned_admin_id integer,
+        ADD COLUMN cheque_transaction_date date;
       CREATE OR REPLACE FUNCTION test_plot_payment_mirror() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN INSERT INTO cash_flow_entries(site_id,source_module,source_id,credit,debit,status,particular)
           VALUES(NEW.site_id,'plot_payments',NEW.id,NEW.amount,0,NEW.status,'Shop payment'); RETURN NEW; END $$;
@@ -294,25 +296,37 @@ test('Accounts adopts the original cash and bank entries and rolls everything ba
       CREATE TRIGGER pool_capture AFTER INSERT OR UPDATE OR DELETE ON bookings FOR EACH ROW EXECUTE FUNCTION capture_pool_money_source();
       ${directBookingSql}
       ${postingPolicySql};
+      ${approvalGuardSql};
       CREATE TRIGGER plot_approval BEFORE INSERT OR UPDATE ON plots FOR EACH ROW EXECUTE FUNCTION queue_plot_status_approval();
+      CREATE TRIGGER cheque_approval BEFORE INSERT OR UPDATE ON plot_payments FOR EACH ROW EXECUTE FUNCTION enforce_cheque_clearance_approval();
     `);
-    await collect(f.db);
+    await collect(f.db, 25000);
+    await f.db.exec(`INSERT INTO draw_payments(draw_registration_id,receipt_no,amount,payment_date,payment_from,
+      received_by,bank_name,bank_account_id,cheque_no,created_by) VALUES
+      (301,'CHEQUE-51',25000,'2026-11-07','CHEQUE','Collector','DRAW BANK',71,'000051',2)`);
     await f.db.exec("INSERT INTO pool_money_results(source_kind,owner_id,site_id,result,note,recorded_by) VALUES('draw',301,7,'NOT_SELECTED','Recorded decision',1)");
     assert.match((await submit()).data.message, /marked as not selected/);
     await f.db.exec("DELETE FROM pool_money_results; UPDATE cash_flow_entries SET status='rejected' WHERE cash_type='bank'");
     assert.match((await submit()).data.message, /BANK-45.*rejected/i);
     await assertUnbooked(f);
     await f.db.exec("UPDATE cash_flow_entries SET status='approved',approved_by=1,approved_at='2026-11-17' WHERE cash_type='bank'");
-    const original = (await f.query('SELECT id,bank_account_id,status,approved_by,approved_at,credit,cash_type FROM cash_flow_entries ORDER BY id')).rows;
+    for (const status of ['BOUNCED', 'RETURNED']) {
+      await f.query("UPDATE cash_flow_entries SET cheque_status=$1 WHERE cash_type='cheque'", [status]);
+      assert.match((await submit()).data.message, /CHEQUE-51.*ineligible cheque/i);
+      await assertUnbooked(f);
+    }
+    await f.db.exec("UPDATE cash_flow_entries SET cheque_status='PENDING' WHERE cash_type='cheque'");
+    const original = (await f.query('SELECT id,bank_account_id,status,approved_by,approved_at,credit,cash_type,cheque_status FROM cash_flow_entries ORDER BY id')).rows;
     const result = await submit();
     assert.equal(result.status, 201, JSON.stringify(result.data));
     assert.equal((await f.query('SELECT approval_status FROM plots WHERE id=401')).rows[0].approval_status, 'approved');
-    const { rows } = await f.query(`SELECT c.id,c.bank_account_id,c.status,c.approved_by,c.approved_at,c.credit,c.cash_type
+    const { rows } = await f.query(`SELECT c.id,c.bank_account_id,c.status,c.approved_by,c.approved_at,c.credit,c.cash_type,c.cheque_status
       FROM pool_money_receipts r JOIN plot_payments p ON p.id=r.plot_payment_id JOIN cash_flow_entries c
       ON c.source_module='plot_payments' AND c.source_id=p.id WHERE p.plot_id=401 AND p.status=c.status
-      AND p.approved_at IS NOT DISTINCT FROM c.approved_at AND p.approved_by IS NOT DISTINCT FROM c.approved_by ORDER BY c.id`);
+      AND p.approved_at IS NOT DISTINCT FROM c.approved_at AND p.approved_by IS NOT DISTINCT FROM c.approved_by
+      AND p.cheque_status IS NOT DISTINCT FROM c.cheque_status ORDER BY c.id`);
     assert.deepEqual(rows, original);
-    assert.deepEqual((await f.query('SELECT count(*)::int AS n,sum(credit)::int AS amount FROM cash_flow_entries')).rows[0], { n: 2, amount: 100000 });
+    assert.deepEqual((await f.query('SELECT count(*)::int AS n,sum(credit)::int AS amount FROM cash_flow_entries')).rows[0], { n: 3, amount: 100000 });
 
     // Exercise the main Accounts Plot Payments detail query against the same isolated database.
     const { default: accountsPool } = await import(new URL('../config/db.js', accountsMigration));
@@ -321,6 +335,12 @@ test('Accounts adopts the original cash and bank entries and rolls everything ba
     const detail = await getPlotPaymentDetail(shop, site);
     assert.equal(detail.plot.buyer_member_id, review.client_member_id);
     assert.equal(detail.plot.status, 'BOOKED');
-    assert.deepEqual([detail.plot.total_received, detail.plot.received_cash, detail.plot.received_bank].map(Number), [100000, 50000, 50000]);
-    assert.deepEqual(detail.payments.map(p => [p.payment_from, p.created_by_name]), [['CASH', 'Test Agent'], ['BANK', 'Test Agent']]);
+    assert.deepEqual([detail.plot.total_received, detail.plot.received_cash, detail.plot.received_bank].map(Number), [75000, 50000, 25000]);
+    const cheque = detail.payments.find(p => p.payment_from === 'CHEQUE');
+    assert.deepEqual([cheque.status, cheque.cheque_status, cheque.created_by_name], ['pending', 'PENDING', 'Test Agent']);
+    await assert.rejects(f.query("UPDATE plot_payments SET status='approved' WHERE id=$1", [cheque.id]), /clear the cheque before approving/i);
+    await updateChequeStatusRecord(f, { source: 'plot_payment', entryId: cheque.id, status: 'CLEARED', expectedSiteId: site, requirePending: true });
+    assert.equal(Number((await getPlotPaymentDetail(shop, site)).plot.total_received), 75000);
+    await f.query("UPDATE plot_payments SET status='approved',approved_by=1,approved_at=now() WHERE id=$1", [cheque.id]);
+    assert.equal(Number((await getPlotPaymentDetail(shop, site)).plot.total_received), 100000);
   });

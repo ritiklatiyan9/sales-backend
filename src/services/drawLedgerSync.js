@@ -83,9 +83,11 @@ export const syncDrawLedgerToPlot = async (registrationId, db = pool, { requireA
       }
       const status = posting?.status || 'pending';
       const chequeStatus = posting?.cheque_status ?? (paymentType === 'CHEQUE' ? 'PENDING' : null);
-      if (requireAvailableCredit && (!['pending', 'approved'].includes(status)
-          || (paymentType === 'CHEQUE' && (status !== 'approved' || chequeStatus !== 'CLEARED')))) {
-        return { ok: false, message: `Receipt ${pay.receipt_no || pay.id} is awaiting clearance or has been rejected. Review it in Accounts.` };
+      // A pending cheque can reserve the shop. Accounts determines when the payment posts.
+      const usableCheque = paymentType !== 'CHEQUE' || chequeStatus === 'CLEARED'
+        || (chequeStatus === 'PENDING' && status === 'pending');
+      if (requireAvailableCredit && (!['pending', 'approved'].includes(status) || !usableCheque)) {
+        return { ok: false, message: `Receipt ${pay.receipt_no || pay.id} is rejected or has an ineligible cheque status. Review it in Accounts.` };
       }
       const isBankish = paymentType === 'BANK' || paymentType === 'CHEQUE';
       const receiptText = posting || requireAvailableCredit ? value => value ?? null : up;
