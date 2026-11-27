@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import http from 'http';
 import app from './app.js';
-import pool, { bootSchemaReady, connectDB } from './config/db.js';
+import pool, { bootSchemaReady, connectDB, schemaHas } from './config/db.js';
 import { initSocket } from './config/socket.js';
 import { recoverOcrQueue } from './queue/ocrQueue.js';
 import { validateProductionSecurity } from './security/production.js';
@@ -12,6 +12,7 @@ import { migrateBookingAccountsLoginAccess } from './migrations/047_booking_acco
 import { migrateBrokerMobilePush } from './migrations/048_broker_mobile_push.js';
 import { migrateMemberBookingName } from './migrations/051_member_booking_name.js';
 import { migrateMemberCodeIds } from './migrations/053_member_code_ids.js';
+import { migrateMobileAccountRecovery } from './migrations/055_mobile_account_recovery.js';
 
 validateProductionSecurity();
 
@@ -34,6 +35,10 @@ async function start() {
       await migrateBookingAccountsLoginAccess(pool);
       await migrateBrokerMobilePush(pool);
       await migrateMemberCodeIds(pool);
+    }
+    if (process.env.MOBILE_PORTAL_ENABLED === 'true'
+      && !(await schemaHas({ relations: ['booking_client_password_resets'] }, pool))) {
+      await migrateMobileAccountRecovery(pool);
     }
     console.log(`[booking-api] migrations checked ${uptimeMs()} ms`);
   } catch (err) {

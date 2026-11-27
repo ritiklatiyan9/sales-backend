@@ -8,6 +8,7 @@ import { createMobilePushDevices } from '../services/mobilePush.service.js';
 import staffAuthMiddleware, { clientInvitationAuthMiddleware } from '../middlewares/auth.middleware.js';
 import { createMobileAccountProvisioner } from '../services/mobileAccountProvision.service.js';
 import { createClientInvitationService } from '../services/clientInvitation.service.js';
+import { createMobileAccountRecovery } from '../services/mobileAccountRecovery.service.js';
 
 const gzipAsync = promisify(gzip);
 export async function sendPortfolioJson(req, res, payload) {
@@ -78,6 +79,10 @@ export function createMobilePortalRouter(service, {
   staffAuth = staffAuthMiddleware, accountProvisionAuth = clientInvitationAuthMiddleware,
   accountProvisioner = createMobileAccountProvisioner(pool),
   invitationService = createClientInvitationService(pool),
+  accountRecovery = createMobileAccountRecovery(pool),
+  recoveryLimiter = credentialLimiter(req => (
+    typeof req.body?.code === 'string' && req.body.code.length === 43 ? req.body.code : 'invalid'
+  )),
 } = {}) {
   const router = express.Router();
   const run = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(error => {
@@ -112,6 +117,15 @@ export function createMobilePortalRouter(service, {
     next();
   });
   router.get('/health', (_req, res) => res.json({ status: 'ok', service: 'my-real-assets', backend: 'bookings' }));
+  router.post('/admin/password-resets', accountProvisionAuth, run(async (req, res) => {
+    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can issue a password reset link.' });
+    res.json(await accountRecovery.issue({
+      memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actor: req.user,
+    }));
+  }));
+  router.post('/auth/password-reset/confirm', recoveryLimiter, run(async (req, res) => {
+    res.json(await accountRecovery.confirm(req.body));
+  }));
   router.post('/auth/activate', loginLimiter, run(async (req, res) => res.json(await service.activate(req.body))));
   router.post('/auth/login', loginLimiter, run(async (req, res) => res.json(await service.login(req.body))));
   router.use(run(async (req, res, next) => {

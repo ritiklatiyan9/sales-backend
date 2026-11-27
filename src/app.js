@@ -27,9 +27,9 @@ const corsOptions = {
   exposedHeaders: ['Retry-After'], // the client honours a 429's wait instead of retrying blind
   maxAge: 7200,
 };
-// The Accounts client screen can provision access, but only this endpoint
-// accepts its browser origin; every request still needs staff authentication.
-app.use('/api/mobile/admin/accounts', cors({
+// The Accounts client screen can manage mobile access through these two paths.
+// Every request still needs staff authentication.
+app.use(['/api/mobile/admin/accounts', '/api/mobile/admin/password-resets'], cors({
   origin: (origin, callback) => callback(null, origin === 'https://dgdefence.com' || origin === 'https://www.dgdefence.com'),
   methods: ['POST'], allowedHeaders: ['Authorization', 'Content-Type'], maxAge: 600,
 }));
@@ -51,6 +51,15 @@ if (process.env.NODE_ENV !== 'production') {
 
 // The mobile apps' privacy and deletion pages must be publicly readable,
 // including by app-store reviewers, without exposing the rest of the API.
+app.get('/my-real-assets/reset-password.html', (_req, res) => {
+  res.set({
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.sendFile(path.join(process.cwd(), 'public', 'my-real-assets', 'reset-password.html'));
+});
 app.use('/my-real-assets', express.static(path.join(process.cwd(), 'public', 'my-real-assets'), { dotfiles: 'deny', index: false }));
 app.use('/my-real-partners', express.static(path.join(process.cwd(), 'public', 'my-real-partners'), { dotfiles: 'deny', index: false }));
 
