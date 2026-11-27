@@ -6,10 +6,13 @@ import { ensureBookingCreditFields } from './bookingDrawCredits.js';
 import { syncDrawLedgerToPlot } from './drawLedgerSync.js';
 import { money, todayIST, workflowError } from './drawWorkflow.js';
 import { syncPlotBookingToAccounting } from './plotBookingSync.js';
-import { isFullAdmin } from './subAdminPermissions.js';
+import { isFullAdmin, isSubAdmin } from './subAdminPermissions.js';
+import { requireWorkspaceAccess } from './bookingWorkspaceAccess.js';
+
+const canBookShop = user => isFullAdmin(user) || isSubAdmin(user);
 
 export function supportsDrawShopBooking(siteId, siteName, organizationId, user) {
-  return isFullAdmin(user) && user.organization_id != null && Number(user.organization_id) === Number(organizationId)
+  return canBookShop(user) && user.organization_id != null && Number(user.organization_id) === Number(organizationId)
     && Number(siteId) === 7 && siteName?.trim().toLowerCase() === 'naya baazar unn commercial';
 }
 
@@ -22,7 +25,7 @@ function positiveId(value) {
 }
 
 async function readRegistration(db, user, registrationId, lock = false) {
-  if (!isFullAdmin(user)) throw workflowError('Only an admin can book a shop from a draw.', 403);
+  if (!canBookShop(user)) throw workflowError('Only admins and sub-admins can book a shop from a draw.', 403);
   const { rows: [draw] } = await db.query(`
     SELECT r.id, r.registration_no, r.site_id, s.name AS site_name, s.organization_id,
            r.client_member_id, m.full_name AS client_name, m.status AS client_status, r.agent_user_id, r.broker_member_id, r.is_winner,
@@ -35,6 +38,7 @@ async function readRegistration(db, user, registrationId, lock = false) {
   if (!supportsDrawShopBooking(draw.site_id, draw.site_name, draw.organization_id, user)) {
     throw workflowError('Direct shop booking is available only for Naya Baazar Unn Commercial.', 403);
   }
+  if (isSubAdmin(user)) await requireWorkspaceAccess(user, draw.site_id, 'booking_draws', 'can_update', db);
   if (!draw.is_winner && !draw.booking_id) {
     const { rows: [schema] } = await db.query("SELECT to_regclass('public.pool_money_results') IS NOT NULL AS has_results");
     if (schema.has_results) {
@@ -94,7 +98,7 @@ export async function drawShopBookingOptions(registrationId, user, db = pool) {
 }
 
 export async function bookShopFromDraw(registrationId, body, user, database = pool) {
-  if (!isFullAdmin(user)) throw workflowError('Only an admin can book a shop from a draw.', 403);
+  if (!canBookShop(user)) throw workflowError('Only admins and sub-admins can book a shop from a draw.', 403);
   const plotId = positiveId(body.plot_id);
   const reviewedTotal = money(body.expected_draw_credit_amount, 'Reviewed draw total');
   const reviewedPrice = money(body.expected_sale_price, 'Reviewed shop price');

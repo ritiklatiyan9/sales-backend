@@ -89,7 +89,7 @@ test('Book Shop validates the reviewed draw, books its client before the draw op
   assert.deepEqual(options.data.receipts.map(r => r.receipt_no), ['CASH-25', 'BANK-45']);
   assert.equal((await request(getDrawShopBooking, { id: 302 })).status, 403);
   assert.equal((await request(getDrawShopBooking, { user: { ...admin, organization_id: 2 } })).status, 403);
-  assert.equal((await request(createDrawShopBooking, { body: review, user: { ...admin, role: 'sub_admin' } })).status, 403);
+  assert.equal((await request(createDrawShopBooking, { body: review, user: { ...admin, role: 'agent' } })).status, 403);
   for (const changes of [{ plot_id: 402 }, { plot_id: 403 }, { plot_id: 404 }, { plot_id: 405 }, { plot_id: 1 },
     { expected_sale_price: 800000 }, { expected_draw_credit_amount: 50000 }, { client_member_id: 203 }, { site_id: 1 }]) {
     assert.equal((await submit(changes)).status, 409);
@@ -132,6 +132,30 @@ test('Book Shop validates the reviewed draw, books its client before the draw op
   const { rows: [event] } = await f.query("SELECT detail, actor_user_id FROM draw_events WHERE event_type='ALLOTTED'");
   assert.equal(event.actor_user_id, admin.id);
   assert.equal(event.detail.previous_status, 'SLIP_ISSUED');
+});
+
+test('Book Shop allows a sub-admin with Draws update access in their assigned project', async t => {
+  const f = await fixture(t);
+  await collect(f.db);
+  const user = { id: 2, role: 'sub_admin', organization_id: 1, grants: { booking_draws: [true, false, true, false] } };
+  assert.equal((await request(getDrawShopBooking, { user })).status, 403);
+  assert.equal((await request(createDrawShopBooking, { user, body: review })).status, 403);
+
+  await f.db.exec("UPDATE users SET role='sub_admin' WHERE id=2; INSERT INTO user_sites(user_id, site_id) VALUES (2,7)");
+  const readOnly = { ...user, grants: { booking_draws: [true, false, false, false] } };
+  assert.equal((await request(getDrawShopBooking, { user: readOnly })).status, 403);
+  assert.equal((await request(createDrawShopBooking, { user: readOnly, body: review })).status, 403);
+  const register = await request(listDraws, { user, query: { site_id: site, view: 'active' } });
+  assert.equal(register.data.find(row => row.id === draw).direct_shop_booking_enabled, true);
+  const options = await request(getDrawShopBooking, { user });
+  assert.equal(options.status, 200);
+  assert.deepEqual(options.data.shops.map(row => row.id), [shop]);
+  const booking = await request(createDrawShopBooking, {
+    user, body: { ...review, receipt_version: options.data.receipt_version },
+  });
+  assert.equal(booking.status, 201, JSON.stringify(booking.data));
+  const { rows: [saved] } = await f.query('SELECT allotted_by FROM draw_registrations WHERE id=$1', [draw]);
+  assert.equal(saved.allotted_by, user.id);
 });
 
 test('Accounts adopts the original cash and bank entries and rolls everything back when the second transfer fails',
