@@ -104,6 +104,12 @@ export function createMobilePortalRouter(service, {
     const issuedBy = Number(req.user.id);
     return res.json(await invitationService.issue({ memberId, issuedBy, identityVerified: req.body?.identityVerified }));
   }));
+  router.post('/admin/password-resets', accountProvisionAuth, run(async (req, res) => {
+    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can issue a password reset.' });
+    res.json(await accountRecovery.issue({
+      memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actor: req.user,
+    }));
+  }));
   router.get('/status', (_req, res) => res.json({
     service: 'my-real-assets', apiVersion: 1, enabled: Boolean(isEnabled()), sessionDurationDays: CLIENT_MOBILE_SESSION_DAYS,
     authMode: 'client-password-v1',
@@ -117,12 +123,6 @@ export function createMobilePortalRouter(service, {
     next();
   });
   router.get('/health', (_req, res) => res.json({ status: 'ok', service: 'my-real-assets', backend: 'bookings' }));
-  router.post('/admin/password-resets', accountProvisionAuth, run(async (req, res) => {
-    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can issue a password reset.' });
-    res.json(await accountRecovery.issue({
-      memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actor: req.user,
-    }));
-  }));
   router.post('/auth/password-reset/confirm', recoveryLimiter, run(async (req, res) => {
     res.json(await accountRecovery.confirm(req.body));
   }));

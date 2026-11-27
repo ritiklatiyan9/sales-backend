@@ -1,13 +1,15 @@
 import { createHash } from 'node:crypto';
 import pool from '../config/db.js';
 import bookingModel from '../models/Booking.model.js';
-import drawModel, { ACCOUNTS_BOOKED_SHOP_MATCH } from '../models/Draw.model.js';
+import drawModel, { ACCOUNTS_BOOKED_SHOP_MATCH, DRAW_RECEIPT_LINKED_TO_SHOP } from '../models/Draw.model.js';
+import kycCaseModel from '../models/KycCase.model.js';
 import { ensureBookingCreditFields } from './bookingDrawCredits.js';
 import { syncDrawLedgerToPlot } from './drawLedgerSync.js';
 import { money, todayIST, workflowError } from './drawWorkflow.js';
 import { syncPlotBookingToAccounting } from './plotBookingSync.js';
 import { isFullAdmin, isSubAdmin } from './subAdminPermissions.js';
 import { requireWorkspaceAccess } from './bookingWorkspaceAccess.js';
+import { findBrokerReferral, parseMemberCode } from './memberCodes.js';
 
 const canBookShop = user => isFullAdmin(user) || isSubAdmin(user);
 
@@ -20,13 +22,24 @@ export function supportsDrawShopBooking(siteId, siteName, organizationId, user) 
   return canShowAccountsShopBookings(siteId, siteName, user) && Number(user.organization_id) === Number(organizationId);
 }
 
+export async function registeredDrawBroker(draw, db) {
+  if (draw.broker_member_id) {
+    const { rows: [broker] } = await db.query('SELECT id,full_name FROM members WHERE id=$1 AND site_id=$2', [draw.broker_member_id, draw.site_id]);
+    if (broker?.full_name?.trim()) return broker;
+  }
+  if (parseMemberCode(draw.broker_code)?.role === 'BROKER') {
+    const broker = await findBrokerReferral(draw.broker_code, draw.site_id, db);
+    if (broker?.full_name?.trim()) return broker;
+  }
+  if (draw.broker_member_id || draw.broker_code) throw workflowError('The broker saved on this draw could not be found in this project.', 409);
+  return null;
+}
+
 export async function accountsBookedShopsForDraws(registrationIds, db = pool) {
   const shopsByDraw = new Map();
   if (!registrationIds.length) return shopsByDraw;
   const { rows } = await db.query(`
-    SELECT r.id AS draw_id, shop.plot_no, shop.block,
-      EXISTS (SELECT 1 FROM draw_payments dp JOIN plot_payments pp ON pp.id=dp.plot_payment_id
-        WHERE dp.draw_registration_id=r.id AND pp.plot_id=shop.id AND pp.site_id=r.site_id) AS receipt_linked
+    SELECT r.id AS draw_id, shop.plot_no, shop.block, ${DRAW_RECEIPT_LINKED_TO_SHOP} AS receipt_linked
     FROM draw_registrations r JOIN plots shop ON ${ACCOUNTS_BOOKED_SHOP_MATCH}
     WHERE r.id=ANY($1::int[])
     ORDER BY shop.block,shop.plot_no,shop.id`, [registrationIds]);
@@ -50,7 +63,7 @@ async function readRegistration(db, user, registrationId, lock = false) {
   if (!canBookShop(user)) throw workflowError('Only admins and sub-admins can book a shop from a draw.', 403);
   const { rows: [draw] } = await db.query(`
     SELECT r.id, r.registration_no, r.site_id, s.name AS site_name, s.organization_id,
-           r.client_member_id, m.full_name AS client_name, m.status AS client_status, r.agent_user_id, r.broker_member_id, r.is_winner,
+           r.client_member_id, m.full_name AS client_name, m.status AS client_status, r.agent_user_id, r.broker_member_id, r.broker_code, r.is_winner,
            r.status, r.required_amount, r.booking_id, r.allotted_plot_id, kyc.id AS kyc_id, kyc.status AS kyc_status
     FROM draw_registrations r JOIN sites s ON s.id=r.site_id
     JOIN members m ON m.id=r.client_member_id AND m.site_id=r.site_id
@@ -112,9 +125,11 @@ export async function drawShopBookingOptions(registrationId, user, db = pool) {
   const draw = await readRegistration(db, user, registrationId);
   const receipts = await readReceipts(db, draw);
   const reason = bookingBlock(draw, receipts);
+  const broker = reason ? null : await registeredDrawBroker(draw, db);
   return {
     id: draw.id, site_id: draw.site_id, registration_no: draw.registration_no, client_member_id: draw.client_member_id,
     client_name: draw.client_name, booking_id: draw.booking_id, allotted_plot_id: draw.allotted_plot_id,
+    broker_name: broker?.full_name, broker_code: draw.broker_code,
     receipts: receipts.rows, receipt_version: receipts.version, total: receipts.total, reason, shops: reason ? [] : await availableShops(db, draw.site_id),
   };
 }
@@ -136,28 +151,28 @@ export async function bookShopFromDraw(registrationId, body, user, database = po
         receipts.total !== reviewedTotal || receipts.version !== body.receipt_version) {
       throw workflowError('The registration or its receipts changed. Refresh and review the booking.', 409);
     }
+    // Winner allotments also lock KYC before inventory.
+    await db.query('SELECT id FROM kyc_cases WHERE id=$1 FOR UPDATE', [draw.kyc_id]);
     const [shop] = await availableShops(db, draw.site_id, plotId);
     if (!shop) throw workflowError('This shop is no longer available in this project. Choose another shop.', 409);
     if (Number(shop.sale_price) !== reviewedPrice) throw workflowError('The shop price changed. Refresh and review the booking.', 409);
     if (receipts.total > reviewedPrice) throw workflowError('The draw credit exceeds the shop price. Review the receipts in Accounts.', 409);
 
+    const broker = await registeredDrawBroker(draw, db);
     const booking = await bookingModel.create({
       site_id: draw.site_id, plot_id: shop.id, client_member_id: draw.client_member_id, buyer_name: draw.client_name,
-      agent_user_id: draw.agent_user_id, booking_agent_id: draw.broker_member_id,
+      agent_user_id: draw.agent_user_id, booking_agent_id: broker?.id ?? null,
       team_id: draw.agent_user_id ? (await db.query('SELECT team_id FROM users WHERE id=$1', [draw.agent_user_id])).rows[0]?.team_id : null,
       booking_date: todayIST(), sale_price: shop.sale_price, payment_plan: shop.has_installments ? 'INSTALLMENT' : 'FULL',
       first_installment_amount: Number(shop.first_installment) > 0 ? shop.first_installment : null, token_amount: 0,
-      status: 'CONFIRMED', kyc_status: 'VERIFIED', booked_by: user.email || null, created_by: user.id,
+      status: 'CONFIRMED', kyc_status: 'VERIFIED', booked_by: broker?.full_name || user.email || null, created_by: user.id,
       notes: `Shop booked from draw registration ${draw.registration_no || draw.id}`,
     }, db);
     const bookingNo = await bookingModel.generateBookingNo(booking.id, booking.booking_date, db);
-    const kyc = await db.query(`UPDATE kyc_cases k SET booking_id=$1, updated_at=now()
-      WHERE k.id=$2 AND k.client_member_id=$3 AND k.site_id=$4 AND k.status='VERIFIED'
-        AND (k.booking_id IS NULL OR EXISTS (SELECT 1 FROM bookings b WHERE b.id=k.booking_id AND b.status='CANCELLED'))
-      RETURNING id`, [booking.id, draw.kyc_id, draw.client_member_id, draw.site_id]);
-    if (!kyc.rows.length) throw workflowError('The verified KYC is no longer available for this booking.', 409);
+    const kycCaseId = await kycCaseModel.attachVerifiedDrawCase(booking, draw.kyc_id, db);
+    if (!kycCaseId) throw workflowError('The verified KYC is no longer available for this booking.', 409);
     await db.query(`UPDATE draw_registrations SET booking_id=$2, allotted_plot_id=$3, allotted_at=now(), allotted_by=$4,
-      kyc_case_id=$5, status='ALLOTTED', updated_at=now() WHERE id=$1`, [draw.id, booking.id, shop.id, user.id, draw.kyc_id]);
+      kyc_case_id=$5, status='ALLOTTED', updated_at=now() WHERE id=$1`, [draw.id, booking.id, shop.id, user.id, kycCaseId]);
 
     // Use the same transaction-local booking context as the main Accounts register.
     await db.query("SELECT set_config('accounts.direct_plot_booking',$1,true)", [String(shop.id)]);

@@ -84,6 +84,7 @@ test('Book Shop validates the reviewed draw, books its client before the draw op
   const options = await request(getDrawShopBooking);
   assert.equal(options.status, 200);
   assert.equal(options.data.reason, null);
+  assert.equal(options.data.broker_name, 'Draw Broker');
   assert.deepEqual(options.data.shops.map(p => p.id), [shop]);
   assert.equal(options.data.total, 100000);
   assert.deepEqual(options.data.receipts.map(r => r.receipt_no), ['CASH-25', 'BANK-45']);
@@ -108,11 +109,11 @@ test('Book Shop validates the reviewed draw, books its client before the draw op
   const bookingId = result.data.booking_id;
   assert.match(result.data.booking_no, /^BK-\d{4}-\d{6}$/);
   assert.deepEqual([result.data.plot_id, result.data.amount, result.data.receipt_count], [shop, 100000, 2]);
-  const { rows: [booking] } = await f.query(`SELECT b.client_member_id,b.status,b.booking_agent_id,b.token_amount::int,b.payment_plan,
+  const { rows: [booking] } = await f.query(`SELECT b.client_member_id,b.status,b.booking_agent_id,b.booked_by,b.created_by,b.token_amount::int,b.payment_plan,
     b.first_installment_amount::int,p.status AS shop_status,p.buyer_member_id,p.buyer_name,p.booking_by,r.is_winner,r.winner_marked_at,
     r.status AS draw_status,k.booking_id AS kyc_booking FROM bookings b JOIN plots p ON p.id=b.plot_id
     JOIN draw_registrations r ON r.booking_id=b.id JOIN kyc_cases k ON k.id=r.kyc_case_id WHERE b.id=$1`, [bookingId]);
-  assert.deepEqual(booking, { client_member_id: 201, status: 'CONFIRMED', booking_agent_id: 202, token_amount: 0, payment_plan: 'INSTALLMENT',
+  assert.deepEqual(booking, { client_member_id: 201, status: 'CONFIRMED', booking_agent_id: 202, booked_by: 'Draw Broker', created_by: admin.id, token_amount: 0, payment_plan: 'INSTALLMENT',
     first_installment_amount: 200000, shop_status: 'BOOKED', buyer_member_id: 201, buyer_name: 'SHOP APPLICANT', booking_by: 'DRAW BROKER',
     is_winner: false, winner_marked_at: null, draw_status: 'ALLOTTED', kyc_booking: bookingId });
   const { rows: payments } = await f.query(`SELECT d.receipt_no,p.payment_type,p.amount::int,p.created_by,p.bank_details,c.bank_account_id,
@@ -132,6 +133,50 @@ test('Book Shop validates the reviewed draw, books its client before the draw op
   const { rows: [event] } = await f.query("SELECT detail, actor_user_id FROM draw_events WHERE event_type='ALLOTTED'");
   assert.equal(event.actor_user_id, admin.id);
   assert.equal(event.detail.previous_status, 'SLIP_ISSUED');
+});
+
+test('a buyer can book two shops on separate slips that share verified KYC', async t => {
+  const f = await fixture(t);
+  await collect(f.db);
+  await f.db.exec(`
+    ALTER TABLE kyc_cases ADD COLUMN reused_from_case_id integer REFERENCES kyc_cases(id);
+    DELETE FROM website_booking_requests WHERE plot_id=403;
+    INSERT INTO documents(kyc_case_id,client_member_id,site_id,type,file_path,ocr_status)
+      VALUES(211,201,7,'PHOTO','test/verified-photo','DONE');
+    INSERT INTO ocr_results(document_id,extracted_fields)
+      SELECT id,'{"fixture":true}'::jsonb FROM documents WHERE kyc_case_id=211;
+    INSERT INTO draw_registrations(id,site_id,client_member_id,registration_no,qr_token,required_amount,status,
+      slip_no,kyc_case_id,broker_member_id,draw_opening_date,workflow_version)
+      VALUES(303,7,201,'DR-303','test-303',100000,'SLIP_ISSUED','SLIP-303',211,202,'2099-01-01',1);
+    INSERT INTO draw_payments(draw_registration_id,receipt_no,amount,payment_date,payment_from,created_by)
+      VALUES(303,'CASH-26',100000,'2026-11-08','CASH',2);
+  `);
+  const first = await submit();
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  const options = await request(getDrawShopBooking, { id: 303 });
+  assert.equal(options.data.reason, null);
+  assert.deepEqual(options.data.shops.map(p => p.id), [403]);
+  const secondRequest = { id: 303, body: { ...review, plot_id: 403, receipt_version: options.data.receipt_version } };
+  const second = await request(createDrawShopBooking, secondRequest);
+  assert.equal(second.status, 201, JSON.stringify(second.data));
+  assert.notEqual(first.data.booking_id, second.data.booking_id);
+  const { rows: cases } = await f.query(`SELECT r.id AS slip,r.allotted_plot_id AS plot,
+      k.booking_id,k.status,k.reused_from_case_id,b.booking_agent_id,d.file_path,o.extracted_fields
+    FROM draw_registrations r JOIN kyc_cases k ON k.id=r.kyc_case_id
+    JOIN bookings b ON b.id=r.booking_id JOIN documents d ON d.kyc_case_id=k.id
+    JOIN ocr_results o ON o.document_id=d.id WHERE r.id IN (301,303) ORDER BY r.id`);
+  assert.deepEqual(cases, [
+    { slip: 301, plot: 401, booking_id: first.data.booking_id, status: 'VERIFIED', reused_from_case_id: null,
+      booking_agent_id: 202, file_path: 'test/verified-photo', extracted_fields: { fixture: true } },
+    { slip: 303, plot: 403, booking_id: second.data.booking_id, status: 'VERIFIED', reused_from_case_id: 211,
+      booking_agent_id: 202, file_path: 'test/verified-photo', extracted_fields: { fixture: true } },
+  ]);
+  const { rows: credits } = await f.query(`SELECT d.receipt_no,p.plot_id FROM draw_payments d
+    JOIN plot_payments p ON p.id=d.plot_payment_id ORDER BY d.id`);
+  assert.deepEqual(credits, [
+    { receipt_no: 'CASH-25', plot_id: 401 }, { receipt_no: 'BANK-45', plot_id: 401 }, { receipt_no: 'CASH-26', plot_id: 403 },
+  ]);
+  assert.equal((await request(createDrawShopBooking, secondRequest)).status, 409);
 });
 
 test('the active Draws register reports Accounts shops and distinguishes receipts on separate slips', async t => {
@@ -163,16 +208,16 @@ test('the active Draws register reports Accounts shops and distinguishes receipt
   const allottedQuery = { site_id: site, view: 'active', status: 'ALLOTTED' };
   const allotted = await request(listDraws, { query: allottedQuery });
   assert.equal(allotted.status, 200, JSON.stringify(allotted.data));
-  assert.deepEqual(allotted.data.map(row => row.id).sort((a, b) => a - b), [301, 303, 304, 305]);
-  assert.deepEqual(allotted.data.find(row => row.id === 304).accounts_booked_shops,
+  assert.deepEqual(allotted.data.map(row => row.id).sort((a, b) => a - b), [301, 305]);
+  assert.deepEqual(register.data.find(row => row.id === 304).accounts_booked_shops,
     [{ plot_no: 'G-15', block: null, receipt_linked: false }]);
   const searched = await request(listDraws, { query: { ...allottedQuery, q: 'DR-303' } });
-  assert.deepEqual(searched.data.map(row => row.id), [303]);
+  assert.deepEqual(searched.data, []);
   const otherOrganization = await request(listDraws, { query: allottedQuery, user: { ...admin, organization_id: 2 } });
   assert.deepEqual(otherOrganization.data.map(row => row.id), [305]);
-  await f.db.exec("UPDATE plots SET approval_status='rejected' WHERE id=402");
+  await f.db.exec("UPDATE plots SET approval_status='rejected' WHERE id=401");
   const afterRejection = await request(listDraws, { query: allottedQuery });
-  assert.equal(afterRejection.data.some(row => row.id === 304), false);
+  assert.deepEqual(afterRejection.data.map(row => row.id), [305]);
 });
 
 test('Book Shop allows a sub-admin with Draws update access in their assigned project', async t => {
@@ -209,14 +254,18 @@ test('a verified Naya Baazar winner allots an approved shop directly', { skip: !
     ${migrationSql}
     CREATE TRIGGER plot_approval BEFORE INSERT OR UPDATE ON plots FOR EACH ROW EXECUTE FUNCTION queue_plot_status_approval();
     DELETE FROM plot_installments WHERE plot_id=401;
-    UPDATE draw_registrations SET status='WINNER',is_winner=true,draw_opening_date='2020-01-01' WHERE id=301;
+    UPDATE draw_registrations SET status='WINNER',is_winner=true,draw_opening_date='2020-01-01',
+      broker_member_id=NULL,broker_code='BRK-00202' WHERE id=301;
   `);
   await collect(f.db);
-  const result = await request(allotShop, { body: { plot_id: shop, booking_agent_id: 202, sale_price: 900000 } });
+  const result = await request(allotShop, { body: { plot_id: shop, sale_price: 900000 } });
   assert.equal(result.status, 200, JSON.stringify(result.data));
   assert.equal(result.data.status, 'ALLOTTED');
   const { rows: [saved] } = await f.query('SELECT status,approval_status,buyer_member_id,booking_by,sale_price::int FROM plots WHERE id=$1', [shop]);
   assert.deepEqual(saved, { status: 'BOOKED', approval_status: 'approved', buyer_member_id: 201, booking_by: 'DRAW BROKER', sale_price: 900000 });
+  const { rows: [booking] } = await f.query('SELECT booking_agent_id,booked_by,created_by FROM bookings WHERE id=$1', [result.data.booking_id]);
+  assert.deepEqual(booking, { booking_agent_id: 202, booked_by: 'Draw Broker', created_by: admin.id });
+  assert.deepEqual((await f.query('SELECT DISTINCT booked_by FROM plot_payments WHERE plot_id=$1', [shop])).rows, [{ booked_by: 'DRAW BROKER' }]);
 });
 
 test('Accounts adopts the original cash and bank entries and rolls everything back when the second transfer fails',

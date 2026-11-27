@@ -52,14 +52,49 @@ class KycCaseModel extends MasterModel {
     }, pool);
   }
 
+  async attachVerifiedDrawCase(booking, caseId, db) {
+    const { rows: [source] } = await db.query(`SELECT k.id,k.booking_id,k.mode,k.verified_by,k.verified_at,
+        to_jsonb(k) ? 'reused_from_case_id' AS tracks_reuse, b.status AS booking_status
+      FROM kyc_cases k LEFT JOIN bookings b ON b.id=k.booking_id
+        AND b.client_member_id=k.client_member_id AND b.site_id=k.site_id
+      WHERE k.id=$1 AND k.client_member_id=$2 AND k.site_id=$3 AND k.status='VERIFIED'
+        AND (k.booking_id IS NULL OR b.id IS NOT NULL) FOR UPDATE OF k`,
+    [caseId, booking.client_member_id, booking.site_id]);
+    if (!source) return null;
+    if (source.booking_id == null || source.booking_status === 'CANCELLED') {
+      await db.query('UPDATE kyc_cases SET booking_id=$1,updated_at=now() WHERE id=$2', [booking.id, source.id]);
+      return source.id;
+    }
+
+    // A second shop gets its own case and document records for the same verified buyer.
+    const { rows: [target] } = await db.query(`INSERT INTO kyc_cases
+      (booking_id,client_member_id,site_id,mode,status,verified_by,verified_at,created_by${source.tracks_reuse ? ',reused_from_case_id' : ''})
+      VALUES ($1,$2,$3,$4,'VERIFIED',$5,$6,$7${source.tracks_reuse ? ',$8' : ''}) RETURNING id`,
+    [booking.id, booking.client_member_id, booking.site_id, source.mode, source.verified_by, source.verified_at,
+      booking.created_by ?? null, ...(source.tracks_reuse ? [source.id] : [])]);
+    const { rows: documents } = await db.query(`SELECT id FROM documents WHERE kyc_case_id=$1
+      AND (site_id IS NULL OR site_id=$2) AND (client_member_id IS NULL OR client_member_id=$3) ORDER BY id FOR SHARE`,
+    [source.id, booking.site_id, booking.client_member_id]);
+    for (const document of documents) {
+      const { rows: [copy] } = await db.query(`INSERT INTO documents
+        (kyc_case_id,client_member_id,site_id,type,member_document_field,file_path,file_hash,mime_type,file_size,ocr_status,ocr_engine,ocr_error,ocr_completed_at)
+        SELECT $1,$2,$3,type,member_document_field,file_path,file_hash,mime_type,file_size,
+          CASE WHEN ocr_status='PROCESSING' THEN 'PENDING' ELSE ocr_status END,ocr_engine,ocr_error,ocr_completed_at
+        FROM documents WHERE id=$4 RETURNING id`, [target.id, booking.client_member_id, booking.site_id, document.id]);
+      await db.query(`INSERT INTO ocr_results (document_id,raw_text,extracted_fields,confidence_overall,confidence_map,engine,processed_at)
+        SELECT $1,raw_text,extracted_fields,confidence_overall,confidence_map,engine,processed_at
+        FROM ocr_results WHERE document_id=$2 ORDER BY id DESC LIMIT 1`, [copy.id, document.id]);
+    }
+    return target.id;
+  }
+
   /**
    * Adopt the customer's pre-existing KYC into a freshly-created booking:
    * member-anchored cases (opened by an agent before this booking existed) AND cases
    * stranded on the member's CANCELLED bookings, so a re-booking never restarts KYC
    * from zero. Keeps exactly ONE case per booking (strongest wins, others' documents
    * fold into it), rolls the booking's kyc_status up from the surviving case, and
-   * opens a fresh case when the member had none. Shared by createBooking and the
-   * draw-allotment flow. Returns the number of adopted cases.
+   * opens a fresh case when the member had none. Returns the number of adopted cases.
    */
   async adoptForBooking(booking, pool) {
     const { rows: adopted } = await pool.query(

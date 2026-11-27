@@ -12,7 +12,7 @@ export const DEFAULT_SIDEBAR_LAYOUT = [
   { id:'records', items:['/plot-documents','/agreements'] },
   { id:'network', items:['/network','/teams'] },
   { id:'sites', items:['/project-details','/project-details?section=payments'] },
-  { id:'administration', items:['/profile','/access','/module-show'] },
+  { id:'administration', items:['/profile','/access','/module-show','/draws/reset-password'] },
 ];
 export const canManageSidebar = user => ['admin','super_admin'].includes(user?.role);
 const fail = message => { throw Object.assign(new Error(message), { status:400 }); };

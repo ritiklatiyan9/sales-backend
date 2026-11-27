@@ -13,7 +13,7 @@ import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
-import { accountsBookedShopsForDraws, bookShopFromDraw, canShowAccountsShopBookings, drawShopBookingOptions, supportsDrawShopBooking } from '../services/drawShopBooking.js';
+import { accountsBookedShopsForDraws, bookShopFromDraw, canShowAccountsShopBookings, drawShopBookingOptions, registeredDrawBroker, supportsDrawShopBooking } from '../services/drawShopBooking.js';
 import { drawPaymentAccounting, drawPaymentMutationError, editedDrawPayment, removeDrawPayment, saveDrawPaymentEdit } from '../services/drawPaymentMutations.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
@@ -488,10 +488,11 @@ export const getDraw = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You are not authorised to view this draw registration' });
   }
   await requireSiteAccess(req.user, detail.site_id);
+  const directShopBookingEnabled = supportsDrawShopBooking(detail.site_id, detail.site_name, detail.site_organization_id, req.user);
   if (detail.client_photo) detail.client_photo = await signMemberDocumentUrl(detail.client_photo);
   const savedSignatures=await signatures;
   if(savedSignatures?.form_snapshot?.draw?.client_photo) savedSignatures.form_snapshot.draw.client_photo=await signMemberDocumentUrl(savedSignatures.form_snapshot.draw.client_photo);
-  res.json({ ...detail, application_signatures: savedSignatures });
+  res.json({ ...detail, direct_shop_booking_enabled: directShopBookingEnabled, application_signatures: savedSignatures });
 });
 
 /** POST /draws/:id/eligibility-override — approve entry before the full draw amount is paid. */
@@ -978,6 +979,7 @@ export async function allotDrawBooking({ registrationId, body, user }) {
 
     // The allotment becomes a real booking so every downstream ERP flow (agreement
     // form, KYC dossier, plot ledger) works unchanged for draw winners.
+    const broker = await registeredDrawBroker(registration, client);
     const booking = await bookingModel.create({
       site_id: registration.site_id,
       plot_id: plot.id,
@@ -992,24 +994,25 @@ export async function allotDrawBooking({ registrationId, body, user }) {
       token_bank_name: clean(req.body.token_bank_name), token_branch: clean(req.body.token_branch),
       token_bank_details: clean(req.body.token_bank_details), token_cheque_no: clean(req.body.token_cheque_no),
       token_narration: clean(req.body.token_narration), token_received_by: clean(req.body.token_received_by),
-      booking_agent_id: req.body.booking_agent_id || null,
+      booking_agent_id: broker?.id ?? (req.body.booking_agent_id || null),
       payment_plan: paymentPlan,
       booking_date: bookingDate,
       status: 'CONFIRMED',
-      kyc_status: 'NOT_STARTED',
-      booked_by: req.user?.email || null,
+      kyc_status: 'VERIFIED',
+      booked_by: broker?.full_name || req.user?.email || null,
       notes: `Allotted via lucky draw ${registration.registration_no} (slip ${registration.slip_no})`,
       created_by: req.user?.id || null,
     }, client);
     const booking_no = await bookingModel.generateBookingNo(booking.id, booking.booking_date, client);
-    await kycCaseModel.adoptForBooking(booking, client);
+    const kycCaseId = await kycCaseModel.attachVerifiedDrawCase(booking, liveKyc.kyc_case_id, client);
+    if (!kycCaseId) throw workflowError('The verified KYC is no longer available for this booking.', 409);
 
     await client.query(
       `UPDATE draw_registrations
           SET allotted_plot_id = $1, allotted_at = now(), allotted_by = $2,
-              booking_id = $3, kyc_case_id = (SELECT id FROM kyc_cases WHERE booking_id = $3 ORDER BY id DESC LIMIT 1), status = 'ALLOTTED', updated_at = now()
+              booking_id = $3, kyc_case_id = $5, status = 'ALLOTTED', updated_at = now()
         WHERE id = $4`,
-      [plot.id, req.user.id, booking.id, registration.id]
+      [plot.id, req.user.id, booking.id, registration.id, kycCaseId]
     );
     await drawModel.logEvent(
       registration.id, 'ALLOTTED',
@@ -1029,14 +1032,15 @@ export async function allotDrawBooking({ registrationId, body, user }) {
          booking_date = $2, sale_price = $3, first_installment = $4,
          installments_enabled = $5, interest_enabled = $6, interest_rate = $7,
          interest_type = $8, grace_period_days = $9, penalty_enabled = $10,
-         penalty_rate = $11, penalty_type = $12, free_to_sale_days = $13
+         penalty_rate = $11, penalty_type = $12, free_to_sale_days = $13,
+         booking_by = COALESCE($15, booking_by)
        WHERE id = $14`,
       [registration.client_member_id, bookingDate, salePrice,
         installmentPlan?.firstInstallment || 0, !!settings,
         settings?.interest_enabled || false, settings?.interest_rate || 0,
         settings?.interest_type || 'per_month', settings?.grace_period_days ?? 15,
         settings?.penalty_enabled || false, settings?.penalty_rate || 0,
-        settings?.penalty_type || 'per_day', settings?.free_to_sale_days || 0, plot.id]
+        settings?.penalty_type || 'per_day', settings?.free_to_sale_days || 0, plot.id, broker?.full_name?.trim().toUpperCase() ?? null]
     );
     if (installmentPlan) {
       const values = installmentPlan.rows.flatMap((row, index) => [plot.id, row.installment_name, row.amount, row.due_date, index + 1]);

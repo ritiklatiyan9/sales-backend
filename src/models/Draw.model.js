@@ -8,6 +8,8 @@ const websiteRequestsReady = new WeakMap();
 export const ACCOUNTS_BOOKED_SHOP_MATCH = `shop.site_id=r.site_id AND shop.buyer_member_id=r.client_member_id
   AND shop.unit_type='shop' AND shop.status IN ('BOOKED','SOLD','REGISTRY','REGISTERED')
   AND shop.approval_status IN ('approved','pending') AND shop.plot_tag IS DISTINCT FROM 'OLD' AND shop.booking_cancelled_at IS NULL`;
+export const DRAW_RECEIPT_LINKED_TO_SHOP = `EXISTS (SELECT 1 FROM draw_payments dp JOIN plot_payments pp ON pp.id=dp.plot_payment_id
+  WHERE dp.draw_registration_id=r.id AND pp.plot_id=shop.id AND pp.site_id=r.site_id)`;
 
 const WORKFLOW_BROKER_NAME_SQL = `COALESCE(NULLIF(BTRIM(draw_broker.full_name), ''), NULLIF(BTRIM(broker_member.full_name), ''),
   NULLIF(BTRIM(registration_broker.name), ''), NULLIF(BTRIM(booking_broker.name), ''))`;
@@ -83,7 +85,7 @@ class DrawModel extends MasterModel {
       if (status === 'ALLOTTED' && accountsBookingOrganizationId != null) {
         params.push(accountsBookingOrganizationId);
         where.push(`(${statusMatch} OR (s.organization_id = $${params.length}
-          AND EXISTS (SELECT 1 FROM plots shop WHERE ${ACCOUNTS_BOOKED_SHOP_MATCH})))`);
+          AND EXISTS (SELECT 1 FROM plots shop WHERE ${ACCOUNTS_BOOKED_SHOP_MATCH} AND ${DRAW_RECEIPT_LINKED_TO_SHOP})))`);
       } else {
         where.push(statusMatch);
       }
@@ -265,6 +267,7 @@ class DrawModel extends MasterModel {
              m.state AS client_state, m.pincode AS client_pincode,
              m.father_name AS client_father, m.aadhar_no AS client_aadhar, m.pan_no AS client_pan,
              s.name AS site_name, s.address AS site_address, s.city AS site_city, s.state AS site_state,
+             (to_jsonb(s)->>'organization_id')::integer AS site_organization_id,
              au.name AS agent_name, au.phone AS agent_phone, au.referral_code AS agent_referral_code,
              consultant.name AS broker_name, consultant.phone AS broker_phone,
              p.plot_no AS allotted_plot_no, p.block AS allotted_plot_block, p.plot_size AS allotted_plot_size,
