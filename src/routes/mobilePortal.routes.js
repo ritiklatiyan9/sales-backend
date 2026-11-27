@@ -118,7 +118,7 @@ export function createMobilePortalRouter(service, {
   });
   router.get('/health', (_req, res) => res.json({ status: 'ok', service: 'my-real-assets', backend: 'bookings' }));
   router.post('/admin/password-resets', accountProvisionAuth, run(async (req, res) => {
-    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can issue a password reset link.' });
+    if (req.user?.role !== 'super_admin') return res.status(403).json({ message: 'Only a super administrator can issue a password reset.' });
     res.json(await accountRecovery.issue({
       memberId: Number(req.body?.memberId), identityVerified: req.body?.identityVerified, actor: req.user,
     }));

@@ -208,7 +208,7 @@ const retirePreviousAutoCommission = async ({ plotId, siteId, prevName }, db) =>
  * created_by, booking_date, booking_agent_id.
  * Returns a summary object; never throws (errors are logged + returned as { ok:false }).
  */
-export const syncPlotBookingToAccounting = async (booking, db = pool) => {
+export const syncPlotBookingToAccounting = async (booking, db = pool, { directShopTerms } = {}) => {
   try {
     if (!booking?.plot_id) return { ok: true, skipped: 'no_plot' };
 
@@ -255,7 +255,23 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
       ? { bookingByName: plot.booking_by, agentId: null, autoCreatedMember: false }
       : await resolveBookingBy({ booking, plotSiteId: plot.site_id }, db);
 
-    // Flip the accounting plot to BOOKED. Names upper-cased to match accounting convention.
+    const values = [
+      buyerName.trim().toUpperCase(),
+      !managedAllocations && bookingByName ? bookingByName.trim().toUpperCase() : null,
+      booking.booking_date || null,
+      parseInt(plot.id),
+      parseInt(booking.client_member_id),
+      plot.booking_by ?? null,
+    ];
+    if (directShopTerms) {
+      const { salePrice, firstInstallment, settings } = directShopTerms;
+      values.push(salePrice, firstInstallment, !!settings, settings?.interest_enabled || false,
+        settings?.interest_rate || 0, settings?.interest_type || 'per_month', settings?.grace_period_days ?? 15,
+        settings?.penalty_enabled || false, settings?.penalty_rate || 0, settings?.penalty_type || 'per_day',
+        settings?.free_to_sale_days || 0);
+      // The allotment caller holds the shop lock and owns this transaction.
+      await db.query("SELECT set_config('accounts.direct_plot_booking', $1, true)", [String(plot.id)]);
+    }
     const updatedPlot = await db.query(
       `UPDATE plots
           SET status       = 'BOOKED',
@@ -263,21 +279,18 @@ export const syncPlotBookingToAccounting = async (booking, db = pool) => {
               buyer_member_id = $5,
               booking_by   = CASE WHEN booking_by IS DISTINCT FROM $6 THEN booking_by
                                   ELSE COALESCE($2, booking_by) END,
-              booking_date = COALESCE(booking_date, $3),
+              booking_date = ${directShopTerms ? '$3' : 'COALESCE(booking_date, $3)'},
               updated_at   = NOW()
+              ${directShopTerms ? `, sale_price=$7, first_installment=$8, installments_enabled=$9,
+                interest_enabled=$10, interest_rate=$11, interest_type=$12, grace_period_days=$13,
+                penalty_enabled=$14, penalty_rate=$15, penalty_type=$16, free_to_sale_days=$17` : ''}
         WHERE id = $4
           AND upper(trim(COALESCE(status,''))) NOT IN ('CANCEL','CANCELLATION','CANCELLED','RESALE','TRANSFERRED','UNDER CANCELLATION')
           AND NULLIF(to_jsonb(plots)->>'booking_cancelled_at','') IS NULL
         RETURNING booking_by`,
-      [
-        buyerName.trim().toUpperCase(),
-        !managedAllocations && bookingByName ? bookingByName.trim().toUpperCase() : null,
-        booking.booking_date || null,
-        parseInt(plot.id),
-        parseInt(booking.client_member_id),
-        plot.booking_by ?? null,
-      ]
+      values
     );
+    if (directShopTerms) await db.query("SELECT set_config('accounts.direct_plot_booking', '', true)");
 
     if (!updatedPlot.rows.length) return { ok: false, reason: 'historical_booking_requires_new_plot', plot_id: plot.id };
 

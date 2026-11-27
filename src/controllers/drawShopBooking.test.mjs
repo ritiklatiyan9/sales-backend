@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import test from 'node:test';
 import { drawFixture } from '../test/drawFixture.mjs';
-import { getDrawShopBooking, createDrawShopBooking, listDraws } from './draw.controller.js';
+import { allotShop, getDrawShopBooking, createDrawShopBooking, listDraws } from './draw.controller.js';
 import { deleteBooking, updateBooking } from './booking.controller.js';
 
 const site = 7;
@@ -139,10 +139,15 @@ test('the active Draws register reports Accounts shops and distinguishes receipt
   await collect(f.db);
   await f.db.exec(`
     UPDATE plots SET status='BOOKED',buyer_member_id=201 WHERE id IN (401,402,403,404);
+    UPDATE plots SET buyer_member_id=204 WHERE id=402;
     UPDATE plots SET plot_tag='OLD' WHERE id=403;
     UPDATE plots SET buyer_member_id=202,buyer_name='Shop Applicant' WHERE id=405;
+    INSERT INTO members(id,site_id,member_type,status,full_name) VALUES(204,7,'CLIENT','ACTIVE','Unlinked Applicant');
     INSERT INTO draw_registrations(id,site_id,client_member_id,registration_no,qr_token,required_amount,status)
-      VALUES(303,7,201,'DR-303','test-303',100000,'SLIP_ISSUED');
+      VALUES(303,7,201,'DR-303','test-303',100000,'SLIP_ISSUED'),
+        (304,7,204,'DR-304','test-304',100000,'SLIP_ISSUED'),
+        (305,7,204,'DR-305','test-305',100000,'ALLOTTED'),
+        (306,7,201,'DR-306','test-306',100000,'CANCELLED');
     INSERT INTO plot_payments(id,plot_id,site_id,amount) VALUES(501,401,7,50000);
     UPDATE draw_payments SET plot_payment_id=501 WHERE draw_registration_id=301 AND receipt_no='CASH-25';
   `);
@@ -154,6 +159,20 @@ test('the active Draws register reports Accounts shops and distinguishes receipt
   assert.deepEqual(otherSlip.accounts_booked_shops, [{ plot_no: 'G-14', block: null, receipt_linked: false }]);
   assert.equal(linked.status, 'SLIP_ISSUED');
   assert.equal(otherSlip.allotted_plot_id, null);
+
+  const allottedQuery = { site_id: site, view: 'active', status: 'ALLOTTED' };
+  const allotted = await request(listDraws, { query: allottedQuery });
+  assert.equal(allotted.status, 200, JSON.stringify(allotted.data));
+  assert.deepEqual(allotted.data.map(row => row.id).sort((a, b) => a - b), [301, 303, 304, 305]);
+  assert.deepEqual(allotted.data.find(row => row.id === 304).accounts_booked_shops,
+    [{ plot_no: 'G-15', block: null, receipt_linked: false }]);
+  const searched = await request(listDraws, { query: { ...allottedQuery, q: 'DR-303' } });
+  assert.deepEqual(searched.data.map(row => row.id), [303]);
+  const otherOrganization = await request(listDraws, { query: allottedQuery, user: { ...admin, organization_id: 2 } });
+  assert.deepEqual(otherOrganization.data.map(row => row.id), [305]);
+  await f.db.exec("UPDATE plots SET approval_status='rejected' WHERE id=402");
+  const afterRejection = await request(listDraws, { query: allottedQuery });
+  assert.equal(afterRejection.data.some(row => row.id === 304), false);
 });
 
 test('Book Shop allows a sub-admin with Draws update access in their assigned project', async t => {
@@ -178,6 +197,26 @@ test('Book Shop allows a sub-admin with Draws update access in their assigned pr
   assert.equal(booking.status, 201, JSON.stringify(booking.data));
   const { rows: [saved] } = await f.query('SELECT allotted_by FROM draw_registrations WHERE id=$1', [draw]);
   assert.equal(saved.allotted_by, user.id);
+});
+
+test('a verified Naya Baazar winner allots an approved shop directly', { skip: !existsSync(accountsMigration) }, async t => {
+  const f = await fixture(t);
+  const { migrationSql } = await import(new URL('./258_direct_plot_status.js', accountsMigration));
+  await f.db.exec(`
+    ALTER TABLE plots ADD COLUMN approved_by integer, ADD COLUMN approved_at timestamptz,
+      ADD COLUMN approval_requested_by integer, ADD COLUMN approval_requested_at timestamptz,
+      ADD COLUMN assigned_admin_id integer, ADD COLUMN created_by integer;
+    ${migrationSql}
+    CREATE TRIGGER plot_approval BEFORE INSERT OR UPDATE ON plots FOR EACH ROW EXECUTE FUNCTION queue_plot_status_approval();
+    DELETE FROM plot_installments WHERE plot_id=401;
+    UPDATE draw_registrations SET status='WINNER',is_winner=true,draw_opening_date='2020-01-01' WHERE id=301;
+  `);
+  await collect(f.db);
+  const result = await request(allotShop, { body: { plot_id: shop, booking_agent_id: 202, sale_price: 900000 } });
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.status, 'ALLOTTED');
+  const { rows: [saved] } = await f.query('SELECT status,approval_status,buyer_member_id,booking_by,sale_price::int FROM plots WHERE id=$1', [shop]);
+  assert.deepEqual(saved, { status: 'BOOKED', approval_status: 'approved', buyer_member_id: 201, booking_by: 'DRAW BROKER', sale_price: 900000 });
 });
 
 test('Accounts adopts the original cash and bank entries and rolls everything back when the second transfer fails',

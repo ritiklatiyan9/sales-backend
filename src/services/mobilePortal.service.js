@@ -3,9 +3,11 @@ import jwt from 'jsonwebtoken';
 import { allocateInstallmentPayments } from './mobileInstallmentAllocation.service.js';
 import { createClientPortalService } from './clientPortal.service.js';
 import { createClientInvitationService } from './clientInvitation.service.js';
+import { createMobileAccountRecovery } from './mobileAccountRecovery.service.js';
 
 const ISSUER = 'my-real-assets-bookings';
 const AUDIENCE = 'my-real-assets-client';
+const RESET_REALM = 'mobile-client-password-reset-v1';
 // Broker mobile uses the existing 30-day duration independently.
 export const MOBILE_SESSION_DAYS = 30;
 export const CLIENT_MOBILE_SESSION_DAYS = 1;
@@ -231,6 +233,7 @@ export function createMobilePortalService(db, options = {}) {
   const { now = Date.now } = options;
   const financialsFor = createMobileFinancialReader(db, options);
   const clientPortal = createClientPortalService(db);
+  const accountRecovery = createMobileAccountRecovery(db);
   const userFor = members => ({ id: `client:${members[0].id}`, name: members[0].full_name || 'Property owner', role: 'client' });
   async function getClientSession(accountId, version, { setup = false } = {}) {
     try {
@@ -248,15 +251,46 @@ export function createMobilePortalService(db, options = {}) {
     if (!members.length) unauthorized();
     return { members, user: userFor(members), accountId, version, setupRequired: setup };
   }
+  async function recoverySession(reset, resetDigest) {
+    if (!reset) unauthorized();
+    const { accountId, version } = reset;
+    const { members } = await clientPortal.getSession({ accountId, version }, db, { allowPasswordSetup: true })
+      .catch(error => { if (error.status === 401) unauthorized(); throw error; });
+    const member = members.find(row => row.member_id === reset.memberId && row.member_active !== false);
+    if (!member) unauthorized();
+    return {
+      accountId, version, setupRequired: true, resetDigest, mobile: reset.phone,
+      user: userFor([{ id: member.member_id, full_name: member.full_name }]),
+    };
+  }
+  function signInResponse(session, realm, expiresIn) {
+    const claims = { realm, version: session.version };
+    if (session.resetDigest) claims.resetDigest = session.resetDigest;
+    const token = jwt.sign(claims, privateKey('access'), {
+      algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-client-account:${session.accountId}`, expiresIn,
+    });
+    return {
+      token,
+      expiresAt: new Date(jwt.decode(token).exp * 1000).toISOString(),
+      sessionDurationDays: session.setupRequired ? null : CLIENT_MOBILE_SESSION_DAYS,
+      passwordChangeRequired: session.setupRequired,
+      user: session.user,
+    };
+  }
   async function getSession(token) {
     let claims;
     try {
       claims = jwt.verify(token, privateKey('access'), { algorithms: ['HS256'], issuer: ISSUER, audience: AUDIENCE });
     } catch { unauthorized(); }
-    if (!['mobile-client-password-v2', 'mobile-client-password-setup-v1'].includes(claims.realm) || !/^mra-client-account:[1-9]\d*$/.test(claims.sub || '')
+    if (!['mobile-client-password-v2', 'mobile-client-password-setup-v1', RESET_REALM].includes(claims.realm) || !/^mra-client-account:[1-9]\d*$/.test(claims.sub || '')
       || !Number.isSafeInteger(claims.version)) unauthorized();
     const accountId = Number(claims.sub.split(':')[1]);
     if (!Number.isSafeInteger(accountId)) unauthorized();
+    if (claims.realm === RESET_REALM) {
+      const reset = await accountRecovery.pending(claims.resetDigest);
+      if (reset?.accountId !== accountId || reset.version !== claims.version) unauthorized();
+      return recoverySession(reset, claims.resetDigest);
+    }
     return accountSession(accountId, claims.version, { setup: claims.realm === 'mobile-client-password-setup-v1' });
   }
   async function loadPlots(session, plotId = null, options = {}) {
@@ -320,28 +354,31 @@ export function createMobilePortalService(db, options = {}) {
         fail(401, 'Mobile number or password did not match.');
       }
       const match = await clientPortal.authenticate(mobile, password, { dryRun: true, allowPasswordSetup: true });
-      if (!match?.account) fail(401, 'Mobile number or password did not match.');
+      if (!match?.account) {
+        const reset = await accountRecovery.temporaryPassword(mobile, password);
+        if (!reset) fail(401, 'Mobile number or password did not match.');
+        const session = await recoverySession(reset, reset.resetDigest);
+        const secondsRemaining = Math.floor((new Date(reset.expiresAt).getTime() - Date.now()) / 1000);
+        if (secondsRemaining < 1) unauthorized();
+        return signInResponse(session, RESET_REALM, Math.min(secondsRemaining, 600));
+      }
       const setup = !match.account.password_changed;
       if (!setup && match.members.some(row => String(row.aadhar_no || '').replace(/[\s-]/g, '') === password.replace(/[\s-]/g, ''))) {
         fail(401, 'Mobile number or password did not match.');
       }
       const session = await accountSession(match.account.id, match.account.token_version, { setup });
-      const token = jwt.sign({ realm: setup ? 'mobile-client-password-setup-v1' : 'mobile-client-password-v2', version: match.account.token_version }, privateKey('access'), {
-        algorithm: 'HS256', issuer: ISSUER, audience: AUDIENCE, subject: `mra-client-account:${match.account.id}`, expiresIn: setup ? '10m' : `${CLIENT_MOBILE_SESSION_DAYS}d`,
-      });
-      return {
-        token,
-        expiresAt: new Date(jwt.decode(token).exp * 1000).toISOString(),
-        sessionDurationDays: setup ? null : CLIENT_MOBILE_SESSION_DAYS,
-        passwordChangeRequired: setup,
-        user: session.user,
-      };
+      return signInResponse(session, setup ? 'mobile-client-password-setup-v1' : 'mobile-client-password-v2',
+        setup ? '10m' : `${CLIENT_MOBILE_SESSION_DAYS}d`);
     },
     async activate(body) {
       await createClientInvitationService(db).activate(body);
       return this.login({ mobile: body.mobile, password: body.newPassword, role: 'client' });
     },
     async logout(session) {
+      if (session.resetDigest) {
+        await accountRecovery.cancel(session.resetDigest);
+        return;
+      }
       // This version is shared with the web portal: sign-out revokes all
       // currently issued client sessions for this account, on every device.
       const current = await getClientSession(session.accountId, session.version, { setup: session.setupRequired });
@@ -357,6 +394,10 @@ export function createMobilePortalService(db, options = {}) {
         || typeof newPassword !== 'string' || newPassword.length < 12 || Buffer.byteLength(newPassword, 'utf8') > 72
         || newPassword === currentPassword) {
         fail(400, 'Choose a different password of at least 12 characters and at most 72 UTF-8 bytes.');
+      }
+      if (session.resetDigest) {
+        await accountRecovery.confirm({ mobile: session.mobile, code: currentPassword, newPassword }, session.resetDigest);
+        return;
       }
       const current = await getClientSession(session.accountId, session.version, { setup: session.setupRequired });
       if (current.members.some(row => String(row.aadhar_no || '').replace(/[\s-]/g, '') === newPassword.replace(/[\s-]/g, ''))) {

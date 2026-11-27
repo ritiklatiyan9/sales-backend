@@ -36,6 +36,19 @@ async function verifiedAccount(connection, memberId) {
 }
 
 export function createMobileAccountRecovery(db, { now = () => new Date() } = {}) {
+  async function pending(digest, phone = null) {
+    if (typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)) return null;
+    const { rows: [reset] } = await db.query(`
+      SELECT r.account_id AS "accountId", r.member_id AS "memberId", r.token_version AS version,
+             r.expires_at AS "expiresAt", a.phone
+        FROM booking_client_password_resets r
+        JOIN booking_client_accounts a ON a.id=r.account_id
+       WHERE r.code_hash=$1 AND r.consumed_at IS NULL AND r.expires_at>$2
+         AND a.is_active AND a.token_version=r.token_version
+         AND ($3::text IS NULL OR a.phone=$3)`, [digest, now(), phone]);
+    return reset ?? null;
+  }
+
   async function transaction(action) {
     const connection = await db.connect();
     try {
@@ -52,12 +65,25 @@ export function createMobileAccountRecovery(db, { now = () => new Date() } = {})
   }
 
   return {
+    pending,
+    async temporaryPassword(mobile, password) {
+      if (!codePattern.test(password)) return null;
+      const resetDigest = codeHash(password);
+      const reset = await pending(resetDigest, mobile);
+      return reset ? { ...reset, resetDigest } : null;
+    },
+
+    async cancel(digest) {
+      await db.query('UPDATE booking_client_password_resets SET consumed_at=$2 WHERE code_hash=$1 AND consumed_at IS NULL',
+        [digest, now()]);
+    },
+
     async issue({ memberId, identityVerified, actor }) {
       if (!Number.isSafeInteger(memberId) || memberId < 1 || identityVerified !== true) {
         fail(400, 'Verify the client in person and select their record.');
       }
       if (actor?.role !== 'super_admin' || !Number.isSafeInteger(actor.id) || !Number.isSafeInteger(actor.version)) {
-        fail(403, 'Only a super administrator can issue a password reset link.');
+          fail(403, 'Only a super administrator can issue a password reset.');
       }
       return transaction(async connection => {
         const { rows: [staff] } = await connection.query(`
@@ -83,19 +109,20 @@ export function createMobileAccountRecovery(db, { now = () => new Date() } = {})
           INSERT INTO audit_logs(organization_id,site_id,user_id,action,event_type,module,entity_type,entity_id,
             request_method,request_path,status_code,outcome,description)
           VALUES($1,$2,$3,'CREATE','HTTP','my_real_assets','client_account',$4,'POST',
-            '/api/mobile/admin/password-resets',200,'SUCCESS','Office issued a My Real Assets password reset link after identity verification.')`,
+            '/api/mobile/admin/password-resets',200,'SUCCESS','Office issued a My Real Assets password reset after identity verification.')`,
         [account.organization_id, account.site_id, actor.id, String(account.id)]);
         return { code, expiresAt: expiresAt.toISOString() };
       });
     },
 
-    async confirm({ mobile, code, newPassword } = {}) {
+    async confirm({ mobile, code, newPassword } = {}, expectedDigest) {
       const phone = normalizeStaffPhone(mobile);
-      if (!phone || typeof code !== 'string' || !codePattern.test(code)) invalidLink();
+      const digest = typeof code === 'string' && codePattern.test(code) ? codeHash(code) : null;
+      if (expectedDigest && expectedDigest !== digest) fail(403, 'Your current password is incorrect.');
+      if (!phone || !digest) invalidLink();
       if (typeof newPassword !== 'string' || newPassword.length < 12 || Buffer.byteLength(newPassword, 'utf8') > 72) {
         fail(400, 'Choose a password of at least 12 characters and at most 72 bytes.');
       }
-      const digest = codeHash(code);
       return transaction(async connection => {
         await lockClientPasswordPhone(connection, phone);
         const { rows: [reset] } = await connection.query(`

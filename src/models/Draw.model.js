@@ -5,6 +5,10 @@ import MasterModel from './MasterModel.js';
 // ponytail: only a positive to_regclass answer is kept; the table is never dropped, so no invalidation.
 const websiteRequestsReady = new WeakMap();
 
+export const ACCOUNTS_BOOKED_SHOP_MATCH = `shop.site_id=r.site_id AND shop.buyer_member_id=r.client_member_id
+  AND shop.unit_type='shop' AND shop.status IN ('BOOKED','SOLD','REGISTRY','REGISTERED')
+  AND shop.approval_status IN ('approved','pending') AND shop.plot_tag IS DISTINCT FROM 'OLD' AND shop.booking_cancelled_at IS NULL`;
+
 const WORKFLOW_BROKER_NAME_SQL = `COALESCE(NULLIF(BTRIM(draw_broker.full_name), ''), NULLIF(BTRIM(broker_member.full_name), ''),
   NULLIF(BTRIM(registration_broker.name), ''), NULLIF(BTRIM(booking_broker.name), ''))`;
 const WORKFLOW_BROKER_JOINS_SQL = `
@@ -71,9 +75,19 @@ class DrawModel extends MasterModel {
   /** List with joined client/site/agent labels + paid rollup.
    * `visibleUserIds` (array | null) scopes rows to an agent's own network —
    * registrations they own (agent_user_id) or personally created (same rule as bookings). */
-  async list({ siteId, status, q, clientMemberId, brokerIds, visibleUserIds, view }, pool) {
+  async list({ siteId, status, q, clientMemberId, brokerIds, visibleUserIds, view, accountsBookingOrganizationId }, pool) {
     const { where, params } = drawListScope(siteId, visibleUserIds, view);
-    if (status) { params.push(status); where.push(`r.status = $${params.length}`); }
+    if (status) {
+      params.push(status);
+      const statusMatch = `r.status = $${params.length}`;
+      if (status === 'ALLOTTED' && accountsBookingOrganizationId != null) {
+        params.push(accountsBookingOrganizationId);
+        where.push(`(${statusMatch} OR (s.organization_id = $${params.length}
+          AND EXISTS (SELECT 1 FROM plots shop WHERE ${ACCOUNTS_BOOKED_SHOP_MATCH})))`);
+      } else {
+        where.push(statusMatch);
+      }
+    }
     if (clientMemberId) { params.push(clientMemberId); where.push(`r.client_member_id = $${params.length}`); }
     if (brokerIds?.length) {
       params.push(brokerIds);

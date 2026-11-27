@@ -13,7 +13,7 @@ import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
-import { accountsBookedShopsForDraws, bookShopFromDraw, drawShopBookingOptions, supportsDrawShopBooking } from '../services/drawShopBooking.js';
+import { accountsBookedShopsForDraws, bookShopFromDraw, canShowAccountsShopBookings, drawShopBookingOptions, supportsDrawShopBooking } from '../services/drawShopBooking.js';
 import { drawPaymentAccounting, drawPaymentMutationError, editedDrawPayment, removeDrawPayment, saveDrawPaymentEdit } from '../services/drawPaymentMutations.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
@@ -438,10 +438,12 @@ export const listDraws = asyncHandler(async (req, res) => {
   if (broker_ids !== undefined && typeof broker_ids !== 'string') throw workflowError('Invalid broker filter');
   const brokerIds = broker_ids ? broker_ids.split(',').map(Number) : [];
   if (brokerIds.some((id) => !Number.isInteger(id) || id < 1 || id > 2147483647)) throw workflowError('Invalid broker filter');
-  const siteId = view || brokerIds.length ? (await requireSiteAccess(req.user, site_id)).id : site_id;
+  const site = view || brokerIds.length ? await requireSiteAccess(req.user, site_id) : null;
+  const accountsBookingOrganizationId = view === 'active' && status === 'ALLOTTED' && canShowAccountsShopBookings(site.id, site.name, req.user)
+    ? req.user.organization_id : null;
   const visibleUserIds = await getVisibleUserIds(req.user); // null = unrestricted
   const rows = await drawModel.list(
-    { siteId, status, q, clientMemberId: client_member_id, brokerIds, visibleUserIds, view },
+    { siteId: site?.id ?? site_id, status, q, clientMemberId: client_member_id, brokerIds, visibleUserIds, view, accountsBookingOrganizationId },
     pool
   );
   const accountsLookup = [];
@@ -887,6 +889,7 @@ export async function allotDrawBooking({ registrationId, body, user }) {
   let creditAmount = 0;
   let token_sync = null;
   let bookingForSync = null;
+  let plotSync;
   let ledger_sync;
   const client = await pool.connect();
   try {
@@ -926,7 +929,10 @@ export async function allotDrawBooking({ registrationId, body, user }) {
     // FOR UPDATE: serialises concurrent allotments of the SAME shop — without it two
     // admins could allot one unit to two winners (plots.status only flips after commit).
     const { rows: plotRows } = await client.query(
-      'SELECT id, site_id, plot_no, block, status, buyer_name, sale_price FROM plots WHERE id = $1 FOR UPDATE',
+      `SELECT p.id,p.site_id,p.plot_no,p.block,p.status,p.buyer_name,p.sale_price,
+        to_jsonb(p)->>'unit_type' AS unit_type,to_jsonb(p)->>'approval_status' AS approval_status,
+        s.name AS site_name,(to_jsonb(s)->>'organization_id')::integer AS site_organization_id
+        FROM plots p JOIN sites s ON s.id=p.site_id WHERE p.id=$1 FOR UPDATE OF p`,
       [plotId]
     );
     const plot = plotRows[0];
@@ -1011,7 +1017,14 @@ export async function allotDrawBooking({ registrationId, body, user }) {
       req.user.id, client
     );
     const settings = installmentPlan?.settings;
-    await client.query(
+    if (plot.unit_type === 'shop' && plot.approval_status === 'approved'
+      && supportsDrawShopBooking(plot.site_id, plot.site_name, plot.site_organization_id, req.user)) {
+      plotSync = await syncPlotBookingToAccounting(booking, client, {
+        directShopTerms: { salePrice, firstInstallment: installmentPlan?.firstInstallment || 0, settings },
+      });
+      const { rows: [saved] } = await client.query('SELECT approval_status FROM plots WHERE id=$1', [plot.id]);
+      if (!plotSync.ok || saved?.approval_status !== 'approved') throw workflowError('Accounts could not confirm this shop booking. The allotment was rolled back.', 409);
+    } else await client.query(
       `UPDATE plots SET status = 'BOOKED', buyer_name = (SELECT full_name FROM members WHERE id = $1),
          booking_date = $2, sale_price = $3, first_installment = $4,
          installments_enabled = $5, interest_enabled = $6, interest_rate = $7,
@@ -1052,9 +1065,8 @@ export async function allotDrawBooking({ registrationId, body, user }) {
     client.release();
   }
 
-  // The unit and receipt ledger are already committed atomically. Complete existing
-  // agent attribution/commission enrichment after commit; report its result to the UI.
-  const plot_sync = await syncPlotBookingToAccounting(bookingForSync, pool);
+  // Legacy allotments still enrich the booking after the receipt transaction.
+  const plot_sync = plotSync ?? await syncPlotBookingToAccounting(bookingForSync, pool);
   // Draw winners get this one message (createBooking's draw branch returns before its own).
   queueWhatsApp('ALLOTTED', bookingForSync.id, `ALLOTTED:${bookingForSync.id}:${bookingForSync.plot_id}`);
 

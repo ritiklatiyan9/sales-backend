@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import pool from '../config/db.js';
 import bookingModel from '../models/Booking.model.js';
-import drawModel from '../models/Draw.model.js';
+import drawModel, { ACCOUNTS_BOOKED_SHOP_MATCH } from '../models/Draw.model.js';
 import { ensureBookingCreditFields } from './bookingDrawCredits.js';
 import { syncDrawLedgerToPlot } from './drawLedgerSync.js';
 import { money, todayIST, workflowError } from './drawWorkflow.js';
@@ -11,22 +11,25 @@ import { requireWorkspaceAccess } from './bookingWorkspaceAccess.js';
 
 const canBookShop = user => isFullAdmin(user) || isSubAdmin(user);
 
-export function supportsDrawShopBooking(siteId, siteName, organizationId, user) {
-  return canBookShop(user) && user.organization_id != null && Number(user.organization_id) === Number(organizationId)
+export function canShowAccountsShopBookings(siteId, siteName, user) {
+  return canBookShop(user) && user.organization_id != null
     && Number(siteId) === 7 && siteName?.trim().toLowerCase() === 'naya baazar unn commercial';
+}
+
+export function supportsDrawShopBooking(siteId, siteName, organizationId, user) {
+  return canShowAccountsShopBookings(siteId, siteName, user) && Number(user.organization_id) === Number(organizationId);
 }
 
 export async function accountsBookedShopsForDraws(registrationIds, db = pool) {
   const shopsByDraw = new Map();
   if (!registrationIds.length) return shopsByDraw;
   const { rows } = await db.query(`
-    SELECT r.id AS draw_id, p.plot_no, p.block,
+    SELECT r.id AS draw_id, shop.plot_no, shop.block,
       EXISTS (SELECT 1 FROM draw_payments dp JOIN plot_payments pp ON pp.id=dp.plot_payment_id
-        WHERE dp.draw_registration_id=r.id AND pp.plot_id=p.id AND pp.site_id=r.site_id) AS receipt_linked
-    FROM draw_registrations r JOIN plots p ON p.site_id=r.site_id AND p.buyer_member_id=r.client_member_id
-    WHERE r.id=ANY($1::int[]) AND p.unit_type='shop' AND p.status IN ('BOOKED','SOLD','REGISTRY','REGISTERED')
-      AND p.approval_status='approved' AND p.plot_tag IS DISTINCT FROM 'OLD' AND p.booking_cancelled_at IS NULL
-    ORDER BY p.block,p.plot_no,p.id`, [registrationIds]);
+        WHERE dp.draw_registration_id=r.id AND pp.plot_id=shop.id AND pp.site_id=r.site_id) AS receipt_linked
+    FROM draw_registrations r JOIN plots shop ON ${ACCOUNTS_BOOKED_SHOP_MATCH}
+    WHERE r.id=ANY($1::int[])
+    ORDER BY shop.block,shop.plot_no,shop.id`, [registrationIds]);
   for (const { draw_id, ...shop } of rows) {
     const shops = shopsByDraw.get(draw_id) || [];
     shops.push(shop);
