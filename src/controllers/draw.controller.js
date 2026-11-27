@@ -13,7 +13,7 @@ import bookingModel from '../models/Booking.model.js';
 import kycCaseModel from '../models/KycCase.model.js';
 import { syncPlotBookingToAccounting } from '../services/plotBookingSync.js';
 import { syncDrawLedgerToPlot } from '../services/drawLedgerSync.js';
-import { bookShopFromDraw, drawShopBookingOptions, supportsDrawShopBooking } from '../services/drawShopBooking.js';
+import { accountsBookedShopsForDraws, bookShopFromDraw, drawShopBookingOptions, supportsDrawShopBooking } from '../services/drawShopBooking.js';
 import { drawPaymentAccounting, drawPaymentMutationError, editedDrawPayment, removeDrawPayment, saveDrawPaymentEdit } from '../services/drawPaymentMutations.js';
 import { isAdminRole, getVisibleUserIds, logActivity } from '../services/agentNetwork.service.js';
 import { findOrCreateClientByPhone } from '../services/memberQuickAdd.service.js';
@@ -444,9 +444,17 @@ export const listDraws = asyncHandler(async (req, res) => {
     { siteId, status, q, clientMemberId: client_member_id, brokerIds, visibleUserIds, view },
     pool
   );
+  const accountsLookup = [];
+  for (const row of rows) {
+    row.direct_shop_booking_enabled = supportsDrawShopBooking(row.site_id, row.site_name, row.site_organization_id, req.user);
+    // The active register has already checked access to the requested project.
+    if (view === 'active' && row.direct_shop_booking_enabled && row.status !== 'ALLOTTED') accountsLookup.push(row.id);
+  }
+  const accountsShops = await accountsBookedShopsForDraws(accountsLookup, pool);
   // Member photos live in a private bucket; the raw URL 403s in <img>.
   await Promise.all(rows.map(async (r) => {
-    r.direct_shop_booking_enabled = supportsDrawShopBooking(r.site_id, r.site_name, r.site_organization_id, req.user);
+    const shops = accountsShops.get(r.id);
+    if (shops) r.accounts_booked_shops = shops;
     if (r.client_photo) r.client_photo = await signMemberDocumentUrl(r.client_photo);
   }));
   res.json(rows);

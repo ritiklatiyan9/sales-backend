@@ -134,6 +134,28 @@ test('Book Shop validates the reviewed draw, books its client before the draw op
   assert.equal(event.detail.previous_status, 'SLIP_ISSUED');
 });
 
+test('the active Draws register reports Accounts shops and distinguishes receipts on separate slips', async t => {
+  const f = await fixture(t);
+  await collect(f.db);
+  await f.db.exec(`
+    UPDATE plots SET status='BOOKED',buyer_member_id=201 WHERE id IN (401,402,403,404);
+    UPDATE plots SET plot_tag='OLD' WHERE id=403;
+    UPDATE plots SET buyer_member_id=202,buyer_name='Shop Applicant' WHERE id=405;
+    INSERT INTO draw_registrations(id,site_id,client_member_id,registration_no,qr_token,required_amount,status)
+      VALUES(303,7,201,'DR-303','test-303',100000,'SLIP_ISSUED');
+    INSERT INTO plot_payments(id,plot_id,site_id,amount) VALUES(501,401,7,50000);
+    UPDATE draw_payments SET plot_payment_id=501 WHERE draw_registration_id=301 AND receipt_no='CASH-25';
+  `);
+  const register = await request(listDraws, { query: { site_id: site, view: 'active' } });
+  assert.equal(register.status, 200, JSON.stringify(register.data));
+  const linked = register.data.find(row => row.id === draw);
+  const otherSlip = register.data.find(row => row.id === 303);
+  assert.deepEqual(linked.accounts_booked_shops, [{ plot_no: 'G-14', block: null, receipt_linked: true }]);
+  assert.deepEqual(otherSlip.accounts_booked_shops, [{ plot_no: 'G-14', block: null, receipt_linked: false }]);
+  assert.equal(linked.status, 'SLIP_ISSUED');
+  assert.equal(otherSlip.allotted_plot_id, null);
+});
+
 test('Book Shop allows a sub-admin with Draws update access in their assigned project', async t => {
   const f = await fixture(t);
   await collect(f.db);

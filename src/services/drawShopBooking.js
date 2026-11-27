@@ -16,6 +16,25 @@ export function supportsDrawShopBooking(siteId, siteName, organizationId, user) 
     && Number(siteId) === 7 && siteName?.trim().toLowerCase() === 'naya baazar unn commercial';
 }
 
+export async function accountsBookedShopsForDraws(registrationIds, db = pool) {
+  const shopsByDraw = new Map();
+  if (!registrationIds.length) return shopsByDraw;
+  const { rows } = await db.query(`
+    SELECT r.id AS draw_id, p.plot_no, p.block,
+      EXISTS (SELECT 1 FROM draw_payments dp JOIN plot_payments pp ON pp.id=dp.plot_payment_id
+        WHERE dp.draw_registration_id=r.id AND pp.plot_id=p.id AND pp.site_id=r.site_id) AS receipt_linked
+    FROM draw_registrations r JOIN plots p ON p.site_id=r.site_id AND p.buyer_member_id=r.client_member_id
+    WHERE r.id=ANY($1::int[]) AND p.unit_type='shop' AND p.status IN ('BOOKED','SOLD','REGISTRY','REGISTERED')
+      AND p.approval_status='approved' AND p.plot_tag IS DISTINCT FROM 'OLD' AND p.booking_cancelled_at IS NULL
+    ORDER BY p.block,p.plot_no,p.id`, [registrationIds]);
+  for (const { draw_id, ...shop } of rows) {
+    const shops = shopsByDraw.get(draw_id) || [];
+    shops.push(shop);
+    shopsByDraw.set(draw_id, shops);
+  }
+  return shopsByDraw;
+}
+
 function positiveId(value) {
   const id = Number(value);
   if (!['number', 'string'].includes(typeof value) || !/^\d+$/.test(String(value)) || !Number.isInteger(id) || id < 1 || id > 2147483647) {
